@@ -6,9 +6,10 @@
 //        - they did NOT have the Clan Member role  -> no ping; bot just removes Unverified
 //   3. A permanent embed in that channel has one button: "Update Server Nickname".
 //   4. Button -> popup asks for in-game username -> two confirmations -> nickname is set.
-//   5. Once the nickname is set, the bot removes the Unverified role and deletes that
-//      member's @ping. Only the permanent embed remains.
-//   The bot never gives any role except Unverified on join — access roles are handled elsewhere.
+//   5. Once the nickname is set, the bot gives the OSRS role, removes the Unverified role
+//      and deletes that member's @ping. Only the permanent embed remains.
+//   Roles the bot gives: Unverified (on join) and OSRS (only after the nickname is set).
+//   Any other access role is handled elsewhere.
 // No database. No slash commands. State lives entirely in Discord (messages + custom IDs).
 
 require("dotenv").config();
@@ -32,6 +33,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 
 const UNVERIFIED_ROLE_ID    = "1547278787815804928";
 const CLAN_MEMBER_ROLE_ID   = "1546403975656505354";
+const OSRS_ROLE_ID          = "1546412132822810744";
 const ONBOARDING_CHANNEL_ID = "1546401367004811314";
 
 // OSRS display names: max 12 characters (OSRS wiki, Account Management > Display name).
@@ -357,11 +359,13 @@ async function onConfirm2(interaction, encoded) {
     });
   }
 
-  // Nickname is changed — now remove the Unverified role.
+  // Nickname is changed — give the OSRS role first, then remove Unverified
+  // (this order means a failure never leaves the member with neither role).
   try {
+    await member.roles.add(OSRS_ROLE_ID, "Onboarding — nickname set via bot");
     await member.roles.remove(UNVERIFIED_ROLE_ID, "Onboarding — nickname set via bot");
   } catch (err) {
-    console.error(`[Roles] Could not remove Unverified role from ${interaction.user.id}: ${err.message}`);
+    console.error(`[Roles] Role update failed for ${interaction.user.id}: ${err.message}`);
     return interaction.editReply({
       embeds: [
         new EmbedBuilder()
@@ -486,5 +490,6 @@ module.exports = {
   ID,
   UNVERIFIED_ROLE_ID,
   CLAN_MEMBER_ROLE_ID,
+  OSRS_ROLE_ID,
   ONBOARDING_CHANNEL_ID,
 };
