@@ -5,7 +5,8 @@
 //        - they ended up with the Clan Member role -> bot @pings them in the onboarding channel
 //        - they did NOT have the Clan Member role  -> no ping; bot just removes Unverified
 //   3. A permanent embed in that channel has one button: "Update Server Nickname".
-//   4. Button -> popup asks for in-game username -> two confirmations -> nickname is set.
+//   4. Button (only usable by members with the Clan Member role) -> popup asks for in-game
+//      username -> two confirmations -> nickname is set.
 //   5. Once the nickname is set, the bot gives the OSRS role, removes the Unverified role
 //      and deletes that member's @ping. Only the permanent embed remains.
 //   Roles the bot gives: Unverified (on join) and OSRS (only after the nickname is set).
@@ -267,7 +268,29 @@ function confirmRow(confirmId, yesLabel, noLabel, name) {
   );
 }
 
+// Works for both a cached GuildMember and the raw interaction member (roles = array of IDs).
+function memberHasRole(member, roleId) {
+  if (!member) return false;
+  const roles = member.roles;
+  if (Array.isArray(roles)) return roles.includes(roleId);
+  return !!roles?.cache?.has(roleId);
+}
+
+function notAllowedEmbed() {
+  return new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle("This button isn't available to you")
+    .setDescription(
+      "Setting a server nickname here is only for members with the **Clan Member** role.\n\n" +
+      "If you should have that role, please ask a staff member for help."
+    );
+}
+
 async function onStartButton(interaction) {
+  if (!memberHasRole(interaction.member, CLAN_MEMBER_ROLE_ID)) {
+    return interaction.reply({ embeds: [notAllowedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
   const modal = new ModalBuilder().setCustomId(ID.MODAL).setTitle("Update Server Nickname");
   const input = new TextInputBuilder()
     .setCustomId(ID.INPUT)
@@ -342,6 +365,10 @@ async function onConfirm2(interaction, encoded) {
   let member;
   try {
     member = await interaction.guild.members.fetch(interaction.user.id);
+    // Re-check at the final step so the gate can't be skipped via an old confirmation message.
+    if (!memberHasRole(member, CLAN_MEMBER_ROLE_ID)) {
+      return interaction.editReply({ embeds: [notAllowedEmbed()], components: [] });
+    }
     await member.setNickname(result.name, "Onboarding — member set their in-game username");
   } catch (err) {
     console.error(`[Nickname] Failed for ${interaction.user.id}: ${err.message}`);
