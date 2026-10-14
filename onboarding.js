@@ -1,4 +1,4 @@
-// ================= FENRIR — ONBOARDING-ONLY BOT =================
+// ================= HEIMDALL — ONBOARDING + ORIENTATION BOT =================
 // Flow:
 //   1. Member joins -> bot gives them the Unverified role.
 //   2. Member finishes the Discord onboarding:
@@ -11,6 +11,13 @@
 //      and deletes that member's @ping. Only the permanent embed remains.
 //   Roles the bot gives: Unverified (on join) and OSRS (only after the nickname is set).
 //   Any other access role is handled elsewhere.
+//
+// Orientation (separate channel):
+//   A permanent embed explains the chain of command and has two buttons:
+//     - "I Accept Leader Role"          usable only by the Leader role      -> gives Verified Leader
+//     - "I Accept Staff/Jr. Staff Role" usable only by the Staff or Jr. Staff role -> gives Verified Staff
+//   These buttons ONLY ever add the verified role. They never remove any role.
+//
 // No database. No slash commands. State lives entirely in Discord (messages + custom IDs).
 
 require("dotenv").config();
@@ -37,6 +44,14 @@ const CLAN_MEMBER_ROLE_ID   = "1546403975656505354";
 const OSRS_ROLE_ID          = "1546412132822810744";
 const ONBOARDING_CHANNEL_ID = "1546401367004811314";
 
+// Orientation acknowledgement
+const ORIENTATION_CHANNEL_ID   = "1559995329825472542";
+const LEADER_ROLE_ID           = "1546401937883402293";
+const STAFF_ROLE_ID            = "1546402959049359360";
+const JR_STAFF_ROLE_ID         = "1546403383752134656";
+const VERIFIED_LEADER_ROLE_ID  = "1559994620442710097";
+const VERIFIED_STAFF_ROLE_ID   = "1559997317325656094";
+
 // OSRS display names: max 12 characters (OSRS wiki, Account Management > Display name).
 const RSN_MAX_LENGTH = 12;
 const RSN_PATTERN    = /^[A-Za-z0-9 _-]+$/;
@@ -57,6 +72,8 @@ const ID = {
   CONFIRM1: "nick_c1",
   CONFIRM2: "nick_c2",
   CANCEL:   "nick_cancel",
+  ORIENT_LEADER: "orient_leader",
+  ORIENT_STAFF:  "orient_staff",
 };
 
 const COLOR = { main: 0x2b6cb0, warn: 0xd69e2e, ok: 0x38a169, bad: 0xe53e3e };
@@ -86,10 +103,14 @@ function validateRsn(raw) {
 const encodeName = (name) => Buffer.from(name, "utf8").toString("base64url");
 const decodeName = (b64) => Buffer.from(String(b64 ?? ""), "base64url").toString("utf8");
 
-function messageHasStartButton(message) {
+function messageHasButton(message, customIds) {
   return (message.components || []).some((row) =>
-    (row.components || []).some((c) => c.customId === ID.START)
+    (row.components || []).some((c) => customIds.includes(c.customId))
   );
+}
+
+function messageHasStartButton(message) {
+  return messageHasButton(message, [ID.START]);
 }
 
 function isPingFor(message, userId) {
@@ -101,14 +122,16 @@ function isPingFor(message, userId) {
   );
 }
 
-async function getOnboardingChannel() {
-  const channel = await client.channels.fetch(ONBOARDING_CHANNEL_ID).catch(() => null);
+async function getChannelById(channelId, label = "Channel") {
+  const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel || !channel.isTextBased()) {
-    console.error(`[Onboarding] Channel ${ONBOARDING_CHANNEL_ID} not found or not text-based.`);
+    console.error(`[${label}] Channel ${channelId} not found or not text-based.`);
     return null;
   }
   return channel;
 }
+
+const getOnboardingChannel = () => getChannelById(ONBOARDING_CHANNEL_ID, "Onboarding");
 
 // Collect up to `pages` x 100 recent messages (newest first).
 async function fetchRecentMessages(channel, pages) {
@@ -145,28 +168,96 @@ function buildPermanentMessage() {
   return { embeds: [embed], components: [row] };
 }
 
-// Makes sure exactly one permanent embed exists. Stateless: finds it by its button.
-async function ensurePermanentMessage() {
-  const channel = await getOnboardingChannel();
+// Makes sure exactly one copy of a permanent embed exists in a channel.
+// Stateless: it is found by its button custom IDs.
+async function ensureEmbedMessage({ channelId, label, buttonIds, payload, what }) {
+  const channel = await getChannelById(channelId, label);
   if (!channel) return;
 
   const recent = await fetchRecentMessages(channel, SCAN_PAGES_PERMANENT);
-  const existing = recent.filter((m) => m.author?.id === client.user.id && messageHasStartButton(m));
-  const payload = buildPermanentMessage();
+  const existing = recent.filter((m) => m.author?.id === client.user.id && messageHasButton(m, buttonIds));
 
   if (existing.length === 0) {
     await channel.send(payload);
-    console.log("[Onboarding] Posted permanent nickname embed.");
+    console.log(`[${label}] Posted ${what}.`);
     return;
   }
 
   // Keep the newest, refresh its content, remove any accidental duplicates.
   const [keep, ...dupes] = existing;
-  await keep.edit(payload).catch((e) => console.warn("[Onboarding] Could not refresh permanent embed:", e.message));
+  await keep.edit(payload).catch((e) => console.warn(`[${label}] Could not refresh ${what}:`, e.message));
   for (const d of dupes) {
     await d.delete().catch(() => {});
   }
-  console.log(`[Onboarding] Permanent embed present${dupes.length ? ` (removed ${dupes.length} duplicate(s))` : ""}.`);
+  console.log(`[${label}] ${what} present${dupes.length ? ` (removed ${dupes.length} duplicate(s))` : ""}.`);
+}
+
+async function ensurePermanentMessage() {
+  return ensureEmbedMessage({
+    channelId: ONBOARDING_CHANNEL_ID,
+    label: "Onboarding",
+    buttonIds: [ID.START],
+    payload: buildPermanentMessage(),
+    what: "permanent nickname embed",
+  });
+}
+
+// ================= ORIENTATION EMBED =================
+function buildOrientationMessage() {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("Leadership & Staff Orientation")
+    .setDescription(
+      "Please read this through, then press the button for your role to confirm you understand and accept your responsibilities.\n\n" +
+      "**Chain of Command**\n" +
+      "Owners > Leaders > Staff > Jr. Staff\n\n" +
+      "Everyone should know who is responsible for what. This structure keeps questions and problems in the right hands, " +
+      "so no one ends up handling a constant stream of requests alone. Staff and Jr. Staff are the first point of contact " +
+      "for clan members. If something needs to go further up, Staff or Jr. Staff are the ones who bring it to the Leaders."
+    )
+    .addFields(
+      {
+        name: "Leaders",
+        value:
+          "Leaders keep the clan running smoothly and make the core decisions that shape its direction. " +
+          "They interview candidates and carry out every promotion to Staff and Jr. Staff. " +
+          "When a major issue is beyond what Staff or Jr. Staff can handle, Leaders use their own judgment to resolve it, " +
+          "and only Owners can overrule a Leader's decision. " +
+          "If you'd like to help shape the clan's future and growth, you're welcome to ask about becoming a Leader.",
+      },
+      {
+        name: "Staff / Jr. Staff",
+        value:
+          "Staff and Jr. Staff handle the clan's day-to-day work. " +
+          "Staff make sure Jr. Staff get the training they need to become full Staff, keep recruitment going, " +
+          "and keep the clan chat and Discord relaxed and fun. " +
+          "Both should be ready to answer questions and step in when problems come up. " +
+          "Staff can remove members from the clan at their discretion; if no Staff or Leaders are online, " +
+          "Jr. Staff can make recommendations on how to handle an issue. " +
+          "Staff also interview anyone interested in becoming Jr. Staff and working toward Leader or Co-Owner, " +
+          "and are free to host events as often as they like to keep the clan engaged.",
+      }
+    )
+    .setFooter({ text: "Only the button matching your current role will work. Accepting never removes any of your existing roles." });
+
+  // Discord only offers four button colors (blue, grey, green, red) — no orange or purple.
+  // Closest matches: Leader = red, Staff/Jr. Staff = blue (Discord's blurple).
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(ID.ORIENT_LEADER).setLabel("I Accept Leader Role").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(ID.ORIENT_STAFF).setLabel("I Accept Staff/Jr. Staff Role").setStyle(ButtonStyle.Primary)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+async function ensureOrientationMessage() {
+  return ensureEmbedMessage({
+    channelId: ORIENTATION_CHANNEL_ID,
+    label: "Orientation",
+    buttonIds: [ID.ORIENT_LEADER, ID.ORIENT_STAFF],
+    payload: buildOrientationMessage(),
+    what: "orientation embed",
+  });
 }
 
 // Deletes every bot @ping aimed at this member (never the permanent embed).
@@ -421,6 +512,90 @@ async function onConfirm2(interaction, encoded) {
   await deletePingsFor(interaction.user.id).catch((e) => console.warn("[Nickname] ping cleanup failed:", e.message));
 }
 
+// ---- Orientation acknowledgement buttons ----
+// These handlers only ever ADD the verified role. There is intentionally no roles.remove() here.
+const ORIENTATION_BUTTONS = {
+  [ID.ORIENT_LEADER]: {
+    label: "Leader",
+    requiredRoleIds: [LEADER_ROLE_ID],
+    grantRoleId: VERIFIED_LEADER_ROLE_ID,
+  },
+  [ID.ORIENT_STAFF]: {
+    label: "Staff / Jr. Staff",
+    requiredRoleIds: [STAFF_ROLE_ID, JR_STAFF_ROLE_ID],
+    grantRoleId: VERIFIED_STAFF_ROLE_ID,
+  },
+};
+
+const hasAnyRole = (member, roleIds) => roleIds.some((id) => memberHasRole(member, id));
+
+function orientationDeniedEmbed(cfg) {
+  return new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle("This button isn't available to you")
+    .setDescription(
+      `This one is for members with the **${cfg.label}** role.\n\n` +
+      "If you think that's a mistake, please reach out to a Leader or Owner."
+    );
+}
+
+async function onOrientationAccept(interaction) {
+  const cfg = ORIENTATION_BUTTONS[interaction.customId];
+  if (!cfg) return;
+
+  // 1) Quick check with the role data that came with the click.
+  if (!hasAnyRole(interaction.member, cfg.requiredRoleIds)) {
+    return interaction.reply({ embeds: [orientationDeniedEmbed(cfg)], flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // 2) Re-check on a fresh copy of the member right before assigning anything.
+  let member;
+  try {
+    member = await interaction.guild.members.fetch(interaction.user.id);
+  } catch (err) {
+    console.error(`[Orientation] Could not fetch ${interaction.user.id}: ${err.message}`);
+    return interaction.editReply({
+      embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Something went wrong").setDescription("Please try the button again in a moment.")],
+    });
+  }
+
+  if (!hasAnyRole(member, cfg.requiredRoleIds)) {
+    return interaction.editReply({ embeds: [orientationDeniedEmbed(cfg)] });
+  }
+
+  if (memberHasRole(member, cfg.grantRoleId)) {
+    return interaction.editReply({
+      embeds: [new EmbedBuilder().setColor(COLOR.ok).setTitle("Already accepted").setDescription(`You've already accepted the **${cfg.label}** role. Nothing more to do.`)],
+    });
+  }
+
+  try {
+    await member.roles.add(cfg.grantRoleId, `Orientation — accepted ${cfg.label} role`);
+  } catch (err) {
+    console.error(`[Orientation] Could not give role ${cfg.grantRoleId} to ${interaction.user.id}: ${err.message}`);
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("I couldn't assign your role")
+          .setDescription("Discord wouldn't let me add it. Please ask a Leader or Owner to help."),
+      ],
+    });
+  }
+
+  console.log(`[Orientation] ${interaction.user.id} accepted ${cfg.label} role.`);
+  return interaction.editReply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR.ok)
+        .setTitle("Role accepted")
+        .setDescription(`Thanks for confirming. You've accepted the **${cfg.label}** role, and your verified role has been added.`),
+    ],
+  });
+}
+
 async function onCancel(interaction) {
   return interaction.update({
     embeds: [
@@ -443,6 +618,9 @@ async function handleInteraction(interaction) {
       case ID.CONFIRM1: return onConfirm1(interaction, payload);
       case ID.CONFIRM2: return onConfirm2(interaction, payload);
       case ID.CANCEL:   return onCancel(interaction);
+      case ID.ORIENT_LEADER:
+      case ID.ORIENT_STAFF:
+        return onOrientationAccept(interaction);
       default:          return;
     }
   }
@@ -454,11 +632,16 @@ async function handleInteraction(interaction) {
 
 // ================= WIRING =================
 client.once(Events.ClientReady, async () => {
-  console.log(`[Fenrir] Logged in as ${client.user.tag}`);
+  console.log(`[Heimdall] Logged in as ${client.user.tag}`);
   try {
     await ensurePermanentMessage();
   } catch (err) {
     console.error("[Onboarding] ensurePermanentMessage failed:", err.message);
+  }
+  try {
+    await ensureOrientationMessage();
+  } catch (err) {
+    console.error("[Orientation] ensureOrientationMessage failed:", err.message);
   }
 });
 
@@ -493,11 +676,11 @@ process.on("unhandledRejection", (err) => console.error("[Process] unhandledReje
 // Only log in when run directly (lets the file be required for testing).
 if (require.main === module) {
   if (!BOT_TOKEN) {
-    console.error("[Fenrir] BOT_TOKEN is not set.");
+    console.error("[Heimdall] BOT_TOKEN is not set.");
     process.exit(1);
   }
   client.login(BOT_TOKEN).catch((err) => {
-    console.error("[Fenrir] Login failed:", err.message);
+    console.error("[Heimdall] Login failed:", err.message);
     process.exit(1);
   });
 }
@@ -513,10 +696,18 @@ module.exports = {
   config,
   handleInteraction,
   ensurePermanentMessage,
+  ensureOrientationMessage,
+  buildOrientationMessage,
   deletePingsFor,
   ID,
   UNVERIFIED_ROLE_ID,
   CLAN_MEMBER_ROLE_ID,
   OSRS_ROLE_ID,
   ONBOARDING_CHANNEL_ID,
+  ORIENTATION_CHANNEL_ID,
+  LEADER_ROLE_ID,
+  STAFF_ROLE_ID,
+  JR_STAFF_ROLE_ID,
+  VERIFIED_LEADER_ROLE_ID,
+  VERIFIED_STAFF_ROLE_ID,
 };
