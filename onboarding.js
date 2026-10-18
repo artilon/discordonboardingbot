@@ -850,20 +850,21 @@ function buildMemberLeftAlertStep2(rsn, lastRank, xp, clickedByUserId) {
 async function recordAuditLog(entry) {
   const supabase = getSupabase();
   if (supabase) {
-    await supabase
-      .from("xp_rank_logs")
-      .insert({
-        rsn: entry.rsn,
-        event_type: entry.eventType,
-        xp_delta: entry.xpDelta ?? 0,
-        total_xp: entry.totalXp ?? 0,
-        old_rank: entry.oldRank ?? null,
-        new_rank: entry.newRank ?? null,
-        reason: entry.reason ?? null,
-        staff_user_id: entry.staffUserId ?? null,
-        staff_user_tag: entry.staffUserTag ?? null,
-      })
-      .catch(() => {});
+    try {
+      await supabase
+        .from("xp_rank_logs")
+        .insert({
+          rsn: entry.rsn,
+          event_type: entry.eventType,
+          xp_delta: entry.xpDelta ?? 0,
+          total_xp: entry.totalXp ?? 0,
+          old_rank: entry.oldRank ?? null,
+          new_rank: entry.newRank ?? null,
+          reason: entry.reason ?? null,
+          staff_user_id: entry.staffUserId ?? null,
+          staff_user_tag: entry.staffUserTag ?? null,
+        });
+    } catch {}
   }
 }
 
@@ -1810,9 +1811,13 @@ client.once(Events.ClientReady, async () => {
   try {
     await ensureRankListMessage();
     await syncClanRanks();
-    startRankingSyncLoop();
   } catch (err) {
     console.error("[RankSync] Initial ranking sync failed:", err.message);
+  }
+  try {
+    startRankingSyncLoop();
+  } catch (err) {
+    console.error("[RankSync] startRankingSyncLoop failed:", err.message);
   }
 });
 
