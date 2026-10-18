@@ -30,6 +30,11 @@
 //   - Maintains an auto-updated permanent Rank List in the Rank List channel.
 
 require("dotenv").config();
+if (typeof globalThis.WebSocket === "undefined") {
+  try {
+    globalThis.WebSocket = require("ws");
+  } catch {}
+}
 const {
   Client,
   GatewayIntentBits,
@@ -71,6 +76,9 @@ const VERIFIED_STAFF_ROLE_ID   = "1559997317325656094";
 const STAFF_ALERT_CHANNEL_ID = "1561481869197840504";
 const RANK_LIST_CHANNEL_ID   = "1561482413341679757";
 const RANK_LOG_CHANNEL_ID    = "1561484125016428605";
+
+// Clan creation date floor (join dates earlier than this are clamped to 2026-10-11)
+const CLAN_CREATION_DATE = "2026-10-11";
 
 // Tenure XP award amounts
 const WEEKLY_BASE_XP  = 2500;   // Multiplied by current rank multiplier every 7 days
@@ -150,8 +158,14 @@ const client = new Client({
 function getSupabase() {
   if (config.supabase) return config.supabase;
   if (SUPABASE_URL && SUPABASE_KEY) {
+    if (typeof globalThis.WebSocket === "undefined") {
+      try {
+        globalThis.WebSocket = require("ws");
+      } catch {}
+    }
     config.supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
       auth: { persistSession: false },
+      realtime: globalThis.WebSocket ? { transport: globalThis.WebSocket } : undefined,
     });
     return config.supabase;
   }
@@ -1001,9 +1015,10 @@ async function processRosterUpload(supabase) {
     const rsn = String(row.rsn || "").trim();
     const parsedDate = parseJoinedDate(row.joined_date);
     if (!rsn || !parsedDate) continue;
+    const clampedIso = parsedDate.iso < CLAN_CREATION_DATE ? CLAN_CREATION_DATE : parsedDate.iso;
     uploadedByKey.set(rsn.toLowerCase(), {
       rsn,
-      joined_date: parsedDate.iso,
+      joined_date: clampedIso,
     });
   }
 
@@ -1143,8 +1158,16 @@ async function syncClanRanks(asOfDate = new Date()) {
 
     for (const member of members) {
       if (member.active !== false) {
+        const parsedJoin = parseJoinedDate(member.joined_date);
+        const effectiveJoinedDate =
+          parsedJoin && parsedJoin.iso < CLAN_CREATION_DATE ? CLAN_CREATION_DATE : member.joined_date;
+        const dateClamped = effectiveJoinedDate !== member.joined_date;
+        if (dateClamped) {
+          member.joined_date = effectiveJoinedDate;
+        }
+
         // Active clan member: calculate tenure & award any new weekly/monthly/yearly milestones
-        const calc = calculateTenureProgression(member.joined_date, asOfDate, member);
+        const calc = calculateTenureProgression(effectiveJoinedDate, asOfDate, member);
         const xpChanged = calc.xp !== (Number(member.xp) || 0);
         const rankChanged = calc.eligibleRank.name !== member.eligible_rank;
         const countersChanged =
@@ -1152,11 +1175,12 @@ async function syncClanRanks(asOfDate = new Date()) {
           calc.monthsAwarded !== (Number(member.months_awarded) || 0) ||
           calc.yearsAwarded !== (Number(member.years_awarded) || 0);
 
-        if (xpChanged || rankChanged || countersChanged) {
+        if (xpChanged || rankChanged || countersChanged || dateClamped) {
           const nowIso = new Date().toISOString();
           await supabase
             .from("clan_members")
             .update({
+              joined_date: effectiveJoinedDate,
               xp: calc.xp,
               eligible_rank: calc.eligibleRank.name,
               weeks_awarded: calc.weeksAwarded,
@@ -1847,6 +1871,7 @@ module.exports = {
   buildOrientationMessage,
   deletePingsFor,
   // Ranking system exports
+  CLAN_CREATION_DATE,
   RANK_TIERS,
   WEEKLY_BASE_XP,
   MONTHLY_BASE_XP,
