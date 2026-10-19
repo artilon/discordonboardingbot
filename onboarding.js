@@ -87,21 +87,21 @@ const YEARLY_BASE_XP  = 100000; // Awarded every 365 days
 
 // Rank progression table (Bronze -> Legacy)
 const RANK_TIERS = [
-  { name: "Bronze",      multiplier: 1,    xpNeeded: 0 },
-  { name: "Steel",       multiplier: 1,    xpNeeded: 2500 },
-  { name: "Black",       multiplier: 1,    xpNeeded: 10000 },
-  { name: "Mithril",     multiplier: 1.5,  xpNeeded: 20000 },
-  { name: "Adamant",     multiplier: 1.5,  xpNeeded: 42500 },
-  { name: "Rune",        multiplier: 2,    xpNeeded: 65000 },
-  { name: "Dragon",      multiplier: 2,    xpNeeded: 105000 },
-  { name: "Sapphire",    multiplier: 2.5,  xpNeeded: 155000 },
-  { name: "Emerald",     multiplier: 2.5,  xpNeeded: 220000 },
-  { name: "Ruby",        multiplier: 3,    xpNeeded: 295000 },
-  { name: "Diamond",     multiplier: 3,    xpNeeded: 400000 },
-  { name: "Dragonstone", multiplier: 3.5,  xpNeeded: 500000 },
-  { name: "Onyx",        multiplier: 3.5,  xpNeeded: 655000 },
-  { name: "Zenyte",      multiplier: 4,    xpNeeded: 780000 },
-  { name: "Legacy",      multiplier: null, xpNeeded: 1045000 },
+  { name: "Bronze",      multiplier: 1,    xpNeeded: 0,       emoji: "<:bronze:1561542018038104135>" },
+  { name: "Steel",       multiplier: 1,    xpNeeded: 2500,    emoji: "<:steel:1561542523946537030>" },
+  { name: "Black",       multiplier: 1,    xpNeeded: 10000,   emoji: "<:black:1561542000799649894>" },
+  { name: "Mithril",     multiplier: 1.5,  xpNeeded: 20000,   emoji: "<:mithril:1561542215031988234>" },
+  { name: "Adamant",     multiplier: 1.5,  xpNeeded: 42500,   emoji: "<:adamant:1561541980402618510>" },
+  { name: "Rune",        multiplier: 2,    xpNeeded: 65000,   emoji: "<:rune:1561542461183102996>" },
+  { name: "Dragon",      multiplier: 2,    xpNeeded: 105000,  emoji: "<:dragon:1561542060631130204>" },
+  { name: "Sapphire",    multiplier: 2.5,  xpNeeded: 155000,  emoji: "<:sapphire:1561542479465943132>" },
+  { name: "Emerald",     multiplier: 2.5,  xpNeeded: 220000,  emoji: "<:emerald:1561542095075024896>" },
+  { name: "Ruby",        multiplier: 3,    xpNeeded: 295000,  emoji: "<:ruby:1561542439272063056>" },
+  { name: "Diamond",     multiplier: 3,    xpNeeded: 400000,  emoji: "<:diamond:1561542040876228792>" },
+  { name: "Dragonstone", multiplier: 3.5,  xpNeeded: 500000,  emoji: "<:dragonstone:1561542078612246598>" },
+  { name: "Onyx",        multiplier: 3.5,  xpNeeded: 655000,  emoji: "<:onyx:1561542393709199470>" },
+  { name: "Zenyte",      multiplier: 4,    xpNeeded: 780000,  emoji: "<:zenyte:1561542547799674910>" },
+  { name: "Legacy",      multiplier: null, xpNeeded: 1045000, emoji: "<:legacy:1561542158346100776>" },
 ];
 
 // OSRS display names: max 12 characters (OSRS wiki, Account Management > Display name).
@@ -349,6 +349,18 @@ function getRankIndex(rankName) {
   return idx === -1 ? 0 : idx;
 }
 
+function getRankEmoji(rankName) {
+  const tier = RANK_TIERS[getRankIndex(rankName)];
+  return tier?.emoji || "";
+}
+
+function formatRankName(rankName, bold = true) {
+  const tier = RANK_TIERS[getRankIndex(rankName)];
+  const name = tier?.name || String(rankName || "Bronze");
+  const emoji = tier?.emoji ? `${tier.emoji} ` : "";
+  return bold ? `${emoji}**${name}**` : `${emoji}${name}`;
+}
+
 function formatMultiplier(mult) {
   return mult === null || mult === undefined ? "n/a" : `${mult}x`;
 }
@@ -416,7 +428,7 @@ function calculateTenureProgression(joinedDate, asOfDate = new Date(), prevAward
           rankBefore: rankBefore.name,
           rankAfter: rankAfter.name,
           totalXpAfter: xp,
-          reason: `Week #${weekIndex} clan tenure (${WEEKLY_BASE_XP.toLocaleString()} base × ${mult}x ${rankBefore.name})`,
+          reason: `Week #${weekIndex} clan tenure (${WEEKLY_BASE_XP.toLocaleString()} base × ${mult}x ${formatRankName(rankBefore.name)})`,
         });
       }
     }
@@ -442,7 +454,7 @@ function calculateTenureProgression(joinedDate, asOfDate = new Date(), prevAward
           rankAfter: rankAfter.name,
           totalXpAfter: xp,
           reason: config.multiplyMonthlyYearly
-            ? `Month #${monthIndex} clan tenure (${MONTHLY_BASE_XP.toLocaleString()} base × ${mult}x ${rankBefore.name})`
+            ? `Month #${monthIndex} clan tenure (${MONTHLY_BASE_XP.toLocaleString()} base × ${mult}x ${formatRankName(rankBefore.name)})`
             : `Month #${monthIndex} clan tenure bonus (+${MONTHLY_BASE_XP.toLocaleString()} XP)`,
         });
       }
@@ -469,7 +481,7 @@ function calculateTenureProgression(joinedDate, asOfDate = new Date(), prevAward
           rankAfter: rankAfter.name,
           totalXpAfter: xp,
           reason: config.multiplyMonthlyYearly
-            ? `Year #${yearIndex} clan tenure (${YEARLY_BASE_XP.toLocaleString()} base × ${mult}x ${rankBefore.name})`
+            ? `Year #${yearIndex} clan tenure (${YEARLY_BASE_XP.toLocaleString()} base × ${mult}x ${formatRankName(rankBefore.name)})`
             : `Year #${yearIndex} clan anniversary bonus (+${YEARLY_BASE_XP.toLocaleString()} XP)`,
         });
       }
@@ -603,7 +615,7 @@ async function ensureOrientationMessage() {
 function buildRankTableSummary() {
   return RANK_TIERS.map((t) => {
     const multText = t.multiplier ? `${t.multiplier}x` : "Max";
-    return `**${t.name}** (${multText}) — \`${t.xpNeeded.toLocaleString()} XP\``;
+    return `${formatRankName(t.name)} (${multText}) — \`${t.xpNeeded.toLocaleString()} XP\``;
   }).join(" • ");
 }
 
@@ -638,11 +650,11 @@ function buildRankListPayload(members = [], asOfDate = new Date()) {
     const joinedStr = joined ? joined.iso : "Unknown";
     const pendingTag =
       getRankIndex(eligibleTier.name) > getRankIndex(confirmedRank)
-        ? ` *(⏳ Rank-up to **${eligibleTier.name}** pending)*`
+        ? ` *(⏳ Rank-up to ${formatRankName(eligibleTier.name)} pending)*`
         : "";
 
     return (
-      `**${idx + 1}. ${m.rsn}** — **${confirmedRank}** (${multStr}) • \`${xp.toLocaleString()} XP\`\n` +
+      `**${idx + 1}. ${m.rsn}** — ${formatRankName(confirmedRank)} (${multStr}) • \`${xp.toLocaleString()} XP\`\n` +
       `┗ Joined: \`${joinedStr}\` (${formatTenureDuration(days)})${pendingTag}`
     );
   });
@@ -733,25 +745,27 @@ function buildRankUpAlertStep1(member, targetRankName) {
     .setColor(COLOR.gold)
     .setTitle(`Rank-Up Alert — ${member.rsn}`)
     .setDescription(
-      `**${member.rsn}** has earned enough Clan Rank XP to be promoted in-game!\n\n` +
+      `**${member.rsn}** has earned enough Clan Rank XP to be promoted from ${formatRankName(currentRank)} to ${formatRankName(targetTier.name)} in-game!\n\n` +
       `Please rank them up in-game, then complete the double confirmation below.`
     )
     .addFields(
       { name: "Member (RSN)", value: `\`${member.rsn}\``, inline: true },
-      { name: "Previous Rank", value: `**${currentRank}**`, inline: true },
-      { name: "New Rank", value: `**${targetTier.name}** (${formatMultiplier(targetTier.multiplier)})`, inline: true },
+      { name: "Previous Rank", value: `${formatRankName(currentRank)}`, inline: true },
+      { name: "New Rank", value: `${formatRankName(targetTier.name)} (${formatMultiplier(targetTier.multiplier)})`, inline: true },
       { name: "Total Rank XP", value: `\`${xp.toLocaleString()} XP\``, inline: true },
-      { name: "Next Rank Goal", value: nextTier ? `${nextTier.name} (\`${nextTier.xpNeeded.toLocaleString()} XP\`)` : "Max Rank Reached", inline: true },
+      { name: "Next Rank Goal", value: nextTier ? `${formatRankName(nextTier.name)} (\`${nextTier.xpNeeded.toLocaleString()} XP\`)` : "Max Rank Reached", inline: true },
       { name: "Time in Clan", value: `${formatTenureDuration(days)} (Joined \`${joined ? joined.iso : member.joined_date}\`)`, inline: true }
     )
     .setFooter({ text: "Confirmation 1 of 2 • Alert auto-deletes after 2nd confirmation." });
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`${ID.RANKUP_C1}:${encodeName(member.rsn)}:${targetTier.name}`)
-      .setLabel(`Ranked Up to ${targetTier.name} In-Game (1/2)`)
-      .setStyle(ButtonStyle.Primary)
-  );
+  const btn = new ButtonBuilder()
+    .setCustomId(`${ID.RANKUP_C1}:${encodeName(member.rsn)}:${targetTier.name}`)
+    .setLabel(`Ranked Up to ${targetTier.name} In-Game (1/2)`)
+    .setStyle(ButtonStyle.Primary);
+  if (targetTier.emoji) {
+    btn.setEmoji(targetTier.emoji);
+  }
+  const row = new ActionRowBuilder().addComponents(btn);
 
   return { embeds: [embed], components: [row] };
 }
@@ -762,12 +776,12 @@ function buildRankUpAlertStep2(rsn, currentRank, targetRankName, xp, clickedByUs
     .setTitle(`Confirmation 2 of 2 — Rank-Up for ${rsn}`)
     .setDescription(
       `<@${clickedByUserId}> marked **${rsn}** as ranked up.\n\n` +
-      `Are you **absolutely sure** that **${rsn}** has been promoted from **${currentRank}** to **${targetRankName}** in-game?\n\n` +
+      `Are you **absolutely sure** that **${rsn}** has been promoted from ${formatRankName(currentRank)} to ${formatRankName(targetRankName)} in-game?\n\n` +
       `Confirming will log the promotion in the XP & Rank Log channel, update the permanent rank list, and **auto-delete** this alert.`
     )
     .addFields(
       { name: "Member (RSN)", value: `\`${rsn}\``, inline: true },
-      { name: "Promotion", value: `${currentRank} ➔ **${targetRankName}**`, inline: true },
+      { name: "Promotion", value: `${formatRankName(currentRank)} ➔ ${formatRankName(targetRankName)}`, inline: true },
       { name: "Total Rank XP", value: `\`${(Number(xp) || 0).toLocaleString()} XP\``, inline: true }
     )
     .setFooter({ text: "Confirmation 2 of 2 — Final Check" });
@@ -800,7 +814,7 @@ function buildMemberLeftAlertStep1(member) {
     )
     .addFields(
       { name: "Member (RSN)", value: `\`${member.rsn}\``, inline: true },
-      { name: "Last Rank", value: `**${lastRank}**`, inline: true },
+      { name: "Last Rank", value: `${formatRankName(lastRank)}`, inline: true },
       { name: "Final Rank XP", value: `\`${xp.toLocaleString()} XP\``, inline: true },
       { name: "Joined Date", value: `\`${joined ? joined.iso : (member.joined_date || "Unknown")}\``, inline: true }
     )
@@ -827,7 +841,7 @@ function buildMemberLeftAlertStep2(rsn, lastRank, xp, clickedByUserId) {
     )
     .addFields(
       { name: "Member (RSN)", value: `\`${rsn}\``, inline: true },
-      { name: "Final Rank", value: `**${lastRank}**`, inline: true },
+      { name: "Final Rank", value: `${formatRankName(lastRank)}`, inline: true },
       { name: "Final XP", value: `\`${(Number(xp) || 0).toLocaleString()} XP\``, inline: true }
     )
     .setFooter({ text: "Confirmation 2 of 2 — Final Check" });
@@ -896,7 +910,7 @@ async function logXpAwardToDiscord(memberRsn, events, totalXp, eligibleRankName)
       .addFields(
         { name: "Member (RSN)", value: `\`${memberRsn}\``, inline: true },
         { name: "XP Awarded", value: `\`+${ev.xpGained.toLocaleString()} XP\``, inline: true },
-        { name: "New Total XP", value: `\`${totalXp.toLocaleString()} XP\` (**${eligibleRankName}**)`, inline: true },
+        { name: "New Total XP", value: `\`${totalXp.toLocaleString()} XP\` (${formatRankName(eligibleRankName)})`, inline: true },
         { name: "Awarded For", value: ev.reason, inline: false },
         { name: "When", value: `<t:${nowUnix}:F> (Milestone date: \`${ev.date}\`)`, inline: false }
       );
@@ -922,7 +936,7 @@ async function logXpAwardToDiscord(memberRsn, events, totalXp, eligibleRankName)
       .addFields(
         { name: "Member (RSN)", value: `\`${memberRsn}\``, inline: true },
         { name: "Total XP Awarded", value: `\`+${totalGained.toLocaleString()} XP\``, inline: true },
-        { name: "New Total XP", value: `\`${totalXp.toLocaleString()} XP\` (**${eligibleRankName}**)`, inline: true },
+        { name: "New Total XP", value: `\`${totalXp.toLocaleString()} XP\` (${formatRankName(eligibleRankName)})`, inline: true },
         {
           name: `Milestones Awarded (${parts.join(", ")})`,
           value: events.length > 5 ? `*Showing latest 5 of ${events.length} milestones:*\n${recentLines}` : recentLines,
@@ -956,7 +970,7 @@ async function logRankUpConfirmedToDiscord({ rsn, oldRank, newRank, totalXp, sta
     .setTitle("Member Ranked Up")
     .addFields(
       { name: "Member (RSN)", value: `\`${rsn}\``, inline: true },
-      { name: "Rank Promotion", value: `${oldRank} ➔ **${newRank}**`, inline: true },
+      { name: "Rank Promotion", value: `${formatRankName(oldRank)} ➔ ${formatRankName(newRank)}`, inline: true },
       { name: "Total Rank XP", value: `\`${(Number(totalXp) || 0).toLocaleString()} XP\``, inline: true },
       { name: "Ranked Up By (Staff)", value: `<@${staffUser.id}> (\`${staffUser.tag || staffUser.username}\`)`, inline: true },
       { name: "When", value: `<t:${nowUnix}:F>`, inline: true }
@@ -990,7 +1004,7 @@ async function logMemberLeftToDiscord(member, staffUser = null) {
     .setTitle(staffUser ? "Member Departure Confirmed" : "Member Left the Clan")
     .addFields(
       { name: "Member (RSN)", value: `\`${member.rsn}\``, inline: true },
-      { name: "Final Rank", value: `**${finalRank}**`, inline: true },
+      { name: "Final Rank", value: `${formatRankName(finalRank)}`, inline: true },
       { name: "Final Rank XP", value: `\`${xp.toLocaleString()} XP\``, inline: true },
       ...(staffUser
         ? [{ name: "Confirmed By (Staff)", value: `<@${staffUser.id}> (\`${staffUser.tag || staffUser.username}\`)`, inline: true }]
@@ -1884,6 +1898,8 @@ module.exports = {
   parseJoinedDate,
   getRankForXp,
   getRankIndex,
+  getRankEmoji,
+  formatRankName,
   getNextRankTier,
   calculateTenureProgression,
   buildRankListPayload,
