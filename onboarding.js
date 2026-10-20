@@ -39,8 +39,10 @@ const zlib = require("zlib");
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   Events,
   ActionRowBuilder,
+  ApplicationCommandOptionType,
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -66,13 +68,23 @@ const CLAN_MEMBER_ROLE_ID   = "1546403975656505354";
 const OSRS_ROLE_ID          = "1546412132822810744";
 const ONBOARDING_CHANNEL_ID = "1546401367004811314";
 
-// Orientation acknowledgement
+// Orientation acknowledgement & leadership roles
 const ORIENTATION_CHANNEL_ID   = "1559995329825472542";
+const OWNER_ROLE_ID            = "1546401420453085204";
+const CO_OWNER_ROLE_ID         = "1559998510110347274";
 const LEADER_ROLE_ID           = "1546401937883402293";
 const STAFF_ROLE_ID            = "1546402959049359360";
 const JR_STAFF_ROLE_ID         = "1546403383752134656";
 const VERIFIED_LEADER_ROLE_ID  = "1559994620442710097";
 const VERIFIED_STAFF_ROLE_ID   = "1559997317325656094";
+
+// Roles allowed to upload the clan roster through the bot
+const ROSTER_UPLOAD_ROLE_IDS = [
+  OWNER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  VERIFIED_LEADER_ROLE_ID,
+  LEADER_ROLE_ID,
+];
 
 // Ranking system channels
 const STAFF_ALERT_CHANNEL_ID = "1561481869197840504";
@@ -135,6 +147,10 @@ const ID = {
   ORIENT_STAFF:  "orient_staff",
   // Ranking system custom IDs
   RANK_LIST_REFRESH: "rank_list_refresh",
+  ROSTER_UPLOAD_BTN: "roster_upload_btn",
+  ROSTER_PASTE_BTN:  "roster_paste_btn",
+  ROSTER_MODAL:      "roster_modal",
+  ROSTER_INPUT:      "roster_input",
   GROWTH_RANGE_30D:  "growth_range_30d",
   GROWTH_RANGE_6M:   "growth_range_6m",
   GROWTH_RANGE_ALL:  "growth_range_all",
@@ -158,7 +174,13 @@ const COLOR = {
 const client = new Client({
   // GuildMembers is a privileged intent — it must be enabled in the Developer Portal
   // (Bot tab -> Privileged Gateway Intents -> Server Members Intent).
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+  ],
+  partials: [Partials.Channel],
 });
 
 function getSupabase() {
@@ -1169,6 +1191,10 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
       .setLabel("Refresh Rank List")
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
+      .setCustomId(ID.ROSTER_UPLOAD_BTN)
+      .setLabel("Upload Roster")
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
       .setCustomId(ID.GROWTH_RANGE_30D)
       .setLabel("Chart: 30 Days")
       .setStyle(rangeKey === "30d" ? ButtonStyle.Success : ButtonStyle.Secondary),
@@ -1262,7 +1288,13 @@ async function ensureRankListMessage(members, growthSnapshots) {
   return ensureEmbedMessage({
     channelId: RANK_LIST_CHANNEL_ID,
     label: "RankList",
-    buttonIds: [ID.RANK_LIST_REFRESH, ID.GROWTH_RANGE_30D, ID.GROWTH_RANGE_6M, ID.GROWTH_RANGE_ALL],
+    buttonIds: [
+      ID.RANK_LIST_REFRESH,
+      ID.ROSTER_UPLOAD_BTN,
+      ID.GROWTH_RANGE_30D,
+      ID.GROWTH_RANGE_6M,
+      ID.GROWTH_RANGE_ALL,
+    ],
     payload: buildRankListPayload(list, new Date(), {
       range: config.growthChartRange,
       growthSnapshots: snapshots || [],
@@ -1555,17 +1587,57 @@ async function logMemberLeftToDiscord(member, staffUser = null) {
 }
 
 // ---- Supabase Roster Upload & Sync Engine ----
-async function processRosterUpload(supabase) {
-  const { data: uploads, error: uploadErr } = await supabase
-    .from("roster_upload")
-    .select("*")
-    .order("id", { ascending: true });
+/**
+ * Parses CSV or plain-text clan roster exports (such as "AztecSoul,Minion,17-Oct-2026"
+ * or "AztecSoul,2026-10-17") into deduplicated `{ rsn, joined_date }` rows.
+ */
+function parseRosterText(rawText) {
+  const lines = String(rawText || "").split(/\r?\n/);
+  const byKey = new Map();
 
-  if (uploadErr || !uploads || uploads.length === 0) return false;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
 
-  // Map latest uploaded entry per normalized RSN
+    const delimiter = line.includes(",") ? "," : line.includes("\t") ? "\t" : line.includes(";") ? ";" : ",";
+    const cells = line
+      .split(delimiter)
+      .map((c) => c.trim().replace(/^["']+|["']+$/g, "").trim())
+      .filter((c) => c.length > 0);
+
+    if (cells.length < 2) continue;
+
+    const rsn = cells[0];
+    if (!rsn || /^(rsn|name|member|username|player)$/i.test(rsn)) continue;
+
+    // Find the column containing the join date (supports 2-column "RSN,Date" or 3+ column "RSN,Rank,Date")
+    let parsedDate = null;
+    for (let i = cells.length - 1; i >= 1; i--) {
+      const candidate = parseJoinedDate(cells[i]);
+      if (candidate) {
+        parsedDate = candidate;
+        break;
+      }
+    }
+    if (!parsedDate) continue;
+
+    const clampedIso = parsedDate.iso < CLAN_CREATION_DATE ? CLAN_CREATION_DATE : parsedDate.iso;
+    byKey.set(rsn.toLowerCase(), {
+      rsn,
+      joined_date: clampedIso,
+    });
+  }
+
+  return Array.from(byKey.values());
+}
+
+async function importRosterRows(supabase, rows = []) {
+  if (!supabase || !rows || rows.length === 0) {
+    return { ok: false, totalUploaded: 0, added: [], reactivated: [], markedLeft: [] };
+  }
+
   const uploadedByKey = new Map();
-  for (const row of uploads) {
+  for (const row of rows) {
     const rsn = String(row.rsn || "").trim();
     const parsedDate = parseJoinedDate(row.joined_date);
     if (!rsn || !parsedDate) continue;
@@ -1576,14 +1648,16 @@ async function processRosterUpload(supabase) {
     });
   }
 
-  if (uploadedByKey.size === 0) return false;
+  if (uploadedByKey.size === 0) {
+    return { ok: false, totalUploaded: 0, added: [], reactivated: [], markedLeft: [] };
+  }
 
   const { data: existingMembers, error: existingErr } = await supabase
     .from("clan_members")
     .select("*");
   if (existingErr) {
-    console.error("[RankSync] Could not fetch clan_members for roster upload:", existingErr.message);
-    return false;
+    console.error("[RankSync] Could not fetch clan_members for roster import:", existingErr.message);
+    return { ok: false, error: existingErr.message, totalUploaded: 0, added: [], reactivated: [], markedLeft: [] };
   }
 
   const existingByKey = new Map();
@@ -1592,6 +1666,9 @@ async function processRosterUpload(supabase) {
   }
 
   const nowIso = new Date().toISOString();
+  const added = [];
+  const reactivated = [];
+  const markedLeft = [];
 
   // 1. Insert new members or update existing members present in the upload
   for (const [key, uploaded] of uploadedByKey.entries()) {
@@ -1611,7 +1688,9 @@ async function processRosterUpload(supabase) {
         left_confirmed: false,
         updated_at: nowIso,
       });
+      added.push(uploaded.rsn);
     } else if (!existing.active || existing.joined_date !== uploaded.joined_date || existing.rsn !== uploaded.rsn) {
+      if (!existing.active) reactivated.push(uploaded.rsn);
       await supabase
         .from("clan_members")
         .update({
@@ -1630,6 +1709,7 @@ async function processRosterUpload(supabase) {
   // 2. Mark previously active members missing from the upload as having left the clan
   for (const [key, existing] of existingByKey.entries()) {
     if (existing.active && !uploadedByKey.has(key)) {
+      markedLeft.push(existing.rsn);
       await supabase
         .from("clan_members")
         .update({
@@ -1645,13 +1725,32 @@ async function processRosterUpload(supabase) {
     }
   }
 
-  // 3. Clear processed rows from roster_upload
+  return {
+    ok: true,
+    totalUploaded: uploadedByKey.size,
+    added,
+    reactivated,
+    markedLeft,
+  };
+}
+
+async function processRosterUpload(supabase) {
+  const { data: uploads, error: uploadErr } = await supabase
+    .from("roster_upload")
+    .select("*")
+    .order("id", { ascending: true });
+
+  if (uploadErr || !uploads || uploads.length === 0) return false;
+
+  const result = await importRosterRows(supabase, uploads);
+  if (!result.ok) return false;
+
   const uploadIds = uploads.map((u) => u.id).filter((id) => id !== undefined);
   if (uploadIds.length > 0) {
     await supabase.from("roster_upload").delete().in("id", uploadIds);
   }
 
-  console.log(`[RankSync] Processed roster_upload (${uploadedByKey.size} member(s)).`);
+  console.log(`[RankSync] Processed roster_upload (${result.totalUploaded} member(s)).`);
   return true;
 }
 
@@ -2212,6 +2311,293 @@ async function onGrowthRangeButton(interaction, rangeKey) {
   await interaction.editReply(payload).catch((e) => console.warn("[GrowthChart] Could not update range view:", e.message));
 }
 
+// ---- Roster Upload via Discord Button / File Drop / Modal / Slash Command ----
+const pendingRosterUploads = new Map(); // userId -> { expiresAt, channelId, guildId }
+const ROSTER_UPLOAD_WINDOW_MS = 2 * 60 * 1000;
+
+function canUploadRoster(member) {
+  return hasAnyRole(member, ROSTER_UPLOAD_ROLE_IDS);
+}
+
+function rosterUploadDeniedEmbed() {
+  return new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle("This button isn't available to you")
+    .setDescription(
+      "Uploading the clan roster is restricted to **Leaders**, **Co-Owners**, and the **Owner**.\n\n" +
+      "If you think that's a mistake, please reach out to an Owner."
+    );
+}
+
+function buildRosterUploadResultEmbed(result) {
+  if (!result.ok) {
+    return new EmbedBuilder()
+      .setColor(COLOR.bad)
+      .setTitle("Roster Upload Failed")
+      .setDescription(
+        result.error ||
+          "No valid `RSN,JoinedDate` rows were found. Make sure each line looks like `AztecSoul,Minion,17-Oct-2026` or `AztecSoul,2026-10-17`."
+      );
+  }
+
+  const addedPreview =
+    result.added.length > 0
+      ? `${result.added.length} (${result.added.slice(0, 10).join(", ")}${result.added.length > 10 ? "…" : ""})`
+      : "0";
+  const leftPreview =
+    result.markedLeft.length > 0
+      ? `${result.markedLeft.length} (${result.markedLeft.slice(0, 10).join(", ")}${result.markedLeft.length > 10 ? "…" : ""})`
+      : "0";
+
+  return new EmbedBuilder()
+    .setColor(COLOR.ok)
+    .setTitle("Clan Roster Uploaded & Synced")
+    .setDescription(
+      "Your clan member list has been imported to Supabase, tenure XP has been calculated, and the Growth Chart & Rank List have been updated!"
+    )
+    .addFields(
+      { name: "Active Members in Upload", value: `\`${result.totalUploaded}\``, inline: true },
+      { name: "New Members Added", value: addedPreview, inline: true },
+      { name: "Members Marked Left", value: leftPreview, inline: true }
+    );
+}
+
+async function onRosterUploadButton(interaction) {
+  if (!canUploadRoster(interaction.member)) {
+    return interaction.reply({ embeds: [rosterUploadDeniedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  pendingRosterUploads.set(interaction.user.id, {
+    expiresAt: Date.now() + ROSTER_UPLOAD_WINDOW_MS,
+    channelId: interaction.channelId,
+    guildId: interaction.guildId,
+  });
+
+  const botMention = client.user ? `<@${client.user.id}>` : "@Heimdall";
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("Upload Clan Roster to Database")
+    .setDescription(
+      "Upload mode is active for the next **2 minutes**. Choose whichever method is easiest:\n\n" +
+      `**Option 1 — Upload a \`.csv\` or \`.txt\` File (No Size Limit):**\n` +
+      `• Drop your exported \`.csv\` or \`.txt\` file in this channel and mention ${botMention} in the message (or drop the file in a **DM to ${botMention}**, or use \`/upload-roster\`).\n` +
+      `• I will automatically import the file into Supabase, update the chart & rank list, and **delete your upload message immediately**.\n\n` +
+      `**Option 2 — Paste Roster Text:**\n` +
+      `• Click **Paste Roster Text** below to paste lines like \`AztecSoul,Minion,17-Oct-2026\` directly.`
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(ID.ROSTER_PASTE_BTN)
+      .setLabel("Paste Roster Text")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return interaction.reply({
+    embeds: [embed],
+    components: [row],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function onRosterPasteButton(interaction) {
+  if (!canUploadRoster(interaction.member)) {
+    return interaction.reply({ embeds: [rosterUploadDeniedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(ID.ROSTER_MODAL)
+    .setTitle("Upload Clan Roster");
+
+  const input = new TextInputBuilder()
+    .setCustomId(ID.ROSTER_INPUT)
+    .setLabel("Paste clan list (RSN,Rank,Date or RSN,Date)")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setPlaceholder("AztecSoul,Minion,17-Oct-2026\nEm Bri,Master,11-Oct-2026\nTorlokt,Owner,4-Mar-2024");
+
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return interaction.showModal(modal);
+}
+
+async function onRosterModalSubmit(interaction) {
+  if (!canUploadRoster(interaction.member)) {
+    return interaction.reply({ embeds: [rosterUploadDeniedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const rawText = interaction.fields.getTextInputValue(ID.ROSTER_INPUT);
+  const rows = parseRosterText(rawText);
+  if (rows.length === 0) {
+    return interaction.editReply({
+      embeds: [buildRosterUploadResultEmbed({ ok: false })],
+    });
+  }
+
+  const supabase = getSupabase();
+  if (!supabase) {
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Supabase Not Configured")
+          .setDescription("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not set."),
+      ],
+    });
+  }
+
+  const result = await importRosterRows(supabase, rows);
+  pendingRosterUploads.delete(interaction.user.id);
+  await syncClanRanks();
+  return interaction.editReply({ embeds: [buildRosterUploadResultEmbed(result)] });
+}
+
+async function onUploadRosterSlashCommand(interaction) {
+  if (!canUploadRoster(interaction.member)) {
+    return interaction.reply({ embeds: [rosterUploadDeniedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  const attachment = interaction.options.getAttachment("file", true);
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  let rawText = "";
+  try {
+    const res = await fetch(attachment.url);
+    rawText = await res.text();
+  } catch (err) {
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Could Not Read File")
+          .setDescription(`Failed to download attachment: ${err.message}`),
+      ],
+    });
+  }
+
+  const rows = parseRosterText(rawText);
+  if (rows.length === 0) {
+    return interaction.editReply({
+      embeds: [buildRosterUploadResultEmbed({ ok: false })],
+    });
+  }
+
+  const supabase = getSupabase();
+  if (!supabase) {
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Supabase Not Configured")
+          .setDescription("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are not set."),
+      ],
+    });
+  }
+
+  const result = await importRosterRows(supabase, rows);
+  pendingRosterUploads.delete(interaction.user.id);
+  await syncClanRanks();
+  return interaction.editReply({ embeds: [buildRosterUploadResultEmbed(result)] });
+}
+
+async function handleMessageCreate(message) {
+  if (!message || message.author?.bot) return;
+  if (!message.attachments || message.attachments.size === 0) return;
+
+  const session = pendingRosterUploads.get(message.author.id);
+  const hasActiveSession = session && session.expiresAt > Date.now();
+  const isRankListChannel = message.channelId === RANK_LIST_CHANNEL_ID;
+  const isDm = !message.guildId;
+
+  if (!hasActiveSession && !isRankListChannel && !isDm) return;
+
+  // Verify the uploader has Owner / Co-Owner / Leader role
+  let allowed = false;
+  if (message.member) {
+    allowed = canUploadRoster(message.member);
+  } else if (session?.guildId) {
+    const guild = await client.guilds.fetch(session.guildId).catch(() => null);
+    const member = guild ? await guild.members.fetch(message.author.id).catch(() => null) : null;
+    allowed = canUploadRoster(member);
+  } else {
+    for (const guild of client.guilds.cache.values()) {
+      const member = await guild.members.fetch(message.author.id).catch(() => null);
+      if (canUploadRoster(member)) {
+        allowed = true;
+        break;
+      }
+    }
+  }
+
+  if (!allowed) return;
+
+  const attachment = message.attachments.first();
+  if (!attachment?.url) return;
+
+  let rawText = "";
+  try {
+    const res = await fetch(attachment.url);
+    rawText = await res.text();
+  } catch (err) {
+    console.error("[RosterUpload] Could not download file attachment:", err.message);
+    return;
+  }
+
+  // Delete the uploaded file message from the guild channel so the channel stays clean
+  if (message.guildId && message.deletable !== false) {
+    await message.delete().catch(() => {});
+  }
+
+  const rows = parseRosterText(rawText);
+  const supabase = getSupabase();
+  if (!supabase || rows.length === 0) {
+    const errEmbed = buildRosterUploadResultEmbed({ ok: false });
+    if (isDm) {
+      await message.reply({ embeds: [errEmbed] }).catch(() => {});
+    } else if (message.channel?.isTextBased()) {
+      const temp = await message.channel.send({ content: `<@${message.author.id}>`, embeds: [errEmbed] }).catch(() => null);
+      if (temp) setTimeout(() => temp.delete().catch(() => {}), 15000);
+    }
+    return;
+  }
+
+  pendingRosterUploads.delete(message.author.id);
+  const result = await importRosterRows(supabase, rows);
+  await syncClanRanks();
+
+  const summaryEmbed = buildRosterUploadResultEmbed(result);
+  if (isDm) {
+    await message.reply({ embeds: [summaryEmbed] }).catch(() => {});
+  } else if (message.channel?.isTextBased()) {
+    const temp = await message.channel
+      .send({ content: `<@${message.author.id}>`, embeds: [summaryEmbed] })
+      .catch(() => null);
+    if (temp) setTimeout(() => temp.delete().catch(() => {}), 15000);
+  }
+}
+
+async function registerUploadRosterCommand() {
+  if (!client.application) return;
+  const commandDef = {
+    name: "upload-roster",
+    description: "Upload a .csv or .txt clan member list to Supabase (Owner, Co-Owners & Leaders only)",
+    options: [
+      {
+        name: "file",
+        description: "Your exported .csv or .txt clan member list (RSN,Rank,JoinedDate or RSN,JoinedDate)",
+        type: ApplicationCommandOptionType.Attachment,
+        required: true,
+      },
+    ],
+  };
+
+  for (const guild of client.guilds.cache.values()) {
+    await guild.commands.create(commandDef).catch((e) => {
+      console.warn(`[RosterUpload] Could not register /upload-roster in guild ${guild.id}:`, e.message);
+    });
+  }
+}
+
 async function onRankUpConfirm1(interaction, encodedRsn, targetRank) {
   const rsn = decodeName(encodedRsn);
   const supabase = getSupabase();
@@ -2343,6 +2729,10 @@ async function onMemberLeftConfirm2(interaction, encodedRsn) {
 async function handleInteraction(interaction) {
   if (!interaction.inGuild()) return;
 
+  if (interaction.isChatInputCommand?.() && interaction.commandName === "upload-roster") {
+    return onUploadRosterSlashCommand(interaction);
+  }
+
   if (interaction.isButton()) {
     const [base, payload, extra] = interaction.customId.split(":");
     switch (base) {
@@ -2354,6 +2744,8 @@ async function handleInteraction(interaction) {
       case ID.ORIENT_STAFF:
         return onOrientationAccept(interaction);
       case ID.RANK_LIST_REFRESH: return onRankListRefresh(interaction);
+      case ID.ROSTER_UPLOAD_BTN: return onRosterUploadButton(interaction);
+      case ID.ROSTER_PASTE_BTN:  return onRosterPasteButton(interaction);
       case ID.GROWTH_RANGE_30D:  return onGrowthRangeButton(interaction, "30d");
       case ID.GROWTH_RANGE_6M:   return onGrowthRangeButton(interaction, "6m");
       case ID.GROWTH_RANGE_ALL:  return onGrowthRangeButton(interaction, "all");
@@ -2367,14 +2759,20 @@ async function handleInteraction(interaction) {
     }
   }
 
-  if (interaction.isModalSubmit() && interaction.customId === ID.MODAL) {
-    return onModalSubmit(interaction);
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId === ID.MODAL) return onModalSubmit(interaction);
+    if (interaction.customId === ID.ROSTER_MODAL) return onRosterModalSubmit(interaction);
   }
 }
 
 // ================= WIRING =================
 client.once(Events.ClientReady, async () => {
   console.log(`[Heimdall] Logged in as ${client.user.tag}`);
+  try {
+    await registerUploadRosterCommand();
+  } catch (err) {
+    console.error("[RosterUpload] registerUploadRosterCommand failed:", err.message);
+  }
   try {
     await ensurePermanentMessage();
   } catch (err) {
@@ -2408,6 +2806,10 @@ client.on(Events.GuildMemberUpdate, (oldMember, newMember) => {
 
 client.on(Events.GuildMemberRemove, (member) => {
   handleMemberRemove(member).catch((e) => console.error("[Leave] handler error:", e.message));
+});
+
+client.on(Events.MessageCreate, (message) => {
+  handleMessageCreate(message).catch((e) => console.error("[Message] handler error:", e.message));
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -2477,14 +2879,21 @@ module.exports = {
   buildMemberLeftAlertStep2,
   ensureRankListMessage,
   syncClanRanks,
+  parseRosterText,
+  importRosterRows,
   processRosterUpload,
+  canUploadRoster,
+  handleMessageCreate,
   ID,
   UNVERIFIED_ROLE_ID,
   CLAN_MEMBER_ROLE_ID,
   OSRS_ROLE_ID,
   ONBOARDING_CHANNEL_ID,
   ORIENTATION_CHANNEL_ID,
+  OWNER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
   LEADER_ROLE_ID,
+  ROSTER_UPLOAD_ROLE_IDS,
   STAFF_ROLE_ID,
   JR_STAFF_ROLE_ID,
   VERIFIED_LEADER_ROLE_ID,
