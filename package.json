@@ -1,7 +1,7 @@
 {
-  "name": "fenrir-onboarding",
+  "name": "odinheim-onboarding",
   "version": "1.0.0",
-  "description": "Fenrir Discord onboarding bot",
+  "description": "Odinheim Discord onboarding bot",
   "main": "onboarding.js",
   "scripts": {
     "start": "node onboarding.js"

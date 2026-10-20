@@ -951,7 +951,7 @@ function renderGrowthChartPng(points = [], rangeLabel = "ALL-TIME") {
   fillRect(0, 0, W, H, 15, 23, 42, 255);
   fillRect(16, 16, W - 32, H - 32, 24, 34, 56, 255);
 
-  drawText("FENRIR CLAN MEMBER GROWTH", 40, 34, 2, 226, 232, 240, "left");
+  drawText("ODINHEIM CLAN MEMBER GROWTH", 40, 34, 2, 226, 232, 240, "left");
   drawText(`VIEW: ${rangeLabel}`, W - 40, 34, 2, 96, 165, 250, "right");
 
   const padL = 76;
@@ -1056,7 +1056,7 @@ function buildGrowthChartEmbedAndAttachment(
 
   const embed = new EmbedBuilder()
     .setColor(COLOR.main)
-    .setTitle("Fenrir Clan Growth & Roster History")
+    .setTitle("Odinheim Clan Growth & Roster History")
     .setDescription(
       `**Current Active Members:** \`${currentActive}\` • **All-Time Peak:** \`${peakMembers}\` • **View:** \`${rangeLabel}\`\n` +
       `**Clan Founded:** \`${CLAN_CREATION_DATE}\` • **Latest Roster Change:** ${latestDeltaSummary}\n\n` +
