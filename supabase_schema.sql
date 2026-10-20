@@ -1,5 +1,5 @@
 -- ============================================================================
--- HEIMDALL — CLAN RANKING SYSTEM SUPABASE SCHEMA
+-- HEIMDALL — CLAN RANKING & GROWTH CHART SUPABASE SCHEMA
 -- Paste this entire file into your Supabase Dashboard -> SQL Editor -> Run.
 -- ============================================================================
 
@@ -27,13 +27,26 @@ create table if not exists public.clan_members (
 create index if not exists idx_clan_members_active on public.clan_members (active);
 create index if not exists idx_clan_members_xp on public.clan_members (xp desc);
 
+-- Clamp any join date earlier than Clan Creation Date (2026-10-11)
+create or replace function public.clamp_clan_creation_date()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.joined_date < date '2026-10-11' then
+    new.joined_date := date '2026-10-11';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_clamp_clan_creation_date on public.clan_members;
+create trigger trg_clamp_clan_creation_date
+before insert or update on public.clan_members
+for each row
+execute function public.clamp_clan_creation_date();
+
 -- 2. Staging table for easy CSV uploads from in-game clan list exports
---    To update your roster:
---      In Supabase Table Editor -> select `roster_upload` -> "Import data from CSV"
---      Your CSV only needs two columns: `rsn` and `joined_date` (e.g. 2025-10-18 or 18-Oct-2025).
---      Heimdall automatically detects rows in `roster_upload`, adds new members,
---      updates existing members, marks missing members as having left the clan,
---      and clears `roster_upload` for your next import.
 create table if not exists public.roster_upload (
   id bigserial primary key,
   rsn text not null,
@@ -59,7 +72,27 @@ create table if not exists public.xp_rank_logs (
 create index if not exists idx_xp_rank_logs_rsn on public.xp_rank_logs (rsn);
 create index if not exists idx_xp_rank_logs_created_at on public.xp_rank_logs (created_at desc);
 
--- 4. Enable Realtime on clan_members and roster_upload so Heimdall updates immediately
+-- 4. Dated Clan Growth History table (tracks member count & net change over time)
+create table if not exists public.clan_growth_history (
+  id bigserial primary key,
+  recorded_date date not null unique,
+  active_members integer not null default 0,
+  members_joined integer not null default 0,
+  members_left integer not null default 0,
+  note text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_clan_growth_history_date on public.clan_growth_history (recorded_date asc);
+
+-- Disable RLS so the bot can read/write freely
+alter table public.clan_members disable row level security;
+alter table public.roster_upload disable row level security;
+alter table public.xp_rank_logs disable row level security;
+alter table public.clan_growth_history disable row level security;
+
+-- 5. Enable Realtime on clan_members, roster_upload, and clan_growth_history
 do $$
 begin
   if not exists (
@@ -74,6 +107,13 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'roster_upload'
   ) then
     alter publication supabase_realtime add table public.roster_upload;
+  end if;
+
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'clan_growth_history'
+  ) then
+    alter publication supabase_realtime add table public.clan_growth_history;
   end if;
 exception
   when others then
