@@ -35,11 +35,13 @@ if (typeof globalThis.WebSocket === "undefined") {
     globalThis.WebSocket = require("ws");
   } catch {}
 }
+const zlib = require("zlib");
 const {
   Client,
   GatewayIntentBits,
   Events,
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
@@ -117,6 +119,7 @@ const config = {
   settleMs: 3000,
   rankSyncIntervalMs: 5 * 60 * 1000, // Check Supabase + tenure milestones every 5 minutes
   multiplyMonthlyYearly: false,      // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
+  growthChartRange: "all",           // "30d" | "6m" | "all"
   supabase: null,                    // Initialized on startup or injected for tests
 };
 
@@ -132,6 +135,9 @@ const ID = {
   ORIENT_STAFF:  "orient_staff",
   // Ranking system custom IDs
   RANK_LIST_REFRESH: "rank_list_refresh",
+  GROWTH_RANGE_30D:  "growth_range_30d",
+  GROWTH_RANGE_6M:   "growth_range_6m",
+  GROWTH_RANGE_ALL:  "growth_range_all",
   RANKUP_C1:         "rankup_c1",
   RANKUP_C2:         "rankup_c2",
   RANKUP_CANCEL:     "rankup_cancel",
@@ -611,7 +617,456 @@ async function ensureOrientationMessage() {
   });
 }
 
-// ================= RANKING SYSTEM: PERMANENT RANK LIST, ALERTS & LOGS =================
+// ================= RANKING SYSTEM: GROWTH CHART, PERMANENT RANK LIST, ALERTS & LOGS =================
+const SHORT_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+const FONT_5X7 = {
+  "0": ["01110","10001","10011","10101","11001","10001","01110"],
+  "1": ["00100","01100","00100","00100","00100","00100","01110"],
+  "2": ["01110","10001","00001","00010","00100","01000","11111"],
+  "3": ["11110","00001","00001","01110","00001","00001","11110"],
+  "4": ["00010","00110","01010","10010","11111","00010","00010"],
+  "5": ["11111","10000","11110","00001","00001","10001","01110"],
+  "6": ["00110","01000","10000","11110","10001","10001","01110"],
+  "7": ["11111","00001","00010","00100","01000","01000","01000"],
+  "8": ["01110","10001","10001","01110","10001","10001","01110"],
+  "9": ["01110","10001","10001","01111","00001","00010","01100"],
+  "A": ["01110","10001","10001","11111","10001","10001","10001"],
+  "B": ["11110","10001","10001","11110","10001","10001","11110"],
+  "C": ["01110","10001","10000","10000","10000","10001","01110"],
+  "D": ["11100","10010","10001","10001","10001","10010","11100"],
+  "E": ["11111","10000","10000","11110","10000","10000","11111"],
+  "F": ["11111","10000","10000","11110","10000","10000","10000"],
+  "G": ["01110","10001","10000","10111","10001","10001","01110"],
+  "H": ["10001","10001","10001","11111","10001","10001","10001"],
+  "I": ["01110","00100","00100","00100","00100","00100","01110"],
+  "J": ["00111","00010","00010","00010","00010","10010","01100"],
+  "K": ["10001","10010","10100","11000","10100","10010","10001"],
+  "L": ["10000","10000","10000","10000","10000","10000","11111"],
+  "M": ["10001","11011","10101","10101","10001","10001","10001"],
+  "N": ["10001","11001","10101","10011","10001","10001","10001"],
+  "O": ["01110","10001","10001","10001","10001","10001","01110"],
+  "P": ["11110","10001","10001","11110","10000","10000","10000"],
+  "Q": ["01110","10001","10001","10001","10101","10010","01101"],
+  "R": ["11110","10001","10001","11110","10100","10010","10001"],
+  "S": ["01111","10000","10000","01110","00001","00001","11110"],
+  "T": ["11111","00100","00100","00100","00100","00100","00100"],
+  "U": ["10001","10001","10001","10001","10001","10001","01110"],
+  "V": ["10001","10001","10001","10001","10001","01010","00100"],
+  "W": ["10001","10001","10001","10101","10101","11011","10001"],
+  "X": ["10001","10001","01010","00100","01010","10001","10001"],
+  "Y": ["10001","10001","01010","00100","00100","00100","00100"],
+  "Z": ["11111","00001","00010","00100","01000","10000","11111"],
+  "-": ["00000","00000","00000","11111","00000","00000","00000"],
+  "+": ["00000","00100","00100","11111","00100","00100","00000"],
+  "/": ["00001","00010","00010","00100","01000","01000","10000"],
+  ":": ["00000","00100","00100","00000","00100","00100","00000"],
+  ".": ["00000","00000","00000","00000","00000","00100","00100"],
+  "'": ["00100","00100","00000","00000","00000","00000","00000"],
+  "(": ["00010","00100","01000","01000","01000","00100","00010"],
+  ")": ["01000","00100","00010","00010","00010","00100","01000"],
+  " ": ["00000","00000","00000","00000","00000","00000","00000"],
+};
+
+const CRC_TABLE = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  CRC_TABLE[n] = c >>> 0;
+}
+
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function makePngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, "ascii");
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crcBuf]);
+}
+
+function encodePng(width, height, rgba) {
+  const raw = Buffer.alloc(height * (1 + width * 4));
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * (1 + width * 4);
+    raw[rowStart] = 0;
+    rgba.copy(raw, rowStart + 1, y * width * 4, (y + 1) * width * 4);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const compressed = zlib.deflateSync(raw);
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    makePngChunk("IHDR", ihdr),
+    makePngChunk("IDAT", compressed),
+    makePngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function formatShortChartDate(isoDate, spanDays = 30) {
+  const parsed = parseJoinedDate(isoDate);
+  if (!parsed) return String(isoDate || "");
+  const [y, m, d] = parsed.iso.split("-").map(Number);
+  const mon = SHORT_MONTHS[(m || 1) - 1] || "JAN";
+  if (spanDays > 150) {
+    return `${mon} '${String(y).slice(-2)}`;
+  }
+  return `${mon} ${d}`;
+}
+
+/**
+ * Builds the chronological daily growth snapshot series from `CLAN_CREATION_DATE` through `asOfDate`,
+ * combining member join/departure dates from `clan_members` with any explicit snapshots in `clan_growth_history`.
+ */
+function buildGrowthSeries(members = [], recordedSnapshots = [], asOfDate = new Date()) {
+  const asOfParsed = parseJoinedDate(asOfDate) || parseJoinedDate(new Date());
+  const todayIso = asOfParsed ? asOfParsed.iso : CLAN_CREATION_DATE;
+
+  const normalizedMembers = (members || [])
+    .map((m) => {
+      const pJoin = parseJoinedDate(m.joined_date);
+      if (!pJoin) return null;
+      const joinedIso = pJoin.iso < CLAN_CREATION_DATE ? CLAN_CREATION_DATE : pJoin.iso;
+      const pLeft = m.active === false && m.left_at ? parseJoinedDate(m.left_at) : null;
+      return {
+        rsn: m.rsn,
+        active: m.active !== false,
+        joinedIso,
+        leftIso: pLeft ? pLeft.iso : null,
+      };
+    })
+    .filter(Boolean);
+
+  const snapshotByDate = new Map();
+  for (const snap of recordedSnapshots || []) {
+    const p = parseJoinedDate(snap.recorded_date);
+    if (!p) continue;
+    const iso = p.iso < CLAN_CREATION_DATE ? CLAN_CREATION_DATE : p.iso;
+    snapshotByDate.set(iso, snap);
+  }
+
+  const dateSet = new Set([CLAN_CREATION_DATE]);
+  if (todayIso >= CLAN_CREATION_DATE) dateSet.add(todayIso);
+
+  for (const m of normalizedMembers) {
+    if (m.joinedIso >= CLAN_CREATION_DATE && m.joinedIso <= todayIso) {
+      dateSet.add(m.joinedIso);
+    }
+    if (m.leftIso && m.leftIso >= CLAN_CREATION_DATE && m.leftIso <= todayIso) {
+      dateSet.add(m.leftIso);
+    }
+  }
+  for (const iso of snapshotByDate.keys()) {
+    if (iso >= CLAN_CREATION_DATE && iso <= todayIso) {
+      dateSet.add(iso);
+    }
+  }
+
+  const sortedDates = Array.from(dateSet).sort();
+  const series = [];
+  let prevActive = 0;
+
+  for (const dateIso of sortedDates) {
+    const joinedMembers = normalizedMembers.filter((m) => m.joinedIso === dateIso).map((m) => m.rsn);
+    const leftMembers = normalizedMembers.filter((m) => !m.active && m.leftIso === dateIso).map((m) => m.rsn);
+    const computedActive = normalizedMembers.filter(
+      (m) => m.joinedIso <= dateIso && (m.active || !m.leftIso || m.leftIso > dateIso)
+    ).length;
+
+    const recorded = snapshotByDate.get(dateIso);
+    const activeMembers =
+      recorded && typeof recorded.active_members === "number" && recorded.active_members > 0
+        ? Math.max(recorded.active_members, computedActive)
+        : computedActive;
+
+    const delta = activeMembers - prevActive;
+    const membersJoined =
+      joinedMembers.length > 0
+        ? joinedMembers.length
+        : recorded?.members_joined ?? (delta > 0 ? delta : 0);
+    const membersLeft =
+      leftMembers.length > 0
+        ? leftMembers.length
+        : recorded?.members_left ?? (delta < 0 ? Math.abs(delta) : 0);
+
+    series.push({
+      date: dateIso,
+      activeMembers,
+      membersJoined,
+      membersLeft,
+      joinedNames: joinedMembers,
+      leftNames: leftMembers,
+      note: recorded?.note || null,
+    });
+    prevActive = activeMembers;
+  }
+
+  return series;
+}
+
+/**
+ * Filters a growth series by time window ("30d", "6m", or "all") and downsamples
+ * to at most `maxPoints` evenly spaced snapshots so the chart stays clean over months and years.
+ */
+function filterAndDownsampleGrowth(series = [], rangeKey = "all", asOfDate = new Date(), maxPoints = 10) {
+  if (!series || series.length === 0) {
+    return {
+      points: [{ date: CLAN_CREATION_DATE, label: "OCT 11", activeMembers: 0, membersJoined: 0, membersLeft: 0 }],
+      rangeLabel: "ALL-TIME",
+      spanDays: 1,
+    };
+  }
+
+  const asOfParsed = parseJoinedDate(asOfDate) || parseJoinedDate(new Date());
+  const asOfMs = asOfParsed ? asOfParsed.utcMs : Date.now();
+  const windowDays = rangeKey === "30d" ? 30 : rangeKey === "6m" ? 180 : null;
+  const rangeLabel = rangeKey === "30d" ? "LAST 30 DAYS" : rangeKey === "6m" ? "LAST 6 MONTHS" : "ALL-TIME";
+
+  let filtered = series;
+  if (windowDays !== null) {
+    const cutoffIso = new Date(asOfMs - windowDays * MS_PER_DAY).toISOString().slice(0, 10);
+    filtered = series.filter((s) => s.date >= cutoffIso);
+    if (filtered.length === 0) {
+      filtered = series.slice(-1);
+    }
+  }
+
+  const firstParsed = parseJoinedDate(filtered[0].date);
+  const lastParsed = parseJoinedDate(filtered[filtered.length - 1].date);
+  const spanDays =
+    firstParsed && lastParsed ? Math.max(1, Math.round((lastParsed.utcMs - firstParsed.utcMs) / MS_PER_DAY)) : 1;
+
+  let sampled = filtered;
+  if (filtered.length > maxPoints) {
+    sampled = [];
+    for (let i = 0; i < maxPoints; i++) {
+      const idx = i === maxPoints - 1 ? filtered.length - 1 : Math.round((i * (filtered.length - 1)) / (maxPoints - 1));
+      sampled.push(filtered[idx]);
+    }
+  }
+
+  const points = sampled.map((s) => ({
+    ...s,
+    label: formatShortChartDate(s.date, spanDays),
+  }));
+
+  return { points, rangeLabel, spanDays };
+}
+
+function renderGrowthChartPng(points = [], rangeLabel = "ALL-TIME") {
+  const W = 800;
+  const H = 360;
+  const rgba = Buffer.alloc(W * H * 4);
+
+  function blendPixel(x, y, r, g, b, a = 255) {
+    const xi = Math.round(x);
+    const yi = Math.round(y);
+    if (xi < 0 || xi >= W || yi < 0 || yi >= H) return;
+    const idx = (yi * W + xi) * 4;
+    if (a >= 255) {
+      rgba[idx] = r;
+      rgba[idx + 1] = g;
+      rgba[idx + 2] = b;
+      rgba[idx + 3] = 255;
+    } else {
+      const alpha = a / 255;
+      rgba[idx] = Math.round(rgba[idx] * (1 - alpha) + r * alpha);
+      rgba[idx + 1] = Math.round(rgba[idx + 1] * (1 - alpha) + g * alpha);
+      rgba[idx + 2] = Math.round(rgba[idx + 2] * (1 - alpha) + b * alpha);
+      rgba[idx + 3] = 255;
+    }
+  }
+
+  function fillRect(x0, y0, w, h, r, g, b, a = 255) {
+    for (let y = y0; y < y0 + h; y++) {
+      for (let x = x0; x < x0 + w; x++) {
+        blendPixel(x, y, r, g, b, a);
+      }
+    }
+  }
+
+  function drawText(text, x, y, scale, r, g, b, align = "left") {
+    const str = String(text).toUpperCase();
+    const charW = 6 * scale;
+    const totalW = str.length * charW - scale;
+    let startX = x;
+    if (align === "center") startX = Math.round(x - totalW / 2);
+    else if (align === "right") startX = Math.round(x - totalW);
+
+    for (let i = 0; i < str.length; i++) {
+      const glyph = FONT_5X7[str[i]] || FONT_5X7[" "];
+      const gx = startX + i * charW;
+      for (let row = 0; row < 7; row++) {
+        for (let col = 0; col < 5; col++) {
+          if (glyph[row][col] === "1") {
+            fillRect(gx + col * scale, y + row * scale, scale, scale, r, g, b, 255);
+          }
+        }
+      }
+    }
+  }
+
+  function drawLine(x0, y0, x1, y1, thickness, r, g, b, a = 255) {
+    const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0), 1) * 2;
+    const rad = thickness / 2;
+    for (let i = 0; i <= steps; i++) {
+      const px = x0 + ((x1 - x0) * i) / steps;
+      const py = y0 + ((y1 - y0) * i) / steps;
+      for (let dy = -Math.ceil(rad); dy <= Math.ceil(rad); dy++) {
+        for (let dx = -Math.ceil(rad); dx <= Math.ceil(rad); dx++) {
+          if (dx * dx + dy * dy <= rad * rad) {
+            blendPixel(px + dx, py + dy, r, g, b, a);
+          }
+        }
+      }
+    }
+  }
+
+  function drawCircle(cx, cy, radius, r, g, b, a = 255) {
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        if (dx * dx + dy * dy <= radius * radius) {
+          blendPixel(cx + dx, cy + dy, r, g, b, a);
+        }
+      }
+    }
+  }
+
+  fillRect(0, 0, W, H, 15, 23, 42, 255);
+  fillRect(16, 16, W - 32, H - 32, 24, 34, 56, 255);
+
+  drawText("FENRIR CLAN MEMBER GROWTH", 40, 34, 2, 226, 232, 240, "left");
+  drawText(`VIEW: ${rangeLabel}`, W - 40, 34, 2, 96, 165, 250, "right");
+
+  const padL = 76;
+  const padR = 48;
+  const padT = 78;
+  const padB = 64;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const safePoints =
+    points.length > 0
+      ? points
+      : [{ date: CLAN_CREATION_DATE, label: "OCT 11", activeMembers: 0 }];
+
+  const gridTicks = 4;
+  const rawTop = Math.max(4, ...safePoints.map((p) => Number(p.activeMembers) || 0)) + 1;
+  const tickStep =
+    rawTop <= 8 ? 2 : rawTop <= 12 ? 3 : rawTop <= 20 ? 5 : rawTop <= 40 ? 10 : rawTop <= 80 ? 20 : rawTop <= 200 ? 50 : 100;
+  const maxY = tickStep * gridTicks;
+
+  for (let i = 0; i <= gridTicks; i++) {
+    const val = tickStep * i;
+    const y = Math.round(padT + plotH - (val / maxY) * plotH);
+    fillRect(padL, y, plotW, 1, 51, 65, 85, 255);
+    drawText(String(val), padL - 12, y - 6, 2, 148, 163, 184, "right");
+  }
+
+  const coords = safePoints.map((p, idx) => {
+    const x =
+      safePoints.length === 1
+        ? Math.round(padL + plotW / 2)
+        : Math.round(padL + (idx / (safePoints.length - 1)) * plotW);
+    const val = Number(p.activeMembers) || 0;
+    const y = Math.round(padT + plotH - (val / maxY) * plotH);
+    return { x, y, ...p, activeMembers: val };
+  });
+
+  const baseY = padT + plotH;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const p0 = coords[i];
+    const p1 = coords[i + 1];
+    for (let x = p0.x; x <= p1.x; x++) {
+      const t = p1.x === p0.x ? 0 : (x - p0.x) / (p1.x - p0.x);
+      const topY = Math.round(p0.y + (p1.y - p0.y) * t);
+      for (let y = topY; y < baseY; y++) {
+        const fade = 1 - (y - topY) / Math.max(1, baseY - topY);
+        blendPixel(x, y, 56, 189, 248, Math.round(90 * fade));
+      }
+    }
+  }
+
+  for (let i = 0; i < coords.length - 1; i++) {
+    drawLine(coords[i].x, coords[i].y, coords[i + 1].x, coords[i + 1].y, 4, 56, 189, 248, 255);
+  }
+
+  for (const c of coords) {
+    drawCircle(c.x, c.y, 7, 15, 23, 42, 255);
+    drawCircle(c.x, c.y, 5, 56, 189, 248, 255);
+    drawText(String(c.activeMembers), c.x, c.y - 22, 2, 248, 250, 252, "center");
+    drawText(c.label || c.date, c.x, baseY + 16, 2, 148, 163, 184, "center");
+  }
+
+  return encodePng(W, H, rgba);
+}
+
+function buildGrowthChartEmbedAndAttachment(
+  members = [],
+  growthSnapshots = [],
+  asOfDate = new Date(),
+  rangeKey = config.growthChartRange || "all"
+) {
+  const fullSeries = buildGrowthSeries(members, growthSnapshots, asOfDate);
+  const { points, rangeLabel } = filterAndDownsampleGrowth(fullSeries, rangeKey, asOfDate, 10);
+  const pngBuffer = renderGrowthChartPng(points, rangeLabel);
+  const attachment = new AttachmentBuilder(pngBuffer, { name: "clan-growth.png" });
+
+  const currentActive = members.filter((m) => m.active !== false).length;
+  const peakMembers = Math.max(currentActive, ...fullSeries.map((s) => s.activeMembers));
+
+  // Show the 5 most recent dates where roster changes occurred
+  const changeSnapshots = fullSeries.filter((s) => s.membersJoined > 0 || s.membersLeft > 0 || s.date === CLAN_CREATION_DATE);
+  const recentSnapshots = (changeSnapshots.length > 0 ? changeSnapshots : fullSeries).slice(-5).reverse();
+
+  const recentLines = recentSnapshots.map((s) => {
+    const changeParts = [];
+    if (s.membersJoined > 0) {
+      const names = s.joinedNames?.length ? `: *${s.joinedNames.slice(0, 4).join(", ")}${s.joinedNames.length > 4 ? "…" : ""}*` : "";
+      changeParts.push(`+${s.membersJoined} joined${names}`);
+    }
+    if (s.membersLeft > 0) {
+      const names = s.leftNames?.length ? `: *${s.leftNames.slice(0, 4).join(", ")}${s.leftNames.length > 4 ? "…" : ""}*` : "";
+      changeParts.push(`-${s.membersLeft} left${names}`);
+    }
+    const deltaText = changeParts.length > 0 ? ` (${changeParts.join(", ")})` : "";
+    return `• \`${s.date}\` — **${s.activeMembers} members**${deltaText}`;
+  });
+
+  const latestChange = recentSnapshots[0];
+  const latestDeltaSummary = latestChange
+    ? `+${latestChange.membersJoined} joined, -${latestChange.membersLeft} left (\`${latestChange.date}\`)`
+    : "No changes recorded yet";
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("Fenrir Clan Growth & Roster History")
+    .setDescription(
+      `**Current Active Members:** \`${currentActive}\` • **All-Time Peak:** \`${peakMembers}\` • **View:** \`${rangeLabel}\`\n` +
+      `**Clan Founded:** \`${CLAN_CREATION_DATE}\` • **Latest Roster Change:** ${latestDeltaSummary}\n\n` +
+      `**Recent Roster Snapshots:**\n${recentLines.join("\n")}`
+    )
+    .setImage("attachment://clan-growth.png");
+
+  return { embed, attachment, fullSeries };
+}
+
 function buildRankTableSummary() {
   return RANK_TIERS.map((t) => {
     const multText = t.multiplier ? `${t.multiplier}x` : "Max";
@@ -619,7 +1074,10 @@ function buildRankTableSummary() {
   }).join(" • ");
 }
 
-function buildRankListPayload(members = [], asOfDate = new Date()) {
+function buildRankListPayload(members = [], asOfDate = new Date(), options = {}) {
+  const rangeKey = options.range || config.growthChartRange || "all";
+  const growthSnapshots = options.growthSnapshots || [];
+
   const activeMembers = members
     .filter((m) => m.active !== false)
     .slice()
@@ -631,6 +1089,13 @@ function buildRankListPayload(members = [], asOfDate = new Date()) {
 
   const asOfParsed = parseJoinedDate(asOfDate) || parseJoinedDate(new Date());
   const nowUnix = Math.floor(Date.now() / 1000);
+
+  const { embed: growthEmbed, attachment: growthAttachment } = buildGrowthChartEmbedAndAttachment(
+    members,
+    growthSnapshots,
+    asOfDate,
+    rangeKey
+  );
 
   const headerDesc =
     "** Clan Rank Progression & Member Standings**\n" +
@@ -659,7 +1124,8 @@ function buildRankListPayload(members = [], asOfDate = new Date()) {
     );
   });
 
-  const embeds = [];
+  // Growth Chart Embed is always embeds[0] (directly above the Member List!)
+  const embeds = [growthEmbed];
   if (lines.length === 0) {
     embeds.push(
       new EmbedBuilder()
@@ -701,21 +1167,87 @@ function buildRankListPayload(members = [], asOfDate = new Date()) {
     new ButtonBuilder()
       .setCustomId(ID.RANK_LIST_REFRESH)
       .setLabel("Refresh Rank List")
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(ID.GROWTH_RANGE_30D)
+      .setLabel("Chart: 30 Days")
+      .setStyle(rangeKey === "30d" ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(ID.GROWTH_RANGE_6M)
+      .setLabel("Chart: 6 Months")
+      .setStyle(rangeKey === "6m" ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(ID.GROWTH_RANGE_ALL)
+      .setLabel("Chart: All-Time")
+      .setStyle(rangeKey === "all" ? ButtonStyle.Success : ButtonStyle.Secondary)
   );
 
-  return { embeds, components: [row] };
+  return { embeds, components: [row], files: [growthAttachment] };
 }
 
-async function ensureRankListMessage(members) {
+async function syncGrowthHistoryToSupabase(supabase, members = [], asOfDate = new Date()) {
+  if (!supabase) return [];
+  try {
+    const { data: existingSnapshots } = await supabase
+      .from("clan_growth_history")
+      .select("*")
+      .order("recorded_date", { ascending: true });
+
+    const series = buildGrowthSeries(members, existingSnapshots || [], asOfDate);
+    const existingByDate = new Map();
+    for (const row of existingSnapshots || []) {
+      const p = parseJoinedDate(row.recorded_date);
+      if (p) existingByDate.set(p.iso, row);
+    }
+
+    const nowIso = new Date().toISOString();
+    for (const pt of series) {
+      const prev = existingByDate.get(pt.date);
+      if (!prev) {
+        await supabase.from("clan_growth_history").insert({
+          recorded_date: pt.date,
+          active_members: pt.activeMembers,
+          members_joined: pt.membersJoined,
+          members_left: pt.membersLeft,
+          updated_at: nowIso,
+        });
+      } else if (
+        prev.active_members !== pt.activeMembers ||
+        prev.members_joined !== pt.membersJoined ||
+        prev.members_left !== pt.membersLeft
+      ) {
+        await supabase
+          .from("clan_growth_history")
+          .update({
+            active_members: pt.activeMembers,
+            members_joined: pt.membersJoined,
+            members_left: pt.membersLeft,
+            updated_at: nowIso,
+          })
+          .eq("id", prev.id);
+      }
+    }
+
+    const { data: refreshed } = await supabase
+      .from("clan_growth_history")
+      .select("*")
+      .order("recorded_date", { ascending: true });
+    return refreshed || [];
+  } catch {
+    return [];
+  }
+}
+
+async function ensureRankListMessage(members, growthSnapshots) {
   let list = members;
+  let snapshots = growthSnapshots;
+  const supabase = getSupabase();
+
   if (!list) {
-    const supabase = getSupabase();
     if (supabase) {
       const { data } = await supabase
         .from("clan_members")
         .select("*")
-        .eq("active", true)
         .order("xp", { ascending: false });
       list = data || [];
     } else {
@@ -723,12 +1255,19 @@ async function ensureRankListMessage(members) {
     }
   }
 
+  if (!snapshots && supabase) {
+    snapshots = await syncGrowthHistoryToSupabase(supabase, list);
+  }
+
   return ensureEmbedMessage({
     channelId: RANK_LIST_CHANNEL_ID,
     label: "RankList",
-    buttonIds: [ID.RANK_LIST_REFRESH],
-    payload: buildRankListPayload(list),
-    what: "permanent clan rank list",
+    buttonIds: [ID.RANK_LIST_REFRESH, ID.GROWTH_RANGE_30D, ID.GROWTH_RANGE_6M, ID.GROWTH_RANGE_ALL],
+    payload: buildRankListPayload(list, new Date(), {
+      range: config.growthChartRange,
+      growthSnapshots: snapshots || [],
+    }),
+    what: "permanent clan growth chart & rank list",
   });
 }
 
@@ -1647,9 +2186,30 @@ async function onRankListRefresh(interaction) {
       new EmbedBuilder()
         .setColor(COLOR.ok)
         .setTitle("Rank List Synced")
-        .setDescription("The clan rank list and tenure milestones have been synced with Supabase."),
+        .setDescription("The clan growth chart, rank list, and tenure milestones have been synced with Supabase."),
     ],
   });
+}
+
+async function onGrowthRangeButton(interaction, rangeKey) {
+  config.growthChartRange = rangeKey;
+  await interaction.deferUpdate();
+  const supabase = getSupabase();
+  let members = [];
+  let snapshots = [];
+  if (supabase) {
+    const { data } = await supabase
+      .from("clan_members")
+      .select("*")
+      .order("xp", { ascending: false });
+    members = data || [];
+    snapshots = await syncGrowthHistoryToSupabase(supabase, members);
+  }
+  const payload = buildRankListPayload(members, new Date(), {
+    range: rangeKey,
+    growthSnapshots: snapshots,
+  });
+  await interaction.editReply(payload).catch((e) => console.warn("[GrowthChart] Could not update range view:", e.message));
 }
 
 async function onRankUpConfirm1(interaction, encodedRsn, targetRank) {
@@ -1794,6 +2354,9 @@ async function handleInteraction(interaction) {
       case ID.ORIENT_STAFF:
         return onOrientationAccept(interaction);
       case ID.RANK_LIST_REFRESH: return onRankListRefresh(interaction);
+      case ID.GROWTH_RANGE_30D:  return onGrowthRangeButton(interaction, "30d");
+      case ID.GROWTH_RANGE_6M:   return onGrowthRangeButton(interaction, "6m");
+      case ID.GROWTH_RANGE_ALL:  return onGrowthRangeButton(interaction, "all");
       case ID.RANKUP_C1:         return onRankUpConfirm1(interaction, payload, extra);
       case ID.RANKUP_C2:         return onRankUpConfirm2(interaction, payload, extra);
       case ID.RANKUP_CANCEL:     return onRankUpCancel(interaction, payload, extra);
@@ -1902,6 +2465,11 @@ module.exports = {
   formatRankName,
   getNextRankTier,
   calculateTenureProgression,
+  buildGrowthSeries,
+  filterAndDownsampleGrowth,
+  renderGrowthChartPng,
+  buildGrowthChartEmbedAndAttachment,
+  syncGrowthHistoryToSupabase,
   buildRankListPayload,
   buildRankUpAlertStep1,
   buildRankUpAlertStep2,
