@@ -103,6 +103,102 @@ const VOICE_EMPTY_TIMEOUT_MS         = 5 * 60 * 1000; // Auto-delete 5 minutes a
 const VOICE_INITIAL_EMPTY_TIMEOUT_MS = 60 * 1000;     // Auto-delete after 60 seconds if nobody joins after creation
 const VOICE_CREATE_COOLDOWN_MS       = 5 * 60 * 1000; // Limit each user to creating 1 voice channel every 5 minutes
 
+// Weekly Events (Skill of the Week & Boss of the Week)
+const WEEKLY_EVENTS_CHANNEL_ID       = "1562600669796507760";
+const WEEKLY_EVENT_POLL_INTERVAL_MS  = 2 * 60 * 60 * 1000; // Poll OSRS HiScores every 2 hours starting Friday 00:00
+const WEEKLY_EVENTS_ANCHOR_ISO       = "2026-10-23T00:00:00.000Z"; // First SOTW starts Friday, Oct 23, 2026 at 00:00
+const FRACTURED_ARCHIVES_UNLOCK_DATE = "2027-04-21"; // 6-month restriction from 2026-10-21
+
+const OSRS_SKILLS = [
+  { name: "Attack",       hiscoreNames: ["Attack"] },
+  { name: "Strength",     hiscoreNames: ["Strength"] },
+  { name: "Defence",      hiscoreNames: ["Defence"] },
+  { name: "Ranged",       hiscoreNames: ["Ranged"] },
+  { name: "Prayer",       hiscoreNames: ["Prayer"] },
+  { name: "Magic",        hiscoreNames: ["Magic"] },
+  { name: "Hitpoints",    hiscoreNames: ["Hitpoints"] },
+  { name: "Mining",       hiscoreNames: ["Mining"] },
+  { name: "Fishing",      hiscoreNames: ["Fishing"] },
+  { name: "Woodcutting",  hiscoreNames: ["Woodcutting"] },
+  { name: "Farming",      hiscoreNames: ["Farming"] },
+  { name: "Hunter",       hiscoreNames: ["Hunter"] },
+  { name: "Sailing",      hiscoreNames: ["Sailing"] },
+  { name: "Runecraft",    hiscoreNames: ["Runecraft", "Runecrafting"] },
+  { name: "Construction", hiscoreNames: ["Construction"] },
+  { name: "Herblore",     hiscoreNames: ["Herblore"] },
+  { name: "Crafting",     hiscoreNames: ["Crafting"] },
+  { name: "Fletching",    hiscoreNames: ["Fletching"] },
+  { name: "Smithing",     hiscoreNames: ["Smithing"] },
+  { name: "Cooking",      hiscoreNames: ["Cooking"] },
+  { name: "Firemaking",   hiscoreNames: ["Firemaking"] },
+  { name: "Agility",      hiscoreNames: ["Agility"] },
+  { name: "Thieving",     hiscoreNames: ["Thieving"] },
+  { name: "Slayer",       hiscoreNames: ["Slayer"] },
+];
+
+const OSRS_BOSSES = [
+  // Raids (regular & challenge/hard/expert modes combined)
+  { name: "Chambers of Xeric",                  hiscoreNames: ["Chambers of Xeric", "Chambers of Xeric: Challenge Mode"] },
+  { name: "Theatre of Blood",                   hiscoreNames: ["Theatre of Blood", "Theatre of Blood: Hard Mode"] },
+  { name: "Tombs of Amascut",                   hiscoreNames: ["Tombs of Amascut", "Tombs of Amascut: Expert Mode"] },
+  {
+    name: "The Fractured Archives",
+    hiscoreNames: ["The Fractured Archives", "The Fractured Archives: Hard Mode", "The Fractured Archives: Challenge Mode", "Fractured Archives"],
+    unlockAfter: FRACTURED_ARCHIVES_UNLOCK_DATE,
+  },
+  // God Wars Dungeon
+  { name: "Commander Zilyana",                  hiscoreNames: ["Commander Zilyana"] },
+  { name: "General Graardor",                   hiscoreNames: ["General Graardor"] },
+  { name: "K'ril Tsutsaroth",                   hiscoreNames: ["K'ril Tsutsaroth"] },
+  { name: "Kree'arra",                          hiscoreNames: ["Kree'arra"] },
+  { name: "Nex",                                hiscoreNames: ["Nex"] },
+  // Desert Treasure II
+  { name: "Duke Sucellus",                      hiscoreNames: ["Duke Sucellus"] },
+  { name: "The Leviathan",                      hiscoreNames: ["The Leviathan"] },
+  { name: "The Whisperer",                      hiscoreNames: ["The Whisperer"] },
+  { name: "Vardorvis",                          hiscoreNames: ["Vardorvis"] },
+  // Wilderness Bosses (Solo & Multi combined)
+  { name: "Callisto / Artio",                   hiscoreNames: ["Callisto", "Artio"] },
+  { name: "Venenatis / Spindel",                hiscoreNames: ["Venenatis", "Spindel"] },
+  { name: "Vet'ion / Calvar'ion",               hiscoreNames: ["Vet'ion", "Calvar'ion"] },
+  { name: "Chaos Elemental",                    hiscoreNames: ["Chaos Elemental"] },
+  { name: "Chaos Fanatic",                      hiscoreNames: ["Chaos Fanatic"] },
+  { name: "Crazy Archaeologist",                hiscoreNames: ["Crazy Archaeologist"] },
+  { name: "Scorpia",                            hiscoreNames: ["Scorpia"] },
+  // Varlamore, Kourend & Newer Bosses
+  { name: "Amoxliatl",                          hiscoreNames: ["Amoxliatl"] },
+  { name: "Doom of Mokhaiotl",                  hiscoreNames: ["Doom of Mokhaiotl"] },
+  { name: "The Hueycoatl",                      hiscoreNames: ["The Hueycoatl", "Hueycoatl"] },
+  { name: "Moons of Peril",                     hiscoreNames: ["Lunar Chests", "Moons of Peril"] },
+  { name: "Royal Titans",                       hiscoreNames: ["The Royal Titans", "Royal Titans"] },
+  { name: "Sarachnis",                          hiscoreNames: ["Sarachnis"] },
+  { name: "Yama",                               hiscoreNames: ["Yama"] },
+  // Classic, World & Instanced Bosses
+  { name: "Barrows",                            hiscoreNames: ["Barrows Chests", "Barrows"] },
+  { name: "Bryophyta",                          hiscoreNames: ["Bryophyta"] },
+  { name: "Brutus",                             hiscoreNames: ["Brutus"] },
+  { name: "Corporeal Beast",                    hiscoreNames: ["Corporeal Beast"] },
+  { name: "Dagannoth Kings",                    hiscoreNames: ["Dagannoth Prime", "Dagannoth Rex", "Dagannoth Supreme"] },
+  { name: "Deranged Archaeologist",             hiscoreNames: ["Deranged Archaeologist"] },
+  { name: "Giant Mole",                         hiscoreNames: ["Giant Mole"] },
+  { name: "Kalphite Queen",                     hiscoreNames: ["Kalphite Queen"] },
+  { name: "King Black Dragon",                  hiscoreNames: ["King Black Dragon"] },
+  { name: "Obor",                               hiscoreNames: ["Obor"] },
+  { name: "Phantom Muspah",                     hiscoreNames: ["Phantom Muspah"] },
+  { name: "Scurrius",                           hiscoreNames: ["Scurrius"] },
+  { name: "The Nightmare / Phosani's Nightmare", hiscoreNames: ["Nightmare", "The Nightmare", "Phosani's Nightmare"] },
+  { name: "Vorkath",                            hiscoreNames: ["Vorkath"] },
+  { name: "Zulrah",                             hiscoreNames: ["Zulrah"] },
+  // Skilling, Gauntlet & Wave Bosses
+  { name: "The Gauntlet / Corrupted Gauntlet",  hiscoreNames: ["The Gauntlet", "The Corrupted Gauntlet"] },
+  { name: "Tempoross",                          hiscoreNames: ["Tempoross"] },
+  { name: "Wintertodt",                         hiscoreNames: ["Wintertodt"] },
+  { name: "Zalcano",                            hiscoreNames: ["Zalcano"] },
+  { name: "TzTok-Jad",                          hiscoreNames: ["TzTok-Jad"] },
+  { name: "TzKal-Zuk",                          hiscoreNames: ["TzKal-Zuk"] },
+  { name: "Sol Heredit",                        hiscoreNames: ["Sol Heredit"] },
+];
+
 const VOICE_CATEGORIES = [
   {
     key: "social",
@@ -166,12 +262,14 @@ const SCAN_PAGES_PINGS     = 2; // 200 messages — finding a member's ping
 const config = {
   settleMs: 3000,
   rankSyncIntervalMs: 30 * 60 * 1000, // Check Supabase + tenure milestones every 30 minutes
+  weeklyEventPollIntervalMs: WEEKLY_EVENT_POLL_INTERVAL_MS,
   voiceEmptyTimeoutMs: VOICE_EMPTY_TIMEOUT_MS,
   voiceInitialEmptyTimeoutMs: VOICE_INITIAL_EMPTY_TIMEOUT_MS,
   voiceCreateCooldownMs: VOICE_CREATE_COOLDOWN_MS,
   multiplyMonthlyYearly: false,       // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
   growthChartRange: "all",            // "30d" | "6m" | "all"
   supabase: null,                     // Initialized on startup or injected for tests
+  hiscoreFetcher: null,               // Optional override for testing OSRS HiScores fetches
 };
 
 // Component custom IDs
@@ -901,6 +999,723 @@ async function ensureVoiceCreatorMessage() {
     payload: buildVoiceCreatorMessage(),
     what: "permanent temporary voice creator embed",
   });
+}
+
+// ================= WEEKLY EVENTS: SKILL OF THE WEEK & BOSS OF THE WEEK =================
+const weeklyEventsMemoryStore = new Map(); // weekKey -> state object
+
+function normalizeHiscoreName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[’']/g, "'")
+    .replace(/\s+/g, " ");
+}
+
+function getEligibleBosses(asOfDate = new Date()) {
+  const d = asOfDate instanceof Date ? asOfDate : new Date(asOfDate);
+  const asOfIso = d.toISOString().slice(0, 10);
+  return OSRS_BOSSES.filter((b) => !b.unlockAfter || asOfIso >= b.unlockAfter);
+}
+
+// Deterministic seeded PRNG (Mulberry32) so weekly random picks remain identical across restarts
+function createSeededRng(seedInt) {
+  let a = seedInt >>> 0;
+  return function nextRand() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function seededShuffle(items, seedInt) {
+  const arr = [...items];
+  const rand = createSeededRng(seedInt);
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function pickWeeklyEventTarget(eventType, typeCycleIndex, asOfDate = new Date()) {
+  const pool = eventType === "sotw" ? OSRS_SKILLS : getEligibleBosses(asOfDate);
+  if (pool.length === 0) return null;
+
+  const cycleLen = pool.length;
+  const idx = Math.max(0, Number(typeCycleIndex) || 0);
+  const passNumber = Math.floor(idx / cycleLen);
+  const posInPass = idx % cycleLen;
+
+  const baseSeed = eventType === "sotw" ? 0x534f5457 : 0x424f5457; // "SOTW" / "BOTW"
+  const shuffled = seededShuffle(pool, baseSeed + passNumber * 1009);
+
+  // Prevent boundary back-to-back repeat between consecutive passes
+  if (passNumber > 0) {
+    const prevShuffled = seededShuffle(pool, baseSeed + (passNumber - 1) * 1009);
+    const prevLast = prevShuffled[prevShuffled.length - 1];
+    if (shuffled[0]?.name === prevLast?.name && shuffled.length > 1) {
+      [shuffled[0], shuffled[1]] = [shuffled[1], shuffled[0]];
+    }
+  }
+
+  return shuffled[posInPass] || shuffled[0];
+}
+
+function getWeekWindowByIndex(weekIndex) {
+  const anchorMs = Date.parse(WEEKLY_EVENTS_ANCHOR_ISO);
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
+  // Each event runs Friday 00:00 -> Thursday 23:59 (switches at 23:59 Thursday night)
+  const startsAtMs = anchorMs + weekIndex * weekMs;
+  const endsAtMs = startsAtMs + weekMs - 60 * 1000; // Thursday 23:59:00 UTC
+
+  const eventType = weekIndex % 2 === 0 ? "sotw" : "botw";
+  const typeCycleIndex = Math.floor(weekIndex / 2);
+  const target = pickWeeklyEventTarget(eventType, typeCycleIndex, new Date(startsAtMs));
+  const startIsoDate = new Date(startsAtMs).toISOString().slice(0, 10);
+  const weekKey = `week_${weekIndex}_${eventType}_${startIsoDate}`;
+
+  return {
+    weekIndex,
+    weekKey,
+    eventType,
+    typeCycleIndex,
+    targetName: target ? target.name : eventType === "sotw" ? "Mining" : "Barrows",
+    targetConfig: target,
+    startsAtMs,
+    endsAtMs,
+    startsAtIso: new Date(startsAtMs).toISOString(),
+    endsAtIso: new Date(endsAtMs).toISOString(),
+  };
+}
+
+function getWeeklyEventSchedule(asOfDate = new Date()) {
+  const nowMs = (asOfDate instanceof Date ? asOfDate : new Date(asOfDate)).getTime();
+  const anchorMs = Date.parse(WEEKLY_EVENTS_ANCHOR_ISO);
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
+
+  let weekIndex = 0;
+  if (nowMs >= anchorMs) {
+    // Advance to the next week as soon as Thursday 23:59 (endsAtMs) is reached
+    weekIndex = Math.floor((nowMs - anchorMs + 60 * 1000) / weekMs);
+  }
+
+  const current = getWeekWindowByIndex(weekIndex);
+  const next = getWeekWindowByIndex(weekIndex + 1);
+  const previous = weekIndex > 0 ? getWeekWindowByIndex(weekIndex - 1) : null;
+
+  const isRunning = nowMs >= current.startsAtMs && nowMs < current.endsAtMs;
+  const isUpcoming = nowMs < current.startsAtMs;
+
+  return {
+    nowMs,
+    current: {
+      ...current,
+      isRunning,
+      isUpcoming,
+    },
+    next,
+    previous,
+    sotw: current.eventType === "sotw" ? { ...current, isRunning, isUpcoming, isCurrentWeek: true } : { ...next, isRunning: false, isUpcoming: true, isCurrentWeek: false },
+    botw: current.eventType === "botw" ? { ...current, isRunning, isUpcoming, isCurrentWeek: true } : { ...next, isRunning: false, isUpcoming: true, isCurrentWeek: false },
+  };
+}
+
+function formatDurationRemaining(ms) {
+  const clamped = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(clamped / 86400);
+  const hours = Math.floor((clamped % 86400) / 3600);
+  const minutes = Math.floor((clamped % 3600) / 60);
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0 || days > 0) parts.push(`${hours}h`);
+  parts.push(`${minutes}m`);
+  return parts.join(" ");
+}
+
+async function fetchPlayerHiscores(rsn) {
+  if (typeof config.hiscoreFetcher === "function") {
+    return config.hiscoreFetcher(rsn);
+  }
+  const cleanRsn = String(rsn || "").trim();
+  if (!cleanRsn) return null;
+
+  const url = `https://secure.runescape.com/m=hiscore_oldschool/index_lite.json?player=${encodeURIComponent(cleanRsn)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  if (typeof timeout.unref === "function") timeout.unref();
+
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0" },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data && typeof data === "object" ? data : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function extractHiscoreMetric(hiscoreData, eventType, targetName) {
+  if (!hiscoreData || typeof hiscoreData !== "object") return null;
+
+  if (eventType === "sotw") {
+    const skillCfg =
+      OSRS_SKILLS.find((s) => normalizeHiscoreName(s.name) === normalizeHiscoreName(targetName)) || {
+        name: targetName,
+        hiscoreNames: [targetName],
+      };
+    const matchNames = new Set(skillCfg.hiscoreNames.map(normalizeHiscoreName));
+    const skills = Array.isArray(hiscoreData.skills) ? hiscoreData.skills : [];
+    for (const s of skills) {
+      if (matchNames.has(normalizeHiscoreName(s.name))) {
+        const xp = Number(s.xp);
+        return Number.isFinite(xp) && xp > 0 ? xp : 0;
+      }
+    }
+    return 0;
+  }
+
+  // Boss of the Week
+  const bossCfg =
+    OSRS_BOSSES.find((b) => normalizeHiscoreName(b.name) === normalizeHiscoreName(targetName)) || {
+      name: targetName,
+      hiscoreNames: [targetName],
+    };
+  const matchNames = new Set(bossCfg.hiscoreNames.map(normalizeHiscoreName));
+  const activities = Array.isArray(hiscoreData.activities) ? hiscoreData.activities : [];
+  let totalKills = 0;
+  for (const act of activities) {
+    if (matchNames.has(normalizeHiscoreName(act.name))) {
+      const score = Number(act.score);
+      if (Number.isFinite(score) && score > 0) {
+        totalKills += score;
+      }
+    }
+  }
+  return totalKills;
+}
+
+async function loadWeeklyEventState(supabase, weekInfo) {
+  const weekKey = weekInfo.weekKey;
+  if (weeklyEventsMemoryStore.has(weekKey)) {
+    return weeklyEventsMemoryStore.get(weekKey);
+  }
+
+  const defaultState = {
+    weekKey,
+    weekIndex: weekInfo.weekIndex,
+    eventType: weekInfo.eventType,
+    targetName: weekInfo.targetName,
+    startsAtIso: weekInfo.startsAtIso,
+    endsAtIso: weekInfo.endsAtIso,
+    baselines: {},
+    standings: [],
+    lastPolledAt: null,
+  };
+
+  if (!supabase) {
+    weeklyEventsMemoryStore.set(weekKey, defaultState);
+    return defaultState;
+  }
+
+  // 1. Try reading from public.weekly_events table
+  try {
+    const { data, error } = await supabase
+      .from("weekly_events")
+      .select("*")
+      .eq("week_key", weekKey)
+      .maybeSingle?.();
+    if (!error && data) {
+      const loaded = {
+        weekKey,
+        weekIndex: weekInfo.weekIndex,
+        eventType: data.event_type || weekInfo.eventType,
+        targetName: data.target_name || weekInfo.targetName,
+        startsAtIso: weekInfo.startsAtIso,
+        endsAtIso: weekInfo.endsAtIso,
+        baselines: data.baselines && typeof data.baselines === "object" ? data.baselines : {},
+        standings: Array.isArray(data.standings) ? data.standings : [],
+        lastPolledAt: data.last_polled_at || null,
+      };
+      weeklyEventsMemoryStore.set(weekKey, loaded);
+      return loaded;
+    }
+  } catch {}
+
+  // 2. Fallback: read latest snapshot from xp_rank_logs if weekly_events table hasn't been created yet
+  try {
+    const { data: logs } = await supabase
+      .from("xp_rank_logs")
+      .select("*")
+      .eq("event_type", "weekly_event_state")
+      .eq("rsn", weekKey)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (logs && logs.length > 0 && logs[0].reason) {
+      const parsed = JSON.parse(logs[0].reason);
+      if (parsed && typeof parsed === "object") {
+        const loaded = {
+          ...defaultState,
+          baselines: parsed.baselines || {},
+          standings: Array.isArray(parsed.standings) ? parsed.standings : [],
+          lastPolledAt: parsed.lastPolledAt || null,
+        };
+        weeklyEventsMemoryStore.set(weekKey, loaded);
+        return loaded;
+      }
+    }
+  } catch {}
+
+  weeklyEventsMemoryStore.set(weekKey, defaultState);
+  return defaultState;
+}
+
+async function saveWeeklyEventState(supabase, state) {
+  weeklyEventsMemoryStore.set(state.weekKey, state);
+  if (!supabase) return;
+
+  const nowIso = new Date().toISOString();
+  try {
+    const { error } = await supabase.from("weekly_events").upsert(
+      {
+        week_key: state.weekKey,
+        week_index: state.weekIndex,
+        event_type: state.eventType,
+        target_name: state.targetName,
+        starts_at: state.startsAtIso,
+        ends_at: state.endsAtIso,
+        baselines: state.baselines || {},
+        standings: state.standings || [],
+        last_polled_at: state.lastPolledAt || nowIso,
+        updated_at: nowIso,
+      },
+      { onConflict: "week_key" }
+    );
+    if (!error) return;
+  } catch {}
+
+  // Fallback persistence into xp_rank_logs if weekly_events table does not exist yet
+  try {
+    await supabase.from("xp_rank_logs").insert({
+      rsn: state.weekKey,
+      event_type: "weekly_event_state",
+      xp_delta: 0,
+      total_xp: (state.standings || []).length,
+      old_rank: state.eventType,
+      new_rank: state.targetName,
+      reason: JSON.stringify({
+        baselines: state.baselines || {},
+        standings: state.standings || [],
+        lastPolledAt: state.lastPolledAt || nowIso,
+      }),
+    });
+  } catch {}
+}
+
+async function pollWeeklyEventHiscores(weekInfo, members, existingState, nowDate = new Date()) {
+  const activeMembers = (members || []).filter((m) => m && m.active !== false && String(m.rsn || "").trim());
+  const baselines = { ...(existingState?.baselines || {}) };
+  const standings = [];
+
+  for (const member of activeMembers) {
+    const rsn = String(member.rsn).trim();
+    const key = rsn.toLowerCase();
+    const hiscoreData = await fetchPlayerHiscores(rsn);
+
+    let currentVal = null;
+    if (hiscoreData) {
+      currentVal = extractHiscoreMetric(hiscoreData, weekInfo.eventType, weekInfo.targetName);
+    }
+
+    if (currentVal === null) {
+      // If HiScores lookup failed temporarily, keep previous baseline/current value if known
+      const prev = baselines[key];
+      if (prev && typeof prev.startValue === "number" && typeof prev.currentValue === "number") {
+        const gained = Math.max(0, prev.currentValue - prev.startValue);
+        if (gained > 0) {
+          standings.push({
+            rsn: prev.rsn || rsn,
+            startValue: prev.startValue,
+            currentValue: prev.currentValue,
+            gained,
+          });
+        }
+      }
+      continue;
+    }
+
+    if (!baselines[key] || typeof baselines[key].startValue !== "number") {
+      baselines[key] = {
+        rsn,
+        startValue: currentVal,
+        currentValue: currentVal,
+      };
+    } else {
+      baselines[key] = {
+        rsn,
+        startValue: baselines[key].startValue,
+        currentValue: currentVal,
+      };
+    }
+
+    const gained = Math.max(0, baselines[key].currentValue - baselines[key].startValue);
+    if (gained > 0) {
+      standings.push({
+        rsn,
+        startValue: baselines[key].startValue,
+        currentValue: baselines[key].currentValue,
+        gained,
+      });
+    }
+  }
+
+  // Sort strictly descending by earned XP or kills (tie-break by total XP/KC, then RSN)
+  standings.sort((a, b) => {
+    if (b.gained !== a.gained) return b.gained - a.gained;
+    if (b.currentValue !== a.currentValue) return b.currentValue - a.currentValue;
+    return a.rsn.localeCompare(b.rsn);
+  });
+
+  const nowIso = (nowDate instanceof Date ? nowDate : new Date(nowDate)).toISOString();
+  return {
+    weekKey: weekInfo.weekKey,
+    weekIndex: weekInfo.weekIndex,
+    eventType: weekInfo.eventType,
+    targetName: weekInfo.targetName,
+    startsAtIso: weekInfo.startsAtIso,
+    endsAtIso: weekInfo.endsAtIso,
+    baselines,
+    standings,
+    lastPolledAt: nowIso,
+  };
+}
+
+function formatWeeklyStandingsLines(standings, eventType) {
+  if (!standings || standings.length === 0) {
+    return eventType === "sotw"
+      ? "*No clan members have earned XP in this skill yet this week. Only members who gain XP are listed here!*"
+      : "*No clan members have recorded kills for this boss yet this week. Only members who earn kills are listed here!*";
+  }
+
+  const medals = ["🥇", "🥈", "🥉"];
+  const lines = standings.slice(0, 25).map((entry, idx) => {
+    const rankPrefix = idx < 3 ? `${medals[idx]} ` : `\`#${idx + 1}\` `;
+    if (eventType === "sotw") {
+      return `${rankPrefix}**${entry.rsn}** — **+${entry.gained.toLocaleString()} XP** *(Total: ${entry.currentValue.toLocaleString()} XP)*`;
+    }
+    const unit = entry.gained === 1 ? "Kill" : "Kills";
+    return `${rankPrefix}**${entry.rsn}** — **+${entry.gained.toLocaleString()} ${unit}** *(Total: ${entry.currentValue.toLocaleString()} KC)*`;
+  });
+
+  if (standings.length > 25) {
+    lines.push(`*…and ${standings.length - 25} more member(s) with gains this week.*`);
+  }
+  return lines.join("\n");
+}
+
+function getNextTwoHourPollUnix(nowMs, startsAtMs, endsAtMs) {
+  if (nowMs < startsAtMs) return Math.floor(startsAtMs / 1000);
+  const twoHoursMs = 2 * 60 * 60 * 1000;
+  const elapsed = nowMs - startsAtMs;
+  const nextPollMs = startsAtMs + (Math.floor(elapsed / twoHoursMs) + 1) * twoHoursMs;
+  return Math.floor(Math.min(nextPollMs, endsAtMs) / 1000);
+}
+
+function buildSotwEmbedPayload(schedule, currentState, previousSotwState = null) {
+  const isCurrentSotw = schedule.current.eventType === "sotw";
+  const sotwInfo = schedule.sotw;
+  const startUnix = Math.floor(sotwInfo.startsAtMs / 1000);
+  const endUnix = Math.floor(sotwInfo.endsAtMs / 1000);
+
+  if (isCurrentSotw) {
+    const isRunning = schedule.current.isRunning;
+    const remainingText = formatDurationRemaining(sotwInfo.endsAtMs - schedule.nowMs);
+    const standings = currentState?.standings || [];
+    const nextPollUnix = getNextTwoHourPollUnix(schedule.nowMs, sotwInfo.startsAtMs, sotwInfo.endsAtMs);
+    const lastPollUnix = currentState?.lastPolledAt
+      ? Math.floor(new Date(currentState.lastPolledAt).getTime() / 1000)
+      : null;
+
+    const timerLines = isRunning
+      ? [
+          `🟢 **CURRENT RUNNING EVENT:** **${sotwInfo.targetName}** *(Skill of the Week)*`,
+          `⏱️ **Running Timer:** Ends <t:${endUnix}:R> (**${remainingText} remaining**)`,
+          `📅 **Starts:** <t:${startUnix}:F>`,
+          `🏁 **Ends:** <t:${endUnix}:F> *(Switches Thursday at 23:59)*`,
+        ]
+      : [
+          `⏳ **SCHEDULED EVENT:** **${sotwInfo.targetName}** *(Skill of the Week)*`,
+          `⏱️ **Running Timer:** Starts <t:${startUnix}:R> • Ends <t:${endUnix}:R>`,
+          `📅 **Starts:** <t:${startUnix}:F> *(Friday at 00:00)*`,
+          `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`,
+        ];
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.ok)
+      .setTitle(`Skill of the Week — ${sotwInfo.targetName}`)
+      .setDescription(timerLines.join("\n"))
+      .addFields(
+        {
+          name: `Leaderboard — Members With ${sotwInfo.targetName} XP Gained (${standings.length})`,
+          value: formatWeeklyStandingsLines(standings, "sotw"),
+          inline: false,
+        },
+        {
+          name: "OSRS HiScores Tracking (Every 2 Hours)",
+          value:
+            (lastPollUnix ? `• **Last Synced:** <t:${lastPollUnix}:R>\n` : "") +
+            `• **Next Sync:** <t:${nextPollUnix}:R> (<t:${nextPollUnix}:t>)\n` +
+            "• **Next Week's Event:** Boss of the Week *(Alternates every Thursday at 23:59)*",
+          inline: false,
+        }
+      )
+      .setFooter({ text: "Odinheim Weekly Events • Official OSRS HiScores • Only members who gained XP are listed" })
+      .setTimestamp(new Date(schedule.nowMs));
+
+    return { embeds: [embed], components: [] };
+  }
+
+  // Boss of the Week is currently running -> Skill of the Week is Up Next
+  const prevStandings = previousSotwState?.standings || [];
+  const prevTitleSuffix = previousSotwState?.targetName ? ` (Last SOTW: ${previousSotwState.targetName})` : "";
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("Skill of the Week — Up Next")
+    .setDescription(
+      `⏸️ **Status:** Alternating Week — **Boss of the Week (${schedule.current.targetName})** is currently active!\n` +
+      `⏭️ **Next Skill of the Week:** **${sotwInfo.targetName}**\n` +
+      `⏱️ **Starts:** <t:${startUnix}:R> on <t:${startUnix}:F>\n` +
+      `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`
+    )
+    .addFields({
+      name: `Previous Skill of the Week Standings${prevTitleSuffix}`,
+      value: prevStandings.length > 0
+        ? formatWeeklyStandingsLines(prevStandings, "sotw")
+        : "*New Skill of the Week leaderboard will begin at 00:00 on Friday morning!*",
+      inline: false,
+    })
+    .setFooter({ text: "Odinheim Weekly Events • Alternates every Thursday at 23:59 between Skill & Boss of the Week" })
+    .setTimestamp(new Date(schedule.nowMs));
+
+  return { embeds: [embed], components: [] };
+}
+
+function buildBotwEmbedPayload(schedule, currentState, previousBotwState = null) {
+  const isCurrentBotw = schedule.current.eventType === "botw";
+  const botwInfo = schedule.botw;
+  const startUnix = Math.floor(botwInfo.startsAtMs / 1000);
+  const endUnix = Math.floor(botwInfo.endsAtMs / 1000);
+
+  if (isCurrentBotw) {
+    const isRunning = schedule.current.isRunning;
+    const remainingText = formatDurationRemaining(botwInfo.endsAtMs - schedule.nowMs);
+    const standings = currentState?.standings || [];
+    const nextPollUnix = getNextTwoHourPollUnix(schedule.nowMs, botwInfo.startsAtMs, botwInfo.endsAtMs);
+    const lastPollUnix = currentState?.lastPolledAt
+      ? Math.floor(new Date(currentState.lastPolledAt).getTime() / 1000)
+      : null;
+
+    const timerLines = isRunning
+      ? [
+          `🟢 **CURRENT RUNNING EVENT:** **${botwInfo.targetName}** *(Boss of the Week)*`,
+          `⏱️ **Running Timer:** Ends <t:${endUnix}:R> (**${remainingText} remaining**)`,
+          `📅 **Starts:** <t:${startUnix}:F>`,
+          `🏁 **Ends:** <t:${endUnix}:F> *(Switches Thursday at 23:59)*`,
+        ]
+      : [
+          `⏳ **SCHEDULED EVENT:** **${botwInfo.targetName}** *(Boss of the Week)*`,
+          `⏱️ **Running Timer:** Starts <t:${startUnix}:R> • Ends <t:${endUnix}:R>`,
+          `📅 **Starts:** <t:${startUnix}:F> *(Friday at 00:00)*`,
+          `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`,
+        ];
+
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.gold)
+      .setTitle(`Boss of the Week — ${botwInfo.targetName}`)
+      .setDescription(timerLines.join("\n"))
+      .addFields(
+        {
+          name: `Leaderboard — Members With ${botwInfo.targetName} Kills Earned (${standings.length})`,
+          value: formatWeeklyStandingsLines(standings, "botw"),
+          inline: false,
+        },
+        {
+          name: "OSRS HiScores Tracking (Every 2 Hours)",
+          value:
+            (lastPollUnix ? `• **Last Synced:** <t:${lastPollUnix}:R>\n` : "") +
+            `• **Next Sync:** <t:${nextPollUnix}:R> (<t:${nextPollUnix}:t>)\n` +
+            "• **Next Week's Event:** Skill of the Week *(Alternates every Thursday at 23:59)*",
+          inline: false,
+        }
+      )
+      .setFooter({ text: "Odinheim Weekly Events • Official OSRS HiScores • Only members who earned kills are listed" })
+      .setTimestamp(new Date(schedule.nowMs));
+
+    return { embeds: [embed], components: [] };
+  }
+
+  // Skill of the Week is currently running -> Boss of the Week is Up Next
+  const prevStandings = previousBotwState?.standings || [];
+  const prevTitleSuffix = previousBotwState?.targetName ? ` (Last BOTW: ${previousBotwState.targetName})` : "";
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("Boss of the Week — Up Next")
+    .setDescription(
+      `⏸️ **Status:** Alternating Week — **Skill of the Week (${schedule.current.targetName})** is currently active!\n` +
+      `⏭️ **Next Boss of the Week:** **${botwInfo.targetName}**\n` +
+      `⏱️ **Starts:** <t:${startUnix}:R> on <t:${startUnix}:F>\n` +
+      `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`
+    )
+    .addFields({
+      name: `Previous Boss of the Week Standings${prevTitleSuffix}`,
+      value: prevStandings.length > 0
+        ? formatWeeklyStandingsLines(prevStandings, "botw")
+        : "*Boss of the Week leaderboard will begin at 00:00 on Friday morning when BOTW starts!*",
+      inline: false,
+    })
+    .setFooter({ text: "Odinheim Weekly Events • Alternates every Thursday at 23:59 between Skill & Boss of the Week" })
+    .setTimestamp(new Date(schedule.nowMs));
+
+  return { embeds: [embed], components: [] };
+}
+
+function isSotwPermanentMessage(message) {
+  if (!message || message.author?.id !== client.user?.id) return false;
+  const title = message.embeds?.[0]?.title || "";
+  return title.startsWith("Skill of the Week");
+}
+
+function isBotwPermanentMessage(message) {
+  if (!message || message.author?.id !== client.user?.id) return false;
+  const title = message.embeds?.[0]?.title || "";
+  return title.startsWith("Boss of the Week");
+}
+
+async function ensureWeeklyEventsMessages(sotwPayload, botwPayload) {
+  const channel = await getChannelById(WEEKLY_EVENTS_CHANNEL_ID, "WeeklyEvents");
+  if (!channel) return;
+
+  const recent = await fetchRecentMessages(channel, SCAN_PAGES_PERMANENT);
+  const myMessages = recent
+    .filter((m) => isSotwPermanentMessage(m) || isBotwPermanentMessage(m))
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp); // Oldest first (top-to-bottom in Discord)
+
+  if (myMessages.length >= 2) {
+    const [firstMsg, secondMsg, ...dupes] = myMessages;
+    await firstMsg.edit(sotwPayload).catch((e) => console.warn("[WeeklyEvents] Could not edit SOTW message:", e.message));
+    await secondMsg.edit(botwPayload).catch((e) => console.warn("[WeeklyEvents] Could not edit BOTW message:", e.message));
+    for (const d of dupes) {
+      await d.delete().catch(() => {});
+    }
+    return;
+  }
+
+  for (const m of myMessages) {
+    await m.delete().catch(() => {});
+  }
+  await channel.send(sotwPayload).catch((e) => console.warn("[WeeklyEvents] Could not send SOTW message:", e.message));
+  await channel.send(botwPayload).catch((e) => console.warn("[WeeklyEvents] Could not send BOTW message:", e.message));
+  console.log("[WeeklyEvents] Posted permanent Skill of the Week and Boss of the Week embeds.");
+}
+
+let weeklyEventsSyncInFlight = false;
+let activeWeeklyEventKey = null;
+let lastTwoHourSlotPolled = null;
+
+async function syncWeeklyEvents(asOfDate = new Date(), options = {}) {
+  if (weeklyEventsSyncInFlight) return null;
+  weeklyEventsSyncInFlight = true;
+  try {
+    const nowDate = asOfDate instanceof Date ? asOfDate : new Date(asOfDate);
+    const schedule = getWeeklyEventSchedule(nowDate);
+    const supabase = getSupabase();
+
+    let members = options.members || null;
+    if (!members && supabase) {
+      const { data } = await supabase
+        .from("clan_members")
+        .select("*")
+        .eq("active", true);
+      members = data || [];
+    }
+
+    let currentState = await loadWeeklyEventState(supabase, schedule.current);
+    const prevState = schedule.previous ? await loadWeeklyEventState(supabase, schedule.previous) : null;
+
+    const shouldPollHiscores =
+      schedule.current.isRunning &&
+      (options.forcePoll === true ||
+        !currentState.lastPolledAt ||
+        Object.keys(currentState.baselines || {}).length === 0);
+
+    if (shouldPollHiscores && members && members.length > 0) {
+      currentState = await pollWeeklyEventHiscores(schedule.current, members, currentState, nowDate);
+      await saveWeeklyEventState(supabase, currentState);
+    }
+
+    const prevSotwState =
+      schedule.previous?.eventType === "sotw" ? prevState : null;
+    const prevBotwState =
+      schedule.previous?.eventType === "botw" ? prevState : null;
+
+    const sotwPayload = buildSotwEmbedPayload(schedule, currentState, prevSotwState);
+    const botwPayload = buildBotwEmbedPayload(schedule, currentState, prevBotwState);
+
+    await ensureWeeklyEventsMessages(sotwPayload, botwPayload);
+    activeWeeklyEventKey = schedule.current.weekKey;
+
+    return {
+      schedule,
+      currentState,
+      sotwPayload,
+      botwPayload,
+    };
+  } finally {
+    weeklyEventsSyncInFlight = false;
+  }
+}
+
+let weeklyEventsTimer = null;
+
+function startWeeklyEventsLoop() {
+  if (weeklyEventsTimer) clearInterval(weeklyEventsTimer);
+
+  // Check every 60 seconds for:
+  //   1. Thursday 23:59 event rollover (switching between Skill of the Week and Boss of the Week)
+  //   2. Every 2-hour OSRS HiScores poll starting at 00:00 Friday morning (00:00, 02:00, 04:00, ..., 22:00)
+  weeklyEventsTimer = setInterval(async () => {
+    try {
+      const now = new Date();
+      const schedule = getWeeklyEventSchedule(now);
+      const twoHoursMs = config.weeklyEventPollIntervalMs ?? WEEKLY_EVENT_POLL_INTERVAL_MS;
+
+      const weekSwitched = activeWeeklyEventKey && activeWeeklyEventKey !== schedule.current.weekKey;
+      const currentSlot =
+        schedule.nowMs >= schedule.current.startsAtMs
+          ? `${schedule.current.weekKey}_slot_${Math.floor((schedule.nowMs - schedule.current.startsAtMs) / twoHoursMs)}`
+          : `${schedule.current.weekKey}_prestart`;
+
+      const slotChanged = currentSlot !== lastTwoHourSlotPolled && schedule.nowMs >= schedule.current.startsAtMs;
+
+      if (weekSwitched || slotChanged) {
+        lastTwoHourSlotPolled = currentSlot;
+        await syncWeeklyEvents(now, { forcePoll: true });
+      }
+    } catch (err) {
+      console.error("[WeeklyEvents] Loop error:", err.message);
+    }
+  }, 60 * 1000);
+
+  if (typeof weeklyEventsTimer.unref === "function") weeklyEventsTimer.unref();
 }
 
 // ================= RANKING SYSTEM: GROWTH CHART, PERMANENT RANK LIST, ALERTS & LOGS =================
@@ -3120,6 +3935,12 @@ client.once(Events.ClientReady, async () => {
   } catch (err) {
     console.error("[RankSync] startRankingSyncLoop failed:", err.message);
   }
+  try {
+    await syncWeeklyEvents(new Date(), { forcePoll: true });
+    startWeeklyEventsLoop();
+  } catch (err) {
+    console.error("[WeeklyEvents] Initial sync failed:", err.message);
+  }
 });
 
 client.on(Events.GuildMemberAdd, (member) => {
@@ -3249,4 +4070,22 @@ module.exports = {
   VOICE_EMPTY_TIMEOUT_MS,
   VOICE_INITIAL_EMPTY_TIMEOUT_MS,
   VOICE_CREATE_COOLDOWN_MS,
+  // Weekly Events exports
+  WEEKLY_EVENTS_CHANNEL_ID,
+  WEEKLY_EVENT_POLL_INTERVAL_MS,
+  WEEKLY_EVENTS_ANCHOR_ISO,
+  FRACTURED_ARCHIVES_UNLOCK_DATE,
+  OSRS_SKILLS,
+  OSRS_BOSSES,
+  getEligibleBosses,
+  pickWeeklyEventTarget,
+  getWeeklyEventSchedule,
+  fetchPlayerHiscores,
+  extractHiscoreMetric,
+  pollWeeklyEventHiscores,
+  buildSotwEmbedPayload,
+  buildBotwEmbedPayload,
+  ensureWeeklyEventsMessages,
+  syncWeeklyEvents,
+  startWeeklyEventsLoop,
 };

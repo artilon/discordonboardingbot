@@ -86,11 +86,27 @@ create table if not exists public.clan_growth_history (
 
 create index if not exists idx_clan_growth_history_date on public.clan_growth_history (recorded_date asc);
 
+-- 5. Weekly Events (Skill of the Week & Boss of the Week) state & baselines
+create table if not exists public.weekly_events (
+  week_key text primary key,
+  week_index integer not null,
+  event_type text not null, -- 'sotw' | 'botw'
+  target_name text not null,
+  starts_at timestamptz not null,
+  ends_at timestamptz not null,
+  baselines jsonb not null default '{}'::jsonb,
+  standings jsonb not null default '[]'::jsonb,
+  last_polled_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 -- Disable RLS so the bot can read/write freely
 alter table public.clan_members disable row level security;
 alter table public.roster_upload disable row level security;
 alter table public.xp_rank_logs disable row level security;
 alter table public.clan_growth_history disable row level security;
+alter table public.weekly_events disable row level security;
 
 -- 5. Enable Realtime on clan_members, roster_upload, and clan_growth_history
 do $$
