@@ -2974,19 +2974,9 @@ async function onMemberLeftConfirm2(interaction, encodedRsn) {
 async function onVoiceCategorySelect(interaction) {
   const selectedKey = interaction.values?.[0];
   const cfg = getVoiceCategoryConfig(selectedKey);
-  if (!cfg) {
-    return interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(COLOR.bad)
-          .setTitle("Invalid Category")
-          .setDescription("Please pick a valid category from the dropdown menu."),
-      ],
-      flags: MessageFlags.Ephemeral,
-    });
+  if (cfg) {
+    selectedVoiceCategoryByUser.set(interaction.user.id, cfg.key);
   }
-
-  selectedVoiceCategoryByUser.set(interaction.user.id, cfg.key);
   return interaction.deferUpdate();
 }
 
@@ -2994,29 +2984,11 @@ async function onVoiceCreateConfirm(interaction, categoryKeyFromButton) {
   const categoryKey = categoryKeyFromButton || selectedVoiceCategoryByUser.get(interaction.user.id);
   const cfg = getVoiceCategoryConfig(categoryKey);
 
-  if (!cfg) {
-    return interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(COLOR.warn)
-          .setTitle("Select a Category First")
-          .setDescription(
-            "Please select a category (**Social Hub**, **Old School Runescape**, or **Other Games**) from the dropdown menu first, then click **Confirm & Create Voice Channel**."
-          ),
-      ],
-      flags: MessageFlags.Ephemeral,
-    });
-  }
-
-  const isFromEphemeralPrompt = Boolean(categoryKeyFromButton);
-  if (isFromEphemeralPrompt) {
-    await interaction.deferUpdate();
-  } else {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  }
+  await interaction.deferUpdate();
+  if (!cfg) return;
 
   try {
-    const { channel, channelName } = await createTemporaryVoiceChannel(
+    await createTemporaryVoiceChannel(
       interaction.guild,
       cfg.key,
       interaction.user
@@ -3025,39 +2997,14 @@ async function onVoiceCreateConfirm(interaction, categoryKeyFromButton) {
 
     // Reset the dropdown on the permanent message so the same category can be selected again later
     await interaction.message?.edit?.(buildVoiceCreatorMessage()).catch(() => {});
-
-    const okEmbed = new EmbedBuilder()
-      .setColor(COLOR.ok)
-      .setTitle("Temporary Voice Channel Created")
-      .setDescription(
-        `Created <#${channel.id}> (**${channelName}**) under **${cfg.label}**!\n\n` +
-        "It will automatically delete 5 minutes after the last person disconnects."
-      );
-
-    return interaction.editReply({ embeds: [okEmbed], components: [] });
   } catch (err) {
     console.error(`[TempVoice] Failed to create voice channel for ${interaction.user.id}:`, err.message);
-    const errEmbed = new EmbedBuilder()
-      .setColor(COLOR.bad)
-      .setTitle("Could Not Create Voice Channel")
-      .setDescription(
-        "Discord wouldn't let me create the voice channel (make sure my bot role has the **Manage Channels** and **Connect** permissions on that category)."
-      );
-    return interaction.editReply({ embeds: [errEmbed], components: [] });
   }
 }
 
 async function onVoiceCreateCancel(interaction) {
   selectedVoiceCategoryByUser.delete(interaction.user.id);
-  return interaction.update({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(COLOR.warn)
-        .setTitle("Cancelled")
-        .setDescription("No voice channel was created. Select a category from the dropdown whenever you're ready."),
-    ],
-    components: [],
-  });
+  return interaction.deferUpdate();
 }
 
 async function handleInteraction(interaction) {
