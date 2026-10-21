@@ -95,11 +95,13 @@ const RANK_LIST_CHANNEL_ID   = "1561482413341679757";
 const RANK_LOG_CHANNEL_ID    = "1561484125016428605";
 
 // Temporary Voice Channel Creator & Category IDs
-const CREATE_VOICE_CHANNEL_ID = "1562519552414453911";
-const SOCIAL_HUB_CATEGORY_ID  = "1546412771598532628";
-const OSRS_CATEGORY_ID        = "1545654996928823377";
-const OTHER_GAMES_CATEGORY_ID = "1545654996928823378";
-const VOICE_EMPTY_TIMEOUT_MS  = 5 * 60 * 1000; // Auto-delete 5 minutes after last person leaves
+const CREATE_VOICE_CHANNEL_ID        = "1562519552414453911";
+const SOCIAL_HUB_CATEGORY_ID         = "1546412771598532628";
+const OSRS_CATEGORY_ID               = "1545654996928823377";
+const OTHER_GAMES_CATEGORY_ID        = "1545654996928823378";
+const VOICE_EMPTY_TIMEOUT_MS         = 5 * 60 * 1000; // Auto-delete 5 minutes after last person leaves
+const VOICE_INITIAL_EMPTY_TIMEOUT_MS = 60 * 1000;     // Auto-delete after 60 seconds if nobody joins after creation
+const VOICE_CREATE_COOLDOWN_MS       = 5 * 60 * 1000; // Limit each user to creating 1 voice channel every 5 minutes
 
 const VOICE_CATEGORIES = [
   {
@@ -165,6 +167,8 @@ const config = {
   settleMs: 3000,
   rankSyncIntervalMs: 30 * 60 * 1000, // Check Supabase + tenure milestones every 30 minutes
   voiceEmptyTimeoutMs: VOICE_EMPTY_TIMEOUT_MS,
+  voiceInitialEmptyTimeoutMs: VOICE_INITIAL_EMPTY_TIMEOUT_MS,
+  voiceCreateCooldownMs: VOICE_CREATE_COOLDOWN_MS,
   multiplyMonthlyYearly: false,       // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
   growthChartRange: "all",            // "30d" | "6m" | "all"
   supabase: null,                     // Initialized on startup or injected for tests
@@ -681,7 +685,22 @@ async function ensureOrientationMessage() {
 
 // ================= TEMPORARY VOICE CHANNEL CREATOR =================
 const selectedVoiceCategoryByUser = new Map(); // userId -> categoryKey
+const voiceCreateLastAtByUser = new Map();     // userId -> timestampMs
 const tempVoiceDeleteTimers = new Map();       // channelId -> Timeout
+
+function getVoiceCreateCooldownRemainingMs(userId, nowMs = Date.now()) {
+  if (!userId) return 0;
+  const lastAt = voiceCreateLastAtByUser.get(userId);
+  if (!lastAt) return 0;
+  const cooldownMs = config.voiceCreateCooldownMs ?? VOICE_CREATE_COOLDOWN_MS;
+  const elapsed = nowMs - lastAt;
+  return elapsed < cooldownMs ? cooldownMs - elapsed : 0;
+}
+
+function clearVoiceCreateCooldown(userId) {
+  if (!userId) voiceCreateLastAtByUser.clear();
+  else voiceCreateLastAtByUser.delete(userId);
+}
 
 function getVoiceCategoryConfig(keyOrCategoryId) {
   if (!keyOrCategoryId) return null;
@@ -726,7 +745,7 @@ function clearTempVoiceTimer(channelId) {
   }
 }
 
-function scheduleTempVoiceDeletion(channel) {
+function scheduleTempVoiceDeletion(channel, customTimeoutMs = null) {
   if (!channel || !isManagedTempVoiceChannel(channel)) return;
   if (getNonBotVoiceMemberCount(channel) > 0) {
     clearTempVoiceTimer(channel.id);
@@ -734,7 +753,7 @@ function scheduleTempVoiceDeletion(channel) {
   }
   if (tempVoiceDeleteTimers.has(channel.id)) return; // Countdown already running
 
-  const timeoutMs = config.voiceEmptyTimeoutMs ?? VOICE_EMPTY_TIMEOUT_MS;
+  const timeoutMs = customTimeoutMs ?? (config.voiceEmptyTimeoutMs ?? VOICE_EMPTY_TIMEOUT_MS);
   const timer = setTimeout(async () => {
     tempVoiceDeleteTimers.delete(channel.id);
     try {
@@ -743,7 +762,7 @@ function scheduleTempVoiceDeletion(channel) {
         (await client.channels.fetch(channel.id).catch(() => null));
       if (!fresh || !isManagedTempVoiceChannel(fresh)) return;
       if (getNonBotVoiceMemberCount(fresh) === 0) {
-        await fresh.delete("Temporary voice channel empty for 5 minutes");
+        await fresh.delete("Temporary voice channel empty timeout reached");
         console.log(`[TempVoice] Deleted empty temporary voice channel ${fresh.name} (${fresh.id}).`);
       }
     } catch (err) {
@@ -832,8 +851,9 @@ async function createTemporaryVoiceChannel(guild, categoryKey, creatorUser) {
     });
   }
 
-  // Start the 5-minute empty timer until someone connects
-  scheduleTempVoiceDeletion(created);
+  // Start the 60-second initial empty timer until someone connects
+  const initialTimeoutMs = config.voiceInitialEmptyTimeoutMs ?? VOICE_INITIAL_EMPTY_TIMEOUT_MS;
+  scheduleTempVoiceDeletion(created, initialTimeoutMs);
   console.log(`[TempVoice] Created ${channelName} (${created.id}) under ${cfg.label}.`);
   return { channel: created, category: cfg, channelName };
 }
@@ -847,7 +867,7 @@ function buildVoiceCreatorMessage() {
       "• **Social Hub** ➔ `Social Voice 1, 2, 3…`\n" +
       "• **Old School Runescape** ➔ `OSRS Voice 1, 2, 3…`\n" +
       "• **Other Games** ➔ `Other Games Voice 1, 2, 3…`\n\n" +
-      "Permissions are automatically synced with the category, and the voice channel will **auto-delete 5 minutes after the last person disconnects**."
+      "Permissions are automatically synced with the category. Channels auto-delete **after 60 seconds if nobody joins**, or **5 minutes after the last person disconnects** (1 channel per user every 5 minutes)."
     );
 
   const selectMenu = new StringSelectMenuBuilder()
@@ -2991,12 +3011,18 @@ async function onVoiceCreateConfirm(interaction, categoryKeyFromButton) {
   await interaction.deferUpdate();
   if (!cfg) return;
 
+  // Enforce 5-minute per-user cooldown
+  if (getVoiceCreateCooldownRemainingMs(interaction.user.id) > 0) {
+    return;
+  }
+
   try {
     await createTemporaryVoiceChannel(
       interaction.guild,
       cfg.key,
       interaction.user
     );
+    voiceCreateLastAtByUser.set(interaction.user.id, Date.now());
     selectedVoiceCategoryByUser.delete(interaction.user.id);
 
     // Reset the dropdown on the permanent message so the same category can be selected again later
@@ -3165,6 +3191,8 @@ module.exports = {
   handleVoiceStateUpdate,
   scheduleTempVoiceDeletion,
   clearTempVoiceTimer,
+  getVoiceCreateCooldownRemainingMs,
+  clearVoiceCreateCooldown,
   deletePingsFor,
   // Ranking system exports
   CLAN_CREATION_DATE,
@@ -3219,4 +3247,6 @@ module.exports = {
   OTHER_GAMES_CATEGORY_ID,
   VOICE_CATEGORIES,
   VOICE_EMPTY_TIMEOUT_MS,
+  VOICE_INITIAL_EMPTY_TIMEOUT_MS,
+  VOICE_CREATE_COOLDOWN_MS,
 };
