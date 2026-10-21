@@ -163,11 +163,11 @@ const SCAN_PAGES_PINGS     = 2; // 200 messages — finding a member's ping
 // Runtime configuration
 const config = {
   settleMs: 3000,
-  rankSyncIntervalMs: 5 * 60 * 1000, // Check Supabase + tenure milestones every 5 minutes
+  rankSyncIntervalMs: 30 * 60 * 1000, // Check Supabase + tenure milestones every 30 minutes
   voiceEmptyTimeoutMs: VOICE_EMPTY_TIMEOUT_MS,
-  multiplyMonthlyYearly: false,      // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
-  growthChartRange: "all",           // "30d" | "6m" | "all"
-  supabase: null,                    // Initialized on startup or injected for tests
+  multiplyMonthlyYearly: false,       // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
+  growthChartRange: "all",            // "30d" | "6m" | "all"
+  supabase: null,                     // Initialized on startup or injected for tests
 };
 
 // Component custom IDs
@@ -2034,6 +2034,7 @@ async function ensureStaffAlertMessage(supabase, member, alertType, payload) {
 }
 
 let rankSyncInFlight = false;
+let lastRankSyncFinishedAt = 0;
 async function syncClanRanks(asOfDate = new Date()) {
   if (rankSyncInFlight) return;
   const supabase = getSupabase();
@@ -2125,6 +2126,7 @@ async function syncClanRanks(asOfDate = new Date()) {
 
     await ensureRankListMessage(members);
   } finally {
+    lastRankSyncFinishedAt = Date.now();
     rankSyncInFlight = false;
   }
 }
@@ -2144,9 +2146,11 @@ function startRankingSyncLoop() {
     realtimeChannel = supabase
       .channel("heimdall-clan-ranks")
       .on("postgres_changes", { event: "*", schema: "public", table: "clan_members" }, () => {
+        if (rankSyncInFlight || Date.now() - lastRankSyncFinishedAt < 5000) return;
         syncClanRanks().catch((e) => console.error("[RankSync] Realtime sync error:", e.message));
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "roster_upload" }, () => {
+        if (rankSyncInFlight) return;
         syncClanRanks().catch((e) => console.error("[RankSync] Roster upload sync error:", e.message));
       })
       .subscribe();
@@ -3077,8 +3081,11 @@ client.once(Events.ClientReady, async () => {
     console.error("[TempVoice] ensureVoiceCreatorMessage failed:", err.message);
   }
   try {
-    await ensureRankListMessage();
-    await syncClanRanks();
+    if (getSupabase()) {
+      await syncClanRanks();
+    } else {
+      await ensureRankListMessage();
+    }
   } catch (err) {
     console.error("[RankSync] Initial ranking sync failed:", err.message);
   }
