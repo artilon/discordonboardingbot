@@ -40,6 +40,7 @@ const {
   Client,
   GatewayIntentBits,
   Partials,
+  ChannelType,
   Events,
   ActionRowBuilder,
   ApplicationCommandOptionType,
@@ -50,6 +51,8 @@ const {
   GuildMemberFlags,
   MessageFlags,
   ModalBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
@@ -91,6 +94,37 @@ const STAFF_ALERT_CHANNEL_ID = "1561481869197840504";
 const RANK_LIST_CHANNEL_ID   = "1561482413341679757";
 const RANK_LOG_CHANNEL_ID    = "1561484125016428605";
 
+// Temporary Voice Channel Creator & Category IDs
+const CREATE_VOICE_CHANNEL_ID = "1562519552414453911";
+const SOCIAL_HUB_CATEGORY_ID  = "1546412771598532628";
+const OSRS_CATEGORY_ID        = "1545654996928823377";
+const OTHER_GAMES_CATEGORY_ID = "1545654996928823378";
+const VOICE_EMPTY_TIMEOUT_MS  = 5 * 60 * 1000; // Auto-delete 5 minutes after last person leaves
+
+const VOICE_CATEGORIES = [
+  {
+    key: "social",
+    categoryId: SOCIAL_HUB_CATEGORY_ID,
+    label: "Social Hub",
+    prefix: "Social Voice",
+    description: "Creates Social Voice 1, 2, 3... under Social Hub",
+  },
+  {
+    key: "osrs",
+    categoryId: OSRS_CATEGORY_ID,
+    label: "Old School Runescape",
+    prefix: "OSRS Voice",
+    description: "Creates OSRS Voice 1, 2, 3... under Old School Runescape",
+  },
+  {
+    key: "other_games",
+    categoryId: OTHER_GAMES_CATEGORY_ID,
+    label: "Other Games",
+    prefix: "Other Games Voice",
+    description: "Creates Other Games Voice 1, 2, 3... under Other Games",
+  },
+];
+
 // Clan creation date floor (join dates earlier than this are clamped to 2026-10-11)
 const CLAN_CREATION_DATE = "2026-10-11";
 
@@ -130,6 +164,7 @@ const SCAN_PAGES_PINGS     = 2; // 200 messages — finding a member's ping
 const config = {
   settleMs: 3000,
   rankSyncIntervalMs: 5 * 60 * 1000, // Check Supabase + tenure milestones every 5 minutes
+  voiceEmptyTimeoutMs: VOICE_EMPTY_TIMEOUT_MS,
   multiplyMonthlyYearly: false,      // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
   growthChartRange: "all",           // "30d" | "6m" | "all"
   supabase: null,                    // Initialized on startup or injected for tests
@@ -160,6 +195,10 @@ const ID = {
   LEFT_C1:           "left_c1",
   LEFT_C2:           "left_c2",
   LEFT_CANCEL:       "left_cancel",
+  // Temporary voice channel creator custom IDs
+  VOICE_CATEGORY_SELECT: "voice_cat_select",
+  VOICE_CREATE_CONFIRM:  "voice_create_confirm",
+  VOICE_CREATE_CANCEL:   "voice_create_cancel",
 };
 
 const COLOR = {
@@ -179,6 +218,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [Partials.Channel],
 });
@@ -636,6 +676,210 @@ async function ensureOrientationMessage() {
     buttonIds: [ID.ORIENT_LEADER, ID.ORIENT_STAFF],
     payload: buildOrientationMessage(),
     what: "orientation embed",
+  });
+}
+
+// ================= TEMPORARY VOICE CHANNEL CREATOR =================
+const selectedVoiceCategoryByUser = new Map(); // userId -> categoryKey
+const tempVoiceDeleteTimers = new Map();       // channelId -> Timeout
+
+function getVoiceCategoryConfig(keyOrCategoryId) {
+  if (!keyOrCategoryId) return null;
+  return (
+    VOICE_CATEGORIES.find((c) => c.key === keyOrCategoryId || c.categoryId === keyOrCategoryId) || null
+  );
+}
+
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isManagedTempVoiceChannel(channel) {
+  if (!channel || channel.type !== ChannelType.GuildVoice) return false;
+  const cfg = VOICE_CATEGORIES.find((c) => c.categoryId === channel.parentId);
+  if (!cfg) return false;
+  const pattern = new RegExp(`^${escapeRegex(cfg.prefix)} \\d+$`, "i");
+  return pattern.test(String(channel.name || "").trim());
+}
+
+function getNonBotVoiceMemberCount(channel) {
+  if (!channel || !channel.members) return 0;
+  if (typeof channel.members.filter === "function") {
+    const filtered = channel.members.filter((m) => !m?.user?.bot);
+    return typeof filtered.size === "number" ? filtered.size : (filtered.length || 0);
+  }
+  if (typeof channel.members.values === "function") {
+    let count = 0;
+    for (const m of channel.members.values()) {
+      if (!m?.user?.bot) count++;
+    }
+    return count;
+  }
+  return 0;
+}
+
+function clearTempVoiceTimer(channelId) {
+  const existing = tempVoiceDeleteTimers.get(channelId);
+  if (existing) {
+    clearTimeout(existing);
+    tempVoiceDeleteTimers.delete(channelId);
+  }
+}
+
+function scheduleTempVoiceDeletion(channel) {
+  if (!channel || !isManagedTempVoiceChannel(channel)) return;
+  if (getNonBotVoiceMemberCount(channel) > 0) {
+    clearTempVoiceTimer(channel.id);
+    return;
+  }
+  if (tempVoiceDeleteTimers.has(channel.id)) return; // Countdown already running
+
+  const timeoutMs = config.voiceEmptyTimeoutMs ?? VOICE_EMPTY_TIMEOUT_MS;
+  const timer = setTimeout(async () => {
+    tempVoiceDeleteTimers.delete(channel.id);
+    try {
+      const fresh =
+        (await channel.guild?.channels?.fetch?.(channel.id).catch(() => null)) ||
+        (await client.channels.fetch(channel.id).catch(() => null));
+      if (!fresh || !isManagedTempVoiceChannel(fresh)) return;
+      if (getNonBotVoiceMemberCount(fresh) === 0) {
+        await fresh.delete("Temporary voice channel empty for 5 minutes");
+        console.log(`[TempVoice] Deleted empty temporary voice channel ${fresh.name} (${fresh.id}).`);
+      }
+    } catch (err) {
+      console.warn(`[TempVoice] Could not auto-delete voice channel ${channel.id}:`, err.message);
+    }
+  }, timeoutMs);
+
+  if (typeof timer.unref === "function") timer.unref();
+  tempVoiceDeleteTimers.set(channel.id, timer);
+}
+
+async function scanExistingTempVoiceChannels() {
+  for (const guild of client.guilds.cache.values()) {
+    const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
+    for (const ch of channels.values()) {
+      if (ch && isManagedTempVoiceChannel(ch)) {
+        if (getNonBotVoiceMemberCount(ch) === 0) {
+          scheduleTempVoiceDeletion(ch);
+        } else {
+          clearTempVoiceTimer(ch.id);
+        }
+      }
+    }
+  }
+}
+
+async function handleVoiceStateUpdate(oldState, newState) {
+  const joinedChannel = newState?.channel;
+  const leftChannel = oldState?.channel;
+
+  if (joinedChannel && isManagedTempVoiceChannel(joinedChannel)) {
+    if (getNonBotVoiceMemberCount(joinedChannel) > 0) {
+      clearTempVoiceTimer(joinedChannel.id);
+    }
+  }
+
+  if (leftChannel && leftChannel.id !== joinedChannel?.id && isManagedTempVoiceChannel(leftChannel)) {
+    if (getNonBotVoiceMemberCount(leftChannel) === 0) {
+      scheduleTempVoiceDeletion(leftChannel);
+    }
+  }
+}
+
+async function getNextVoiceChannelNumber(guild, cfg) {
+  const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
+  const usedNumbers = new Set();
+  const pattern = new RegExp(`^${escapeRegex(cfg.prefix)} (\\d+)$`, "i");
+
+  for (const ch of channels.values()) {
+    if (!ch || ch.type !== ChannelType.GuildVoice) continue;
+    if (ch.parentId !== cfg.categoryId) continue;
+    const match = String(ch.name || "").trim().match(pattern);
+    if (match) {
+      const n = Number(match[1]);
+      if (Number.isInteger(n) && n > 0) usedNumbers.add(n);
+    }
+  }
+
+  let nextNum = 1;
+  while (usedNumbers.has(nextNum)) {
+    nextNum++;
+  }
+  return nextNum;
+}
+
+async function createTemporaryVoiceChannel(guild, categoryKey, creatorUser) {
+  const cfg = getVoiceCategoryConfig(categoryKey);
+  if (!cfg) {
+    throw new Error("Invalid voice channel category selected.");
+  }
+
+  const nextNum = await getNextVoiceChannelNumber(guild, cfg);
+  const channelName = `${cfg.prefix} ${nextNum}`;
+
+  const created = await guild.channels.create({
+    name: channelName,
+    type: ChannelType.GuildVoice,
+    parent: cfg.categoryId,
+    reason: `Temporary voice channel created by ${creatorUser?.tag || creatorUser?.id || "member"}`,
+  });
+
+  // Explicitly sync permissions with the parent category
+  if (typeof created.lockPermissions === "function") {
+    await created.lockPermissions().catch((e) => {
+      console.warn(`[TempVoice] Could not lockPermissions on ${created.id}:`, e.message);
+    });
+  }
+
+  // Start the 5-minute empty timer until someone connects
+  scheduleTempVoiceDeletion(created);
+  console.log(`[TempVoice] Created ${channelName} (${created.id}) under ${cfg.label}.`);
+  return { channel: created, category: cfg, channelName };
+}
+
+function buildVoiceCreatorMessage() {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("Create a Temporary Voice Channel")
+    .setDescription(
+      "Need a voice channel? Pick a category from the dropdown menu below and click **Confirm & Create Voice Channel**.\n\n" +
+      "• **Social Hub** ➔ `Social Voice 1, 2, 3…`\n" +
+      "• **Old School Runescape** ➔ `OSRS Voice 1, 2, 3…`\n" +
+      "• **Other Games** ➔ `Other Games Voice 1, 2, 3…`\n\n" +
+      "Permissions are automatically synced with the category, and the voice channel will **auto-delete 5 minutes after the last person disconnects**."
+    );
+
+  const selectMenu = new StringSelectMenuBuilder()
+    .setCustomId(ID.VOICE_CATEGORY_SELECT)
+    .setPlaceholder("Select a category for your voice channel...")
+    .addOptions(
+      VOICE_CATEGORIES.map((c) =>
+        new StringSelectMenuOptionBuilder()
+          .setLabel(c.label)
+          .setValue(c.key)
+          .setDescription(c.description)
+      )
+    );
+
+  const selectRow = new ActionRowBuilder().addComponents(selectMenu);
+  const buttonRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(ID.VOICE_CREATE_CONFIRM)
+      .setLabel("Confirm & Create Voice Channel")
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return { embeds: [embed], components: [selectRow, buttonRow] };
+}
+
+async function ensureVoiceCreatorMessage() {
+  return ensureEmbedMessage({
+    channelId: CREATE_VOICE_CHANNEL_ID,
+    label: "TempVoice",
+    buttonIds: [ID.VOICE_CATEGORY_SELECT, ID.VOICE_CREATE_CONFIRM],
+    payload: buildVoiceCreatorMessage(),
+    what: "permanent temporary voice creator embed",
   });
 }
 
@@ -2726,6 +2970,123 @@ async function onMemberLeftConfirm2(interaction, encodedRsn) {
   }
 }
 
+// ---- Temporary Voice Channel Creator Interaction Handlers ----
+async function onVoiceCategorySelect(interaction) {
+  const selectedKey = interaction.values?.[0];
+  const cfg = getVoiceCategoryConfig(selectedKey);
+  if (!cfg) {
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Invalid Category")
+          .setDescription("Please pick a valid category from the dropdown menu."),
+      ],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  selectedVoiceCategoryByUser.set(interaction.user.id, cfg.key);
+
+  const nextNum = await getNextVoiceChannelNumber(interaction.guild, cfg).catch(() => 1);
+  const previewName = `${cfg.prefix} ${nextNum}`;
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle("Confirm Temporary Voice Channel")
+    .setDescription(
+      `You selected the **${cfg.label}** category.\n\n` +
+      `• **Voice Channel Name:** \`${previewName}\`\n` +
+      `• **Permissions:** Automatically synced with **${cfg.label}**\n` +
+      `• **Auto-Delete:** 5 minutes after the last person disconnects\n\n` +
+      `Click **Confirm & Create Voice Channel** below to create it now.`
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${ID.VOICE_CREATE_CONFIRM}:${cfg.key}`)
+      .setLabel(`Confirm & Create ${previewName}`)
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(ID.VOICE_CREATE_CANCEL)
+      .setLabel("Cancel")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return interaction.reply({
+    embeds: [embed],
+    components: [row],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function onVoiceCreateConfirm(interaction, categoryKeyFromButton) {
+  const categoryKey = categoryKeyFromButton || selectedVoiceCategoryByUser.get(interaction.user.id);
+  const cfg = getVoiceCategoryConfig(categoryKey);
+
+  if (!cfg) {
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.warn)
+          .setTitle("Select a Category First")
+          .setDescription(
+            "Please select a category (**Social Hub**, **Old School Runescape**, or **Other Games**) from the dropdown menu first, then click **Confirm & Create Voice Channel**."
+          ),
+      ],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const isFromEphemeralPrompt = Boolean(categoryKeyFromButton);
+  if (isFromEphemeralPrompt) {
+    await interaction.deferUpdate();
+  } else {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  }
+
+  try {
+    const { channel, channelName } = await createTemporaryVoiceChannel(
+      interaction.guild,
+      cfg.key,
+      interaction.user
+    );
+    selectedVoiceCategoryByUser.delete(interaction.user.id);
+
+    const okEmbed = new EmbedBuilder()
+      .setColor(COLOR.ok)
+      .setTitle("Temporary Voice Channel Created")
+      .setDescription(
+        `Created <#${channel.id}> (**${channelName}**) under **${cfg.label}**!\n\n` +
+        "It will automatically delete 5 minutes after the last person disconnects."
+      );
+
+    return interaction.editReply({ embeds: [okEmbed], components: [] });
+  } catch (err) {
+    console.error(`[TempVoice] Failed to create voice channel for ${interaction.user.id}:`, err.message);
+    const errEmbed = new EmbedBuilder()
+      .setColor(COLOR.bad)
+      .setTitle("Could Not Create Voice Channel")
+      .setDescription(
+        "Discord wouldn't let me create the voice channel (make sure my bot role has the **Manage Channels** and **Connect** permissions on that category)."
+      );
+    return interaction.editReply({ embeds: [errEmbed], components: [] });
+  }
+}
+
+async function onVoiceCreateCancel(interaction) {
+  selectedVoiceCategoryByUser.delete(interaction.user.id);
+  return interaction.update({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR.warn)
+        .setTitle("Cancelled")
+        .setDescription("No voice channel was created. Select a category from the dropdown whenever you're ready."),
+    ],
+    components: [],
+  });
+}
+
 async function handleInteraction(interaction) {
   if (!interaction.inGuild()) return;
 
@@ -2733,29 +3094,35 @@ async function handleInteraction(interaction) {
     return onUploadRosterSlashCommand(interaction);
   }
 
+  if (interaction.isStringSelectMenu?.() && interaction.customId === ID.VOICE_CATEGORY_SELECT) {
+    return onVoiceCategorySelect(interaction);
+  }
+
   if (interaction.isButton()) {
     const [base, payload, extra] = interaction.customId.split(":");
     switch (base) {
-      case ID.START:             return onStartButton(interaction);
-      case ID.CONFIRM1:          return onConfirm1(interaction, payload);
-      case ID.CONFIRM2:          return onConfirm2(interaction, payload);
-      case ID.CANCEL:            return onCancel(interaction);
+      case ID.START:                return onStartButton(interaction);
+      case ID.CONFIRM1:             return onConfirm1(interaction, payload);
+      case ID.CONFIRM2:             return onConfirm2(interaction, payload);
+      case ID.CANCEL:               return onCancel(interaction);
       case ID.ORIENT_LEADER:
       case ID.ORIENT_STAFF:
         return onOrientationAccept(interaction);
-      case ID.RANK_LIST_REFRESH: return onRankListRefresh(interaction);
-      case ID.ROSTER_UPLOAD_BTN: return onRosterUploadButton(interaction);
-      case ID.ROSTER_PASTE_BTN:  return onRosterPasteButton(interaction);
-      case ID.GROWTH_RANGE_30D:  return onGrowthRangeButton(interaction, "30d");
-      case ID.GROWTH_RANGE_6M:   return onGrowthRangeButton(interaction, "6m");
-      case ID.GROWTH_RANGE_ALL:  return onGrowthRangeButton(interaction, "all");
-      case ID.RANKUP_C1:         return onRankUpConfirm1(interaction, payload, extra);
-      case ID.RANKUP_C2:         return onRankUpConfirm2(interaction, payload, extra);
-      case ID.RANKUP_CANCEL:     return onRankUpCancel(interaction, payload, extra);
-      case ID.LEFT_C1:           return onMemberLeftConfirm1(interaction, payload);
-      case ID.LEFT_C2:           return onMemberLeftConfirm2(interaction, payload);
-      case ID.LEFT_CANCEL:       return onMemberLeftCancel(interaction, payload);
-      default:                   return;
+      case ID.RANK_LIST_REFRESH:    return onRankListRefresh(interaction);
+      case ID.ROSTER_UPLOAD_BTN:    return onRosterUploadButton(interaction);
+      case ID.ROSTER_PASTE_BTN:     return onRosterPasteButton(interaction);
+      case ID.GROWTH_RANGE_30D:     return onGrowthRangeButton(interaction, "30d");
+      case ID.GROWTH_RANGE_6M:      return onGrowthRangeButton(interaction, "6m");
+      case ID.GROWTH_RANGE_ALL:     return onGrowthRangeButton(interaction, "all");
+      case ID.RANKUP_C1:            return onRankUpConfirm1(interaction, payload, extra);
+      case ID.RANKUP_C2:            return onRankUpConfirm2(interaction, payload, extra);
+      case ID.RANKUP_CANCEL:        return onRankUpCancel(interaction, payload, extra);
+      case ID.LEFT_C1:              return onMemberLeftConfirm1(interaction, payload);
+      case ID.LEFT_C2:              return onMemberLeftConfirm2(interaction, payload);
+      case ID.LEFT_CANCEL:          return onMemberLeftCancel(interaction, payload);
+      case ID.VOICE_CREATE_CONFIRM: return onVoiceCreateConfirm(interaction, payload);
+      case ID.VOICE_CREATE_CANCEL:  return onVoiceCreateCancel(interaction);
+      default:                      return;
     }
   }
 
@@ -2784,6 +3151,12 @@ client.once(Events.ClientReady, async () => {
     console.error("[Orientation] ensureOrientationMessage failed:", err.message);
   }
   try {
+    await ensureVoiceCreatorMessage();
+    await scanExistingTempVoiceChannels();
+  } catch (err) {
+    console.error("[TempVoice] ensureVoiceCreatorMessage failed:", err.message);
+  }
+  try {
     await ensureRankListMessage();
     await syncClanRanks();
   } catch (err) {
@@ -2810,6 +3183,10 @@ client.on(Events.GuildMemberRemove, (member) => {
 
 client.on(Events.MessageCreate, (message) => {
   handleMessageCreate(message).catch((e) => console.error("[Message] handler error:", e.message));
+});
+
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  handleVoiceStateUpdate(oldState, newState).catch((e) => console.error("[TempVoice] VoiceStateUpdate error:", e.message));
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -2853,6 +3230,14 @@ module.exports = {
   ensurePermanentMessage,
   ensureOrientationMessage,
   buildOrientationMessage,
+  buildVoiceCreatorMessage,
+  ensureVoiceCreatorMessage,
+  isManagedTempVoiceChannel,
+  getNextVoiceChannelNumber,
+  createTemporaryVoiceChannel,
+  handleVoiceStateUpdate,
+  scheduleTempVoiceDeletion,
+  clearTempVoiceTimer,
   deletePingsFor,
   // Ranking system exports
   CLAN_CREATION_DATE,
@@ -2901,4 +3286,10 @@ module.exports = {
   STAFF_ALERT_CHANNEL_ID,
   RANK_LIST_CHANNEL_ID,
   RANK_LOG_CHANNEL_ID,
+  CREATE_VOICE_CHANNEL_ID,
+  SOCIAL_HUB_CATEGORY_ID,
+  OSRS_CATEGORY_ID,
+  OTHER_GAMES_CATEGORY_ID,
+  VOICE_CATEGORIES,
+  VOICE_EMPTY_TIMEOUT_MS,
 };
