@@ -2987,37 +2987,7 @@ async function onVoiceCategorySelect(interaction) {
   }
 
   selectedVoiceCategoryByUser.set(interaction.user.id, cfg.key);
-
-  const nextNum = await getNextVoiceChannelNumber(interaction.guild, cfg).catch(() => 1);
-  const previewName = `${cfg.prefix} ${nextNum}`;
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.warn)
-    .setTitle("Confirm Temporary Voice Channel")
-    .setDescription(
-      `You selected the **${cfg.label}** category.\n\n` +
-      `• **Voice Channel Name:** \`${previewName}\`\n` +
-      `• **Permissions:** Automatically synced with **${cfg.label}**\n` +
-      `• **Auto-Delete:** 5 minutes after the last person disconnects\n\n` +
-      `Click **Confirm & Create Voice Channel** below to create it now.`
-    );
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`${ID.VOICE_CREATE_CONFIRM}:${cfg.key}`)
-      .setLabel(`Confirm & Create ${previewName}`)
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(ID.VOICE_CREATE_CANCEL)
-      .setLabel("Cancel")
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  return interaction.reply({
-    embeds: [embed],
-    components: [row],
-    flags: MessageFlags.Ephemeral,
-  });
+  return interaction.deferUpdate();
 }
 
 async function onVoiceCreateConfirm(interaction, categoryKeyFromButton) {
@@ -3052,6 +3022,9 @@ async function onVoiceCreateConfirm(interaction, categoryKeyFromButton) {
       interaction.user
     );
     selectedVoiceCategoryByUser.delete(interaction.user.id);
+
+    // Reset the dropdown on the permanent message so the same category can be selected again later
+    await interaction.message?.edit?.(buildVoiceCreatorMessage()).catch(() => {});
 
     const okEmbed = new EmbedBuilder()
       .setColor(COLOR.ok)
