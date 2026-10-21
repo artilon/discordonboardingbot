@@ -105,8 +105,10 @@ const VOICE_CREATE_COOLDOWN_MS       = 5 * 60 * 1000; // Limit each user to crea
 
 // Weekly Events (Skill of the Week & Boss of the Week)
 const WEEKLY_EVENTS_CHANNEL_ID       = "1562600669796507760";
-const WEEKLY_EVENT_POLL_INTERVAL_MS  = 2 * 60 * 60 * 1000; // Poll OSRS HiScores every 2 hours starting Friday 00:00
-const WEEKLY_EVENTS_ANCHOR_ISO       = "2026-10-23T00:00:00.000Z"; // First SOTW starts Friday, Oct 23, 2026 at 00:00
+const WEEKLY_EVENT_POLL_INTERVAL_MS  = 2 * 60 * 60 * 1000; // Poll OSRS HiScores every 2 hours starting Friday 00:00 Central
+const WEEKLY_EVENTS_TIMEZONE         = "America/Chicago";  // Central Time (CST/CDT)
+const WEEKLY_EVENTS_ANCHOR_DATE      = { year: 2026, month: 10, day: 23 }; // Friday, Oct 23, 2026
+const WEEKLY_EVENTS_ANCHOR_ISO       = "2026-10-23T00:00:00-05:00"; // First SOTW starts Friday, Oct 23, 2026 at 00:00 Central
 const FRACTURED_ARCHIVES_UNLOCK_DATE = "2027-04-21"; // 6-month restriction from 2026-10-21
 
 const OSRS_SKILLS = [
@@ -1064,17 +1066,72 @@ function pickWeeklyEventTarget(eventType, typeCycleIndex, asOfDate = new Date())
   return shuffled[posInPass] || shuffled[0];
 }
 
+// Convert a calendar date & wall-clock time in America/Chicago (CST/CDT) into exact UTC milliseconds
+function centralTimeToUtcMs(year, month, day, hour = 0, minute = 0, second = 0) {
+  const targetWallUtc = Date.UTC(year, month - 1, day, hour, minute, second);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: WEEKLY_EVENTS_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+
+  const getOffsetAt = (utcMs) => {
+    const parts = {};
+    for (const p of formatter.formatToParts(new Date(utcMs))) {
+      if (p.type !== "literal") parts[p.type] = Number(p.value);
+    }
+    const wallAtUtc = Date.UTC(
+      parts.year,
+      parts.month - 1,
+      parts.day,
+      parts.hour,
+      parts.minute,
+      parts.second
+    );
+    return wallAtUtc - utcMs;
+  };
+
+  const firstGuess = targetWallUtc - getOffsetAt(targetWallUtc);
+  return targetWallUtc - getOffsetAt(firstGuess);
+}
+
+function addCalendarDays(year, month, day, daysToAdd) {
+  const d = new Date(Date.UTC(year, month - 1, day + daysToAdd));
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    isoDate: d.toISOString().slice(0, 10),
+  };
+}
+
 function getWeekWindowByIndex(weekIndex) {
-  const anchorMs = Date.parse(WEEKLY_EVENTS_ANCHOR_ISO);
-  const weekMs = 7 * 24 * 60 * 60 * 1000;
-  // Each event runs Friday 00:00 -> Thursday 23:59 (switches at 23:59 Thursday night)
-  const startsAtMs = anchorMs + weekIndex * weekMs;
-  const endsAtMs = startsAtMs + weekMs - 60 * 1000; // Thursday 23:59:00 UTC
+  const startCal = addCalendarDays(
+    WEEKLY_EVENTS_ANCHOR_DATE.year,
+    WEEKLY_EVENTS_ANCHOR_DATE.month,
+    WEEKLY_EVENTS_ANCHOR_DATE.day,
+    weekIndex * 7
+  );
+  const endCal = addCalendarDays(
+    WEEKLY_EVENTS_ANCHOR_DATE.year,
+    WEEKLY_EVENTS_ANCHOR_DATE.month,
+    WEEKLY_EVENTS_ANCHOR_DATE.day,
+    weekIndex * 7 + 6
+  );
+
+  // Each event runs Friday 00:00 Central -> Thursday 23:59 Central (switches at 23:59 Thursday night Central)
+  const startsAtMs = centralTimeToUtcMs(startCal.year, startCal.month, startCal.day, 0, 0, 0);
+  const endsAtMs = centralTimeToUtcMs(endCal.year, endCal.month, endCal.day, 23, 59, 0);
 
   const eventType = weekIndex % 2 === 0 ? "sotw" : "botw";
   const typeCycleIndex = Math.floor(weekIndex / 2);
   const target = pickWeeklyEventTarget(eventType, typeCycleIndex, new Date(startsAtMs));
-  const startIsoDate = new Date(startsAtMs).toISOString().slice(0, 10);
+  const startIsoDate = startCal.isoDate;
   const weekKey = `week_${weekIndex}_${eventType}_${startIsoDate}`;
 
   return {
@@ -1093,13 +1150,15 @@ function getWeekWindowByIndex(weekIndex) {
 
 function getWeeklyEventSchedule(asOfDate = new Date()) {
   const nowMs = (asOfDate instanceof Date ? asOfDate : new Date(asOfDate)).getTime();
-  const anchorMs = Date.parse(WEEKLY_EVENTS_ANCHOR_ISO);
-  const weekMs = 7 * 24 * 60 * 60 * 1000;
+  const week0 = getWeekWindowByIndex(0);
+  const approxWeekMs = 7 * 24 * 60 * 60 * 1000;
 
   let weekIndex = 0;
-  if (nowMs >= anchorMs) {
-    // Advance to the next week as soon as Thursday 23:59 (endsAtMs) is reached
-    weekIndex = Math.floor((nowMs - anchorMs + 60 * 1000) / weekMs);
+  if (nowMs >= week0.startsAtMs) {
+    weekIndex = Math.max(0, Math.floor((nowMs - week0.startsAtMs) / approxWeekMs) - 1);
+    while (nowMs >= getWeekWindowByIndex(weekIndex).endsAtMs) {
+      weekIndex++;
+    }
   }
 
   const current = getWeekWindowByIndex(weekIndex);
@@ -1448,13 +1507,13 @@ function buildSotwEmbedPayload(schedule, currentState, previousSotwState = null)
           `🟢 **CURRENT RUNNING EVENT:** **${sotwInfo.targetName}** *(Skill of the Week)*`,
           `⏱️ **Running Timer:** Ends <t:${endUnix}:R> (**${remainingText} remaining**)`,
           `📅 **Starts:** <t:${startUnix}:F>`,
-          `🏁 **Ends:** <t:${endUnix}:F> *(Switches Thursday at 23:59)*`,
+          `🏁 **Ends:** <t:${endUnix}:F>`,
         ]
       : [
           `⏳ **SCHEDULED EVENT:** **${sotwInfo.targetName}** *(Skill of the Week)*`,
           `⏱️ **Running Timer:** Starts <t:${startUnix}:R> • Ends <t:${endUnix}:R>`,
-          `📅 **Starts:** <t:${startUnix}:F> *(Friday at 00:00)*`,
-          `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`,
+          `📅 **Starts:** <t:${startUnix}:F>`,
+          `🏁 **Ends:** <t:${endUnix}:F>`,
         ];
 
     const embed = new EmbedBuilder()
@@ -1472,7 +1531,7 @@ function buildSotwEmbedPayload(schedule, currentState, previousSotwState = null)
           value:
             (lastPollUnix ? `• **Last Synced:** <t:${lastPollUnix}:R>\n` : "") +
             `• **Next Sync:** <t:${nextPollUnix}:R> (<t:${nextPollUnix}:t>)\n` +
-            "• **Next Week's Event:** Boss of the Week *(Alternates every Thursday at 23:59)*",
+            "• **Next Week's Event:** Boss of the Week",
           inline: false,
         }
       )
@@ -1492,17 +1551,17 @@ function buildSotwEmbedPayload(schedule, currentState, previousSotwState = null)
     .setDescription(
       `⏸️ **Status:** Alternating Week — **Boss of the Week (${schedule.current.targetName})** is currently active!\n` +
       `⏭️ **Next Skill of the Week:** **${sotwInfo.targetName}**\n` +
-      `⏱️ **Starts:** <t:${startUnix}:R> on <t:${startUnix}:F>\n` +
-      `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`
+      `⏱️ **Starts:** <t:${startUnix}:R> (<t:${startUnix}:F>)\n` +
+      `🏁 **Ends:** <t:${endUnix}:F>`
     )
     .addFields({
       name: `Previous Skill of the Week Standings${prevTitleSuffix}`,
       value: prevStandings.length > 0
         ? formatWeeklyStandingsLines(prevStandings, "sotw")
-        : "*New Skill of the Week leaderboard will begin at 00:00 on Friday morning!*",
+        : "*New Skill of the Week leaderboard will begin when the event starts!*",
       inline: false,
     })
-    .setFooter({ text: "Odinheim Weekly Events • Alternates every Thursday at 23:59 between Skill & Boss of the Week" })
+    .setFooter({ text: "Odinheim Weekly Events • Alternates weekly between Skill & Boss of the Week" })
     .setTimestamp(new Date(schedule.nowMs));
 
   return { embeds: [embed], components: [] };
@@ -1528,13 +1587,13 @@ function buildBotwEmbedPayload(schedule, currentState, previousBotwState = null)
           `🟢 **CURRENT RUNNING EVENT:** **${botwInfo.targetName}** *(Boss of the Week)*`,
           `⏱️ **Running Timer:** Ends <t:${endUnix}:R> (**${remainingText} remaining**)`,
           `📅 **Starts:** <t:${startUnix}:F>`,
-          `🏁 **Ends:** <t:${endUnix}:F> *(Switches Thursday at 23:59)*`,
+          `🏁 **Ends:** <t:${endUnix}:F>`,
         ]
       : [
           `⏳ **SCHEDULED EVENT:** **${botwInfo.targetName}** *(Boss of the Week)*`,
           `⏱️ **Running Timer:** Starts <t:${startUnix}:R> • Ends <t:${endUnix}:R>`,
-          `📅 **Starts:** <t:${startUnix}:F> *(Friday at 00:00)*`,
-          `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`,
+          `📅 **Starts:** <t:${startUnix}:F>`,
+          `🏁 **Ends:** <t:${endUnix}:F>`,
         ];
 
     const embed = new EmbedBuilder()
@@ -1552,7 +1611,7 @@ function buildBotwEmbedPayload(schedule, currentState, previousBotwState = null)
           value:
             (lastPollUnix ? `• **Last Synced:** <t:${lastPollUnix}:R>\n` : "") +
             `• **Next Sync:** <t:${nextPollUnix}:R> (<t:${nextPollUnix}:t>)\n` +
-            "• **Next Week's Event:** Skill of the Week *(Alternates every Thursday at 23:59)*",
+            "• **Next Week's Event:** Skill of the Week",
           inline: false,
         }
       )
@@ -1572,17 +1631,17 @@ function buildBotwEmbedPayload(schedule, currentState, previousBotwState = null)
     .setDescription(
       `⏸️ **Status:** Alternating Week — **Skill of the Week (${schedule.current.targetName})** is currently active!\n` +
       `⏭️ **Next Boss of the Week:** **${botwInfo.targetName}**\n` +
-      `⏱️ **Starts:** <t:${startUnix}:R> on <t:${startUnix}:F>\n` +
-      `🏁 **Ends:** <t:${endUnix}:F> *(Thursday at 23:59)*`
+      `⏱️ **Starts:** <t:${startUnix}:R> (<t:${startUnix}:F>)\n` +
+      `🏁 **Ends:** <t:${endUnix}:F>`
     )
     .addFields({
       name: `Previous Boss of the Week Standings${prevTitleSuffix}`,
       value: prevStandings.length > 0
         ? formatWeeklyStandingsLines(prevStandings, "botw")
-        : "*Boss of the Week leaderboard will begin at 00:00 on Friday morning when BOTW starts!*",
+        : "*Boss of the Week leaderboard will begin when BOTW starts!*",
       inline: false,
     })
-    .setFooter({ text: "Odinheim Weekly Events • Alternates every Thursday at 23:59 between Skill & Boss of the Week" })
+    .setFooter({ text: "Odinheim Weekly Events • Alternates weekly between Skill & Boss of the Week" })
     .setTimestamp(new Date(schedule.nowMs));
 
   return { embeds: [embed], components: [] };
