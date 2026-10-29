@@ -85,6 +85,33 @@ Free plan allows **3 services per project**, so both bots fit without a second
 Railway account. Watch the usage graph for the first day or two — the $1 monthly
 credit is thin if both services sit at their 0.5 GB cap.
 
+### If `/setup` doesn't appear
+
+Global commands can take up to an hour to propagate. To skip the wait, add:
+
+```
+HM_DEV_GUILD_ID=<your server id>
+```
+
+and redeploy. The log then reads `Commands registered to guild <id>.` and the
+commands are available immediately, in that server only. Leave the variable set
+if you like — registration is idempotent.
+
+### If every subcommand appears twice
+
+`/setup auto, /setup auto, /setup manual, /setup manual, …` means two scopes hold
+a copy of the same command name: one global, one guild. Discord replaces a
+scope's list wholesale but never clears the *other* scope, and the client merges
+subcommand lists across same-named commands instead of letting the guild copy
+shadow the global one.
+
+`src/register.js` handles this on every boot: it writes the scope you asked for,
+and only after that succeeds, empties the other one. So the duplicates clear
+themselves on the first restart after this code is deployed. No manual cleanup.
+
+Order is deliberate — registering first means a failed registration never leaves
+the server with zero commands.
+
 ## Channels and permissions
 
 Five channels inside an `Honour Marks` category. The category denies `@everyone`,
@@ -162,6 +189,9 @@ honour-marks/
     ├── progress.js    completion, partial credit, expiry sweep
     ├── shop.js        perks, boosts, consumables
     ├── panels.js      rendering + the page ledger
+    ├── permissions.js channel specs + the read-only overwrite matrix
+    ├── commands.js    slash-command definitions, validated before deploy
+    ├── register.js    writes one command scope, empties the other
     └── setup.js       auto/manual/repair
 ```
 
@@ -189,9 +219,11 @@ Adjust in `config.js` (`rankXp`). Existing guilds keep their own copy in
 npm test
 ```
 
-43 checks, no network required: rank ladder parity with Heimdall, hiscores diff
+60 checks, no network required: rank ladder parity with Heimdall, hiscores diff
 maths, quest target generation, boss grouping, the panel ledger (growth,
-shrinkage, self-heal) and the full permission matrix.
+shrinkage, self-heal), the full permission matrix, the slash-command payload
+against Discord's required-before-optional rule, and registration scope sync
+(the duplicate-subcommand fix).
 
 ## Known gaps
 

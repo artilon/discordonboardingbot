@@ -1,11 +1,11 @@
 {
   "name": "odinheim-honour-marks",
   "version": "1.0.0",
-  "description": "Odinheim Honour Marks bot \u2014 quests, shop, and the HM database channel",
+  "description": "Odinheim Honour Marks bot — quests, shop, and the HM database channel",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node test/modules.test.js && node test/ledger.test.js && node test/permissions.test.js && node test/commands.test.js"
+    "test": "node test/modules.test.js && node test/ledger.test.js && node test/permissions.test.js && node test/commands.test.js && node test/register.test.js"
   },
   "engines": {
     "node": ">=22"
