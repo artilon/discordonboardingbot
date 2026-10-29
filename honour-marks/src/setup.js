@@ -2,26 +2,22 @@
 const { ChannelType, PermissionFlagsBits } = require("discord.js");
 const { getSupabase, setConfigValue, getConfigJson } = require("./db");
 const { config } = require("./config");
+const {
+  CHANNEL_SPECS, buildOverwrites, buildCategoryOverwrites, overwriteContext,
+} = require("./permissions");
 
 /**
  * Setup has two modes and both are re-runnable.
  *
- *   AUTOMATIC  creates a category + channels + staff role, then binds them.
- *   MANUAL     binds to channels/roles the admin already has.
+ *   AUTOMATIC  creates a category + channels, then binds them.
+ *   MANUAL     binds to channels the admin already has.
  *
  * Everything is written to `bot_config` under `setup`, so `/setup repair` can
- * reconcile later — channels get deleted, permissions get broken, and a bot
- * that can only set itself up once is a bot you re-invite every few months.
+ * reconcile later — channels get deleted, permissions get edited by hand, and a
+ * bot that can only set itself up once is a bot you re-invite every few months.
  */
 
 const SETUP_KEY = "setup";
-
-const CHANNEL_SPECS = [
-  { key: "quests", name: "honour-marks", topic: "Quests, team quests, and the shop" },
-  { key: "database", name: "hm-database", topic: "Honour Marks totals, quest counts, and HM held" },
-  { key: "staff", name: "hm-staff", topic: "Staff only — manual HM adjustments", staffOnly: true },
-  { key: "log", name: "hm-log", topic: "Honour Marks audit log", readOnly: true },
-];
 
 async function readSetup(guildId) {
   return (await getConfigJson(guildId, SETUP_KEY)) || null;
@@ -32,33 +28,54 @@ async function writeSetup(guildId, data) {
 }
 
 /**
- * Creates the category and channels. Requires Manage Channels, and the bot's
- * role must sit above the channels it manages.
+ * Checks the two things that make role-granting fail silently in Discord:
+ * the Manage Roles permission, and the bot's role sitting above the target role
+ * in the hierarchy. Both are reported up front rather than failing on click.
  */
-async function createStructure(guild, { categoryName = "Honour Marks" } = {}) {
+async function checkRoleGranting(guild, roleId) {
+  const problems = [];
+  if (!roleId) return { ok: true, problems };
+
+  const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+  if (!me) return { ok: false, problems: ["Couldn't resolve my own guild member."] };
+
+  if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    problems.push("I need the **Manage Roles** permission to hand out the Honour Marks role.");
+  }
+
+  const target = await guild.roles.fetch(roleId).catch(() => null);
+  if (!target) {
+    problems.push(`The Honour Marks role (\`${roleId}\`) doesn't exist in this server.`);
+  } else if (me.roles.highest.comparePositionTo(target) <= 0) {
+    problems.push(
+      `My role (**${me.roles.highest.name}**) must be dragged **above** **${target.name}** ` +
+      `in Server Settings → Roles, or I can't assign it.`
+    );
+  }
+
+  return { ok: problems.length === 0, problems };
+}
+
+/** Creates the category and every channel, with the full permission matrix. */
+async function createStructure(guild, { categoryName = "Honour Marks", ownerId = null } = {}) {
+  const ctx = overwriteContext(guild, {}, ownerId);
   const created = {};
 
   const category = await guild.channels.create({
     name: categoryName,
     type: ChannelType.GuildCategory,
+    permissionOverwrites: buildCategoryOverwrites(ctx),
     reason: "Honour Marks setup",
   });
   created.categoryId = category.id;
 
   for (const spec of CHANNEL_SPECS) {
-    const overwrites = [];
-    if (spec.staffOnly) {
-      overwrites.push({
-        id: guild.roles.everyone.id,
-        deny: [PermissionFlagsBits.ViewChannel],
-      });
-    }
     const channel = await guild.channels.create({
       name: spec.name,
       type: ChannelType.GuildText,
       topic: spec.topic,
       parent: category.id,
-      permissionOverwrites: overwrites,
+      permissionOverwrites: buildOverwrites(ctx, spec.audience),
       reason: "Honour Marks setup",
     });
     created[spec.key] = channel.id;
@@ -68,16 +85,62 @@ async function createStructure(guild, { categoryName = "Honour Marks" } = {}) {
 }
 
 /**
- * Binds a guild to a set of channels. `channels` may be partial — anything
- * missing is treated as "not configured", and the panels that need it are
- * skipped rather than crashing.
+ * Re-applies the permission matrix to every bound channel. This is what makes
+ * `/setup repair` useful after someone edits overwrites by hand, and what fixes
+ * a guild set up before the claim channel existed.
  */
-async function bindGuild(guildId, { channels = {}, mode = "manual", categoryId = null, staffRoleId = null }) {
+async function applyPermissions(guild, setup, ownerId = null) {
+  const ctx = overwriteContext(guild, setup, ownerId);
+  const applied = [];
+  const missing = [];
+
+  // The category first: children inherit from it.
+  if (setup.categoryId) {
+    const cat = await guild.channels.fetch(setup.categoryId).catch(() => null);
+    if (cat) {
+      await cat.permissionOverwrites.set(buildCategoryOverwrites(ctx)).catch(() => {});
+      applied.push("category");
+    }
+  }
+
+  for (const spec of CHANNEL_SPECS) {
+    const channelId = setup.channels?.[spec.key];
+    if (!channelId) continue;
+    const ch = await guild.channels.fetch(channelId).catch(() => null);
+    if (!ch) {
+      missing.push(spec.key);
+      continue;
+    }
+    await ch.permissionOverwrites.set(buildOverwrites(ctx, spec.audience)).catch(() => {});
+    applied.push(spec.key);
+  }
+
+  return { applied, missing };
+}
+
+/**
+ * Binds a guild to a set of channels. `channels` may be partial — anything
+ * missing is treated as "not configured", and panels that need it are skipped
+ * rather than crashing.
+ */
+async function bindGuild(guildId, {
+  channels = {},
+  mode = "manual",
+  categoryId = null,
+  staffRoleId = null,
+  logUserId = null,
+  honouredRoleId = null,
+  clanMemberRoleId = null,
+}) {
   const data = {
     mode,
     categoryId,
     staffRoleId: staffRoleId || config.roles.staff || null,
+    logUserId: logUserId || config.logUserId || null,
+    honourMarksRoleId: honouredRoleId || config.roles.honourMarks || null,
+    clanMemberRoleId: clanMemberRoleId || config.roles.clanMember || null,
     channels: {
+      claim: channels.claim || config.channels.claim || null,
       quests: channels.quests || config.channels.quests || null,
       shop: channels.shop || config.channels.shop || null,
       database: channels.database || config.channels.database || null,
@@ -110,7 +173,7 @@ async function verifyBindings(guild, setup) {
   return { ok: problems.length === 0, problems };
 }
 
-/** Ensures a snapshot row exists so a brand-new guild renders something sane. */
+/** Ensures a guild has its own copy of the default XP rules. */
 async function seedDefaults(guildId) {
   const supabase = getSupabase();
   if (!supabase) return;
@@ -134,5 +197,7 @@ async function seedDefaults(guildId) {
 
 module.exports = {
   SETUP_KEY, CHANNEL_SPECS,
-  readSetup, writeSetup, createStructure, bindGuild, verifyBindings, seedDefaults,
+  readSetup, writeSetup,
+  createStructure, applyPermissions, bindGuild,
+  verifyBindings, seedDefaults, checkRoleGranting,
 };

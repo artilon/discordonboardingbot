@@ -54,9 +54,81 @@ before it's accepted, so nobody ends up with a dead registration.
 
 ## Railway
 
-Add a **second service** to the existing project, pointing **Root Directory**
-at `honour-marks/`. Free plan allows 3 services per project, so both bots fit.
-Environment variables live on the service, not the repo.
+Same repo, second service, separate Root Directory. Step by step:
+
+1. **New service from the same repo.** Railway project → **+ New** →
+   **GitHub Repo** → pick `discordonboardingbot`. It will try to build the repo
+   root as Heimdall, which is wrong — fix it in step 2.
+2. **Set the root directory.** Service → **Settings** → **Source** →
+   **Root Directory** = `honour-marks`. Confirm the build now uses
+   `honour-marks/package.json`.
+3. **Rename it** to `Odinheim Honour Marks` (Settings → General) so the usage
+   breakdown is readable.
+4. **Add variables.** Service → **Variables** → **Raw Editor**, paste:
+
+   ```
+   HM_BOT_TOKEN=...
+   HM_CLIENT_ID=...
+   SUPABASE_URL=...
+   SUPABASE_KEY=...
+   ```
+
+   Use the **same** `SUPABASE_URL`/`SUPABASE_KEY` as Heimdall — the two bots
+   must share one project or quest XP never reaches the rank ladder.
+5. **Deploy.** Start command is `npm start` from `honour-marks/`.
+6. **Invite the bot** with the `bot` and `applications.commands` scopes plus
+   Manage Channels, Manage Roles, Send Messages, Embed Links, Read Message
+   History and Manage Messages.
+7. **`/setup auto`** in Discord, then `/register` as each member.
+
+Free plan allows **3 services per project**, so both bots fit without a second
+Railway account. Watch the usage graph for the first day or two — the $1 monthly
+credit is thin if both services sit at their 0.5 GB cap.
+
+## Channels and permissions
+
+Five channels inside an `Honour Marks` category. The category denies `@everyone`,
+and each child re-allows only what it needs — because **category overwrites
+cascade to every child**, so allowing a role on the category would expose
+`#hm-log` too.
+
+| Channel | Who can see it | Who can post |
+|---|---|---|
+| `#get-honour-marks` | Clan Member + Honour Marks | bot only |
+| `#honour-marks` (quests + shop) | Honour Marks | bot only |
+| `#hm-database` | Honour Marks | bot only |
+| `#hm-staff` | Staff role | bot only |
+| `#hm-log` | **the setup runner only** | bot only |
+
+On every member-facing channel, `@everyone`, Clan Member and Honour Marks are
+denied `SendMessages`, `SendMessagesInThreads`, `CreatePublicThreads`,
+`CreatePrivateThreads`, `AddReactions` and `CreatePoll`. The channels are pure
+read-only displays; all interaction happens through buttons and menus.
+
+`#hm-log` defaults to whoever ran `/setup`, and can be pinned with
+`HM_LOG_USER_ID`. Staff are explicitly denied it rather than left to inherit.
+
+> **Administrator bypasses channel overwrites.** Discord does not let a channel
+> deny anything to an admin — that's platform behaviour, not a setting. If you
+> want the read-only channels airtight for admins too, remove Administrator from
+> those roles and grant specific permissions instead.
+
+## Claim / Drop Role
+
+`#get-honour-marks` holds one embed with two buttons:
+
+| Button | Effect |
+|---|---|
+| 🎖️ **Claim Role** | Adds the Honour Marks role, unlocking the quest board and database |
+| ✅ **Drop Role** | Removes it. Progress, HM and history are all kept |
+
+Two buttons rather than one toggle because the message is shared by the whole
+server, so its components can't differ per viewer. Both actions are named in the
+embed body as well, so nobody has to guess.
+
+Assigning the role needs **Manage Roles**, and the bot's role must sit **above**
+the Honour Marks role in the hierarchy. `/setup` checks both and tells you if
+either is wrong instead of failing silently on first click.
 
 ## How the embed limit is handled
 
@@ -110,6 +182,16 @@ months instead of being shortcut to 9.
 
 Adjust in `config.js` (`rankXp`). Existing guilds keep their own copy in
 `hm_rank_xp_rules` and are seeded on first setup.
+
+## Tests
+
+```bash
+npm test
+```
+
+43 checks, no network required: rank ladder parity with Heimdall, hiscores diff
+maths, quest target generation, boss grouping, the panel ledger (growth,
+shrinkage, self-heal) and the full permission matrix.
 
 ## Known gaps
 

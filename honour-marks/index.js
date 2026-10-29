@@ -32,10 +32,12 @@ const {
 } = require("./src/shop");
 const {
   COLOR, HM_EMOJI,
+  renderClaimPanel,
   renderDatabase, renderQuestBoard, renderShop, syncPanel, emptyPage,
 } = require("./src/panels");
 const {
   readSetup, bindGuild, createStructure, verifyBindings, seedDefaults,
+  applyPermissions, checkRoleGranting,
 } = require("./src/setup");
 
 assertConfig();
@@ -57,6 +59,7 @@ const commands = [
       s
         .setName("manual")
         .setDescription("Bind Honour Marks to channels you already have")
+        .addChannelOption((o) => o.setName("claim").setDescription("Channel with the Claim / Drop Role buttons"))
         .addChannelOption((o) => o.setName("quests").setDescription("Quest board + shop channel").setRequired(true))
         .addChannelOption((o) => o.setName("database").setDescription("Database channel").setRequired(true))
         .addChannelOption((o) => o.setName("staff").setDescription("Staff channel (optional)"))
@@ -172,7 +175,13 @@ async function refreshPanels(guildId) {
   const dbCh = setup.channels.database
     ? await guild.channels.fetch(setup.channels.database).catch(() => null)
     : null;
+  const claimCh = setup.channels.claim
+    ? await guild.channels.fetch(setup.channels.claim).catch(() => null)
+    : null;
 
+  if (claimCh) {
+    await syncPanel(guildId, claimCh, "claim", renderClaimPanel(setup));
+  }
   if (questsCh) {
     await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId));
     await syncPanel(guildId, questsCh, "shop", await renderShop(guildId));
@@ -198,11 +207,15 @@ async function handleSetup(interaction) {
     }
 
     try {
-      const created = await createStructure(guild);
+      // The setup runner is the only human who sees #hm-log.
+      const ownerId = interaction.user.id;
+      const created = await createStructure(guild, { ownerId });
       const setup = await bindGuild(guild.id, {
         mode: "auto",
         categoryId: created.categoryId,
+        logUserId: ownerId,
         channels: {
+          claim: created.claim,
           quests: created.quests,
           database: created.database,
           staff: created.staff,
@@ -213,14 +226,20 @@ async function handleSetup(interaction) {
       await seedDefaults(guild.id);
       await refreshPanels(guild.id);
 
+      const roleCheck = await checkRoleGranting(guild, setup.honourMarksRoleId);
+      const warn = roleCheck.ok
+        ? ""
+        : `\n\n⚠️ **Role assignment needs attention:**\n${roleCheck.problems.map((p) => `• ${p}`).join("\n")}`;
+
       return interaction.editReply({
         content:
           `✅ **Honour Marks is set up.**\n\n` +
+          `• <#${setup.channels.claim}> — claim or drop the Honour Marks role\n` +
           `• <#${setup.channels.quests}> — quest board and shop\n` +
           `• <#${setup.channels.database}> — member database\n` +
           `• <#${setup.channels.staff}> — staff channel\n` +
-          `• <#${setup.channels.log}> — audit log\n\n` +
-          `Members can now run \`/register\` to link their RuneScape name.`,
+          `• <#${setup.channels.log}> — audit log (only you can see this)\n\n` +
+          `Members can now run \`/register\` to link their RuneScape name.${warn}`,
       });
     } catch (e) {
       console.error("[Setup] auto failed:", e);
@@ -233,6 +252,7 @@ async function handleSetup(interaction) {
   if (sub === "manual") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+    const claim = interaction.options.getChannel("claim");
     const quests = interaction.options.getChannel("quests");
     const database = interaction.options.getChannel("database");
     const staff = interaction.options.getChannel("staff");
@@ -242,7 +262,9 @@ async function handleSetup(interaction) {
     const setup = await bindGuild(guild.id, {
       mode: "manual",
       staffRoleId: staffRole?.id || null,
+      logUserId: interaction.user.id,
       channels: {
+        claim: claim?.id || null,
         quests: quests.id,
         shop: quests.id,
         database: database.id,
@@ -251,15 +273,19 @@ async function handleSetup(interaction) {
       },
     });
     await seedDefaults(guild.id);
+    await applyPermissions(guild, setup, interaction.user.id);
     await refreshPanels(guild.id);
 
     return interaction.editReply({
       content:
         `✅ **Honour Marks bound to your channels.**\n\n` +
+        (setup.channels.claim ? `• Claim / Drop role → <#${setup.channels.claim}>\n` : "• _No claim channel set — add one with `/setup manual claim:#channel`_\n") +
         `• Quests + shop → <#${setup.channels.quests}>\n` +
         `• Database → <#${setup.channels.database}>\n` +
         (setup.channels.staff ? `• Staff → <#${setup.channels.staff}>\n` : "") +
-        (setup.channels.log ? `• Log → <#${setup.channels.log}>\n` : ""),
+        (setup.channels.log ? `• Log → <#${setup.channels.log}> (only you)\n` : "") +
+        `\n⚠️ I replaced the permission overwrites on those channels with the Honour Marks matrix. ` +
+        `If they had custom overwrites, re-add them or run \`/setup auto\` to use dedicated channels instead.`,
     });
   }
 
@@ -269,12 +295,21 @@ async function handleSetup(interaction) {
     if (!setup) return interaction.editReply({ content: "Nothing to repair — run `/setup auto` first." });
 
     const check = await verifyBindings(guild, setup);
+    const perms = await applyPermissions(guild, setup, setup.logUserId || interaction.user.id);
     await refreshPanels(guild.id);
 
+    const lines = [];
+    lines.push(`Permissions re-applied to: ${perms.applied.length ? perms.applied.join(", ") : "nothing"}`);
+    if (perms.missing.length) lines.push(`⚠️ Missing channels: ${perms.missing.join(", ")}`);
+    if (!setup.channels.claim) {
+      lines.push("⚠️ No claim channel bound — run `/setup manual claim:#channel` to add one.");
+    }
+    if (!check.ok) lines.push(...check.problems.map((p) => `⚠️ ${p}`));
+
     return interaction.editReply({
-      content: check.ok
-        ? "✅ All channels present. Panels reconciled — any missing message has been reposted."
-        : `⚠️ Reposted panels, but these need attention:\n${check.problems.map((p) => `• ${p}`).join("\n")}`,
+      content:
+        `✅ **Repair complete.** Panels reconciled and permissions re-applied.\n\n` +
+        lines.join("\n"),
     });
   }
 
@@ -287,6 +322,12 @@ async function handleSetup(interaction) {
     const lines = Object.entries(setup.channels)
       .filter(([, id]) => id)
       .map(([k, id]) => `• **${k}** → <#${id}>`);
+    if (setup.honourMarksRoleId) lines.push(`• **Honour Marks role** → <@&${setup.honourMarksRoleId}>`);
+    if (setup.clanMemberRoleId) lines.push(`• **Clan Member role** → <@&${setup.clanMemberRoleId}>`);
+    if (setup.logUserId) lines.push(`• **Log visible to** → <@${setup.logUserId}>`);
+
+    const roleCheck = await checkRoleGranting(guild, setup.honourMarksRoleId);
+    if (!roleCheck.ok) lines.push("", ...roleCheck.problems.map((p) => `⚠️ ${p}`));
     lines.push("", check.ok ? "✅ All channels reachable." : `⚠️ ${check.problems.join(" ")}`);
 
     return interaction.editReply({
@@ -689,6 +730,68 @@ async function handleCreateTeam(interaction, size, tree) {
   });
 }
 
+// ── Role self-service ────────────────────────────────────────────────────────
+async function handleClaimRole(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const setup = await readSetup(interaction.guildId);
+  const roleId = setup?.honourMarksRoleId || config.roles.honourMarks;
+
+  if (!roleId) {
+    return interaction.editReply({
+      content: "The Honour Marks role isn't configured yet. Ask an admin to run `/setup`.",
+    });
+  }
+
+  const check = await checkRoleGranting(interaction.guild, roleId);
+  if (!check.ok) {
+    return interaction.editReply({ content: `I can't assign that role yet:\n${check.problems.map((p) => `• ${p}`).join("\n")}` });
+  }
+
+  if (interaction.member.roles.cache.has(roleId)) {
+    return interaction.editReply({ content: `You already have <@&${roleId}>.` });
+  }
+
+  try {
+    await interaction.member.roles.add(roleId, "Honour Marks self-claim");
+  } catch (e) {
+    return interaction.editReply({ content: `Couldn't add the role: \`${e.message}\`` });
+  }
+
+  return interaction.editReply({
+    content:
+      `🎖️ **Honour Marks unlocked.**\n\n` +
+      `You now have access to <#${setup.channels.quests}> and <#${setup.channels.database}>.\n\n` +
+      `Head to <#${setup.channels.quests}> and press **Start a Solo Quest**. ` +
+      `If you ever want to drop the role, it's still at <#${setup.channels.claim}>.`,
+  });
+}
+
+async function handleDropRole(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const setup = await readSetup(interaction.guildId);
+  const roleId = setup?.honourMarksRoleId || config.roles.honourMarks;
+
+  if (!roleId) {
+    return interaction.editReply({ content: "The Honour Marks role isn't configured yet." });
+  }
+  if (!interaction.member.roles.cache.has(roleId)) {
+    return interaction.editReply({ content: `You don't have <@&${roleId}> right now.` });
+  }
+
+  try {
+    await interaction.member.roles.remove(roleId, "Honour Marks self-drop");
+  } catch (e) {
+    return interaction.editReply({ content: `Couldn't remove the role: \`${e.message}\`` });
+  }
+
+  return interaction.editReply({
+    content:
+      `✅ **Honour Marks role removed.**\n\n` +
+      `Your progress, Honour Marks and quest history are all kept — the role only controls access. ` +
+      `Claim it again any time at <#${setup.channels.claim}>.`,
+  });
+}
+
 async function handleShopOpen(interaction) {
   const bal = await getBalance(interaction.user.id);
   return interaction.reply({
@@ -1043,6 +1146,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "hm_team_start": return await handleTeamStart(interaction);
         case "hm_check": return await handleCheck(interaction);
         case "hm_my_quests": return await handleMyQuests(interaction);
+        case "hm_claim_role": return await handleClaimRole(interaction);
+        case "hm_drop_role": return await handleDropRole(interaction);
         case "hm_shop_open": return await handleShopOpen(interaction);
         case "hm_shop_perks": return await handleShopPerks(interaction);
         case "hm_shop_boosts": return await handleShopBoosts(interaction);
