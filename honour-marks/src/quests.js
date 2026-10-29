@@ -127,29 +127,44 @@ function treeKind(tree) {
 }
 
 /** Builds the target map for one member's solo quest. */
-function buildSoloTargets(tree, questType) {
+// Raid difficulty is deliberately collapsed: normal and hard/expert are the
+// same content for quest purposes.
+const SOLO_RAID_POOL = ["chambers_of_xeric", "theatre_of_blood", "tombs_of_amascut"];
+
+/** Which pool a solo quest in this category/type is drawn from, and how many targets it needs. */
+function soloTargetPool(tree, questType) {
   const kind = treeKind(tree);
   const req = SOLO_REQUIREMENTS[kind][questType];
+  if (!req) return null;
+
+  if (kind === "skill") return { kind, count: req.count || 1, value: req.xp, pool: SKILLS_BY_TREE[tree] || [] };
+  if (kind === "boss") return { kind, count: req.count || 1, value: req.kc, pool: BOSS_POOL };
+  if (kind === "raid") return { kind, count: req.count || 1, value: req.kc, pool: SOLO_RAID_POOL };
+  return { kind, count: req.count || 1, value: req.kc, pool: MINIGAME_BOSSES };
+}
+
+/**
+ * Builds the target map for one member's solo quest.
+ *
+ * `picks` is how a Quest Choice Token hand-picks a target instead of letting
+ * the bot roll one at random: pass the exact skill/boss keys the member chose
+ * (validated against the real pool) and they're used as-is. Anything missing
+ * or invalid is topped up with a random pick from the same pool, so a bad
+ * `picks` value can never produce a quest with no targets at all.
+ */
+function buildSoloTargets(tree, questType, picks = null) {
+  const spec = soloTargetPool(tree, questType);
+  if (!spec) return { skills: {}, bosses: {} };
+  const { kind, count, value, pool } = spec;
   const targets = { skills: {}, bosses: {} };
 
-  if (kind === "skill") {
-    const skills = pickRandom(SKILLS_BY_TREE[tree] || [], req.count);
-    for (const s of skills) targets.skills[s] = req.xp;
-  } else if (kind === "boss") {
-    // Boss requirement carries only `kc` (a daily is one boss, not two), so
-    // the count has to default — passing undefined here silently produced a
-    // quest with no targets at all.
-    const picked = pickRandom(BOSS_POOL, req.count || 1);
-    for (const b of picked) targets.bosses[b] = req.kc;
-  } else if (kind === "raid") {
-    // Raid difficulty is deliberately collapsed: normal and hard/expert are the
-    // same content for quest purposes.
-    const picked = pickRandom(["chambers_of_xeric", "theatre_of_blood", "tombs_of_amascut"], req.count || 1);
-    for (const r of picked) targets.bosses[r] = req.kc;
-  } else {
-    const picked = pickRandom(MINIGAME_BOSSES, req.count || 1);
-    for (const m of picked) targets.bosses[m] = req.kc;
+  let chosen = Array.isArray(picks) ? [...new Set(picks)].filter((p) => pool.includes(p)).slice(0, count) : [];
+  if (chosen.length < count) {
+    chosen = chosen.concat(pickRandom(pool.filter((p) => !chosen.includes(p)), count - chosen.length));
   }
+
+  const bucket = kind === "skill" ? targets.skills : targets.bosses;
+  for (const key of chosen) bucket[key] = value;
   return targets;
 }
 
@@ -278,7 +293,7 @@ async function getActivePartyQuestForUser(userId) {
  * Creates a solo quest. Rejects if the slot is full or the daily/weekly/monthly
  * cap for this reset period is spent.
  */
-async function createSoloQuest({ guildId, member, tree, questType }) {
+async function createSoloQuest({ guildId, member, tree, questType, picks = null }) {
   const supabase = getSupabase();
   if (!supabase) return { error: "Database unavailable." };
   if (!TREE_BY_KEY[tree]) return { error: "Unknown category." };
@@ -303,7 +318,7 @@ async function createSoloQuest({ guildId, member, tree, questType }) {
     };
   }
 
-  const targets = buildSoloTargets(tree, questType);
+  const targets = buildSoloTargets(tree, questType, picks);
   const now = new Date();
   const expires = new Date(now.getTime() + QUEST_DURATION_DAYS[questType] * 86400000);
 
@@ -325,6 +340,29 @@ async function createSoloQuest({ guildId, member, tree, questType }) {
     if (error.code === "23505") return { error: `You already have an active ${questType} quest.` };
     console.error("[Quests] createSoloQuest:", error.message);
     return { error: "Couldn't create that quest. Try again in a moment." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Cancels an active solo quest with no penalty: the row is deleted, nothing is
+ * paid, and — because `bumpCounts` only ever runs on completion, never on
+ * creation — the member's daily/weekly/monthly slot for that quest type is
+ * free again immediately. This is what a Quest Skip Token actually spends.
+ */
+async function cancelSoloQuest(userId, questId) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+
+  const { data: deleted, error } = await supabase
+    .from("hm_quests")
+    .delete()
+    .eq("id", questId)
+    .eq("user_id", userId)
+    .select("id");
+
+  if (error || !deleted || deleted.length === 0) {
+    return { error: "That quest is already gone — maybe it finished or expired first." };
   }
   return { ok: true };
 }
@@ -480,11 +518,11 @@ module.exports = {
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
   SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY_MULT,
   QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD,
-  buildSoloTargets, buildPartyTargets, soloHmReward, partyHmReward,
+  buildSoloTargets, buildPartyTargets, soloTargetPool, soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestForUser,
-  createSoloQuest, createPartyQuest, creditHm, bumpCounts,
+  createSoloQuest, cancelSoloQuest, createPartyQuest, creditHm, bumpCounts,
   awardRankXp,
   diffProgress, fetchHiscores, cleanRsn,
 };

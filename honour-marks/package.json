@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node test/modules.test.js && node test/ledger.test.js && node test/permissions.test.js && node test/commands.test.js && node test/register.test.js"
+    "test": "node test/modules.test.js && node test/ledger.test.js && node test/permissions.test.js && node test/commands.test.js && node test/register.test.js && node test/boost.test.js"
   },
   "engines": {
     "node": ">=22"

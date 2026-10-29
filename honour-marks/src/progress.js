@@ -1,10 +1,10 @@
 "use strict";
 const { getSupabase } = require("./db");
-const { config } = require("./config");
 const { fetchHiscores, diffProgress } = require("./jagex");
 const {
   getMember, getActiveSoloQuests, creditHm, bumpCounts, awardRankXp,
 } = require("./quests");
+const { getBoostMultiplier } = require("./shop");
 
 /**
  * Quest completion and expiry.
@@ -16,6 +16,13 @@ const {
  * Partial credit pays HM proportional to progress when a quest expires, but
  * NOT Rank XP — Rank XP is only for actually finishing the target. That keeps
  * the rank ladder from being farmed by letting quests lapse.
+ *
+ * Boosts (bought and activated in the Shop) multiply the Rank XP a FINISHED
+ * quest pays out — never the HM, never a partial/expired payout. The active
+ * boost for the quest's own tree is read right here, at the moment of
+ * completion, and the boosted number is what actually gets queued and what
+ * gets written onto the completion row, so #hm-database always shows what a
+ * member was actually paid.
  */
 
 function pctOf(targets, baseline, current) {
@@ -67,13 +74,17 @@ async function checkSoloQuests({ guildId, userId, memberRsn }) {
       refId: String(quest.id),
     });
 
+    const boostMultiplier = await getBoostMultiplier(userId, quest.tree);
     const xpResult = await awardRankXp({
       guildId,
       userId,
       rsn: memberRsn,
       eventKey: `quest_solo_${quest.quest_type}`,
-      reason: `${quest.quest_type} ${quest.tree} quest complete`,
+      reason: boostMultiplier > 1
+        ? `${quest.quest_type} ${quest.tree} quest complete (boosted ${boostMultiplier}×)`
+        : `${quest.quest_type} ${quest.tree} quest complete`,
       discriminator: String(quest.id),
+      multiplier: boostMultiplier,
     });
 
     await supabase.from("hm_quest_completions").insert({
@@ -158,6 +169,13 @@ async function completePartyQuest(quest, progress) {
   if (error || !deleted || deleted.length === 0) return { ok: false };
 
   const hm = Number(quest.hm_reward) || 0;
+  // Each member can have a different active boost for this tree, so the
+  // boosted Rank XP is tracked per member in `rank_xp_breakdown`. One row is
+  // written for the whole party AFTER the loop — writing it inside the loop
+  // (as this used to) inserted one full-duplicate completion row per member,
+  // which made #hm-database and every party total count every quest 2-4x.
+  const rankXpBreakdown = {};
+
   for (const uid of quest.members) {
     const member = await getMember(uid);
     await creditHm({
@@ -170,29 +188,37 @@ async function completePartyQuest(quest, progress) {
       refId: String(quest.id),
     });
 
-    await awardRankXp({
+    const boostMultiplier = await getBoostMultiplier(uid, quest.tree);
+    const xpResult = await awardRankXp({
       guildId: quest.guild_id,
       userId: uid,
       rsn: member?.rsn,
       eventKey: `quest_party_${quest.size}`,
-      reason: `${quest.size} ${quest.tree} quest complete`,
+      reason: boostMultiplier > 1
+        ? `${quest.size} ${quest.tree} quest complete (boosted ${boostMultiplier}×)`
+        : `${quest.size} ${quest.tree} quest complete`,
       discriminator: String(quest.id),
+      multiplier: boostMultiplier,
     });
-
-    await supabase.from("hm_party_quest_completions").insert({
-      guild_id: quest.guild_id,
-      quest_id: quest.id,
-      members: quest.members,
-      size: quest.size,
-      tree: quest.tree,
-      difficulty: quest.difficulty,
-      completed: true,
-      hm_awarded: hm,
-      rank_xp_awarded: config.rankXp[`quest_party_${quest.size}`] || 0,
-    });
+    rankXpBreakdown[uid] = xpResult.amount || 0;
 
     await bumpCounts({ guildId: quest.guild_id, userId: uid, size: quest.size });
   }
+
+  const totalRankXp = Object.values(rankXpBreakdown).reduce((sum, v) => sum + v, 0);
+
+  await supabase.from("hm_party_quest_completions").insert({
+    guild_id: quest.guild_id,
+    quest_id: quest.id,
+    members: quest.members,
+    size: quest.size,
+    tree: quest.tree,
+    difficulty: quest.difficulty,
+    completed: true,
+    hm_awarded: hm,
+    rank_xp_awarded: totalRankXp,
+    rank_xp_breakdown: rankXpBreakdown,
+  });
 
   return { ok: true, hm };
 }

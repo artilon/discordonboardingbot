@@ -5,13 +5,22 @@ const { TREES, TREE_BY_KEY } = require("./quests");
 /**
  * Shop, simplified from the original four-track system to three:
  *
- *   Perks      5 tiers per category, permanent, +5% HM each (max +25%)
- *   Boosts     temporary Rank XP multipliers, bought then activated later
+ *   Perks       5 tiers per category, permanent, +5% HM from quests each (max +25%)
+ *   Boosts      temporary QUEST COMPLETION XP multipliers — bought here, sat in
+ *               your Inventory until you activate one, then they multiply the
+ *               Rank XP a FINISHED quest in that category pays out for as long
+ *               as they're running. They do nothing to HM and do nothing to a
+ *               quest that expires instead of finishing.
  *   Consumables Skip token (cancel a quest) and Choice token (pick the target)
  *
  * The old "Items" track (quest reduction / HM bonus / boost length) is gone —
  * it interacted with perks, boosts and quest targets in ways that made the
  * economy hard to reason about, and it was the least-used of the four.
+ *
+ * Boost prices are 3x the original tuning (750 / 2,250 / 7,500) because,
+ * unlike the old display-only version, a boost is now a real, ongoing
+ * multiplier on every quest you finish in that category for its whole
+ * duration — it needed to cost like the advantage it actually gives.
  */
 
 const PERK_TIERS = [
@@ -23,23 +32,35 @@ const PERK_TIERS = [
 ];
 
 const BOOST_TIERS = [
-  { tier: 1, cost: 250,  multiplier: 1.5, weeks: 1 },
-  { tier: 2, cost: 750,  multiplier: 2.0, weeks: 2 },
-  { tier: 3, cost: 2500, multiplier: 2.5, weeks: 1 },
+  { tier: 1, cost: 750,  multiplier: 1.5, weeks: 1 },
+  { tier: 2, cost: 2250, multiplier: 2.0, weeks: 2 },
+  { tier: 3, cost: 7500, multiplier: 2.5, weeks: 1 },
 ];
 
 const CONSUMABLES = {
-  quest_skip_token:   { cost: 4,  label: "Quest Skip Token",   emoji: "🎫", desc: "Cancel an active solo quest with no penalty." },
-  quest_choice_token: { cost: 50, label: "Quest Choice Token", emoji: "🎯", desc: "Hand-pick the target of your next quest." },
+  quest_skip_token: {
+    cost: 4, label: "Quest Skip Token", emoji: "🎫",
+    desc:
+      "Instantly cancels one active SOLO quest. No reward and no penalty — it simply disappears and that " +
+      "daily/weekly/monthly slot is free again right away. Use it on **My Quests**. Doesn't work on team quests.",
+  },
+  quest_choice_token: {
+    cost: 50, label: "Quest Choice Token", emoji: "🎯",
+    desc:
+      "The next time you start a SOLO quest, you'll be offered the choice to hand-pick its exact target " +
+      "(a specific skill or boss) instead of letting the bot roll one at random from that category. " +
+      "Only spent if you actually use it to pick — declining keeps the token for later.",
+  },
 };
 
 function perkBonusPercent(tier) {
   return (Number(tier) || 0) * 5;
 }
 
+/** `1.5×` — the whole multiplier a quest's Rank XP is multiplied BY, not a bonus on top of it. */
 function boostBonusLabel(multiplier) {
-  const bonus = (Number(multiplier) || 1) - 1;
-  return `+${bonus}×`;
+  const mult = Number(multiplier) || 1;
+  return `${mult}×`;
 }
 
 // ── Reads ────────────────────────────────────────────────────────────────────
@@ -89,7 +110,13 @@ async function getActiveBoosts(userId) {
   return data || [];
 }
 
-/** Total Rank XP multiplier a member currently has from activated boosts. */
+/**
+ * The quest-completion XP multiplier a member currently has active for one
+ * category. Read at the moment a quest finishes (see src/progress.js) — this
+ * is the ONLY place a boost has any effect. If someone somehow has more than
+ * one active boost for the same category, the strongest one applies; they
+ * don't stack additively.
+ */
 async function getBoostMultiplier(userId, tree) {
   const boosts = await getActiveBoosts(userId);
   const relevant = boosts.filter((b) => b.tree === "all" || b.tree === tree);
@@ -214,16 +241,10 @@ async function buyBoost({ guildId, userId, tree, tier }) {
   return { ok: true, cost: spec.cost, balance: debit.balance };
 }
 
-async function buyConsumable({ guildId, userId, key }) {
+/** Adds one of a consumable to a member's inventory without charging HM. */
+async function grantConsumable(userId, guildId, key) {
   const supabase = getSupabase();
-  const spec = CONSUMABLES[key];
-  if (!spec) return { error: "Unknown item." };
-
-  const debit = await tryDebit({
-    guildId, userId, amount: spec.cost, kind: "consumable",
-    reason: spec.label, refId: key,
-  });
-  if (!debit.ok) return { error: debit.error };
+  if (!supabase) return false;
 
   const { data: existing } = await supabase
     .from("hm_inventory")
@@ -238,8 +259,22 @@ async function buyConsumable({ guildId, userId, key }) {
     : await supabase.from("hm_inventory").insert({
         user_id: userId, guild_id: guildId, tree: key, boost_tier: 0, quantity: 1,
       });
+  return !error;
+}
 
-  if (error) {
+async function buyConsumable({ guildId, userId, key }) {
+  const spec = CONSUMABLES[key];
+  if (!spec) return { error: "Unknown item." };
+
+  const debit = await tryDebit({
+    guildId, userId, amount: spec.cost, kind: "consumable",
+    reason: spec.label, refId: key,
+  });
+  if (!debit.ok) return { error: debit.error };
+
+  const granted = await grantConsumable(userId, guildId, key);
+  if (!granted) {
+    const supabase = getSupabase();
     await supabase.from("hm_balances").update({ balance: debit.balance + spec.cost }).eq("user_id", userId);
     return { error: "Couldn't save that item. You were refunded." };
   }
@@ -297,6 +332,6 @@ module.exports = {
   PERK_TIERS, BOOST_TIERS, CONSUMABLES,
   perkBonusPercent, boostBonusLabel,
   getBalance, getPerks, getPerkTier, getInventory, getActiveBoosts, getBoostMultiplier,
-  tryDebit, buyPerk, buyBoost, buyConsumable, consumeItem, activateBoost,
+  tryDebit, buyPerk, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
   TREES,
 };

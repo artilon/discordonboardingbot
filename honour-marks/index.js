@@ -21,18 +21,20 @@ const {
   TREES, TREE_BY_KEY, QUEST_TREES,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActivePartyQuestForUser,
-  createSoloQuest, createPartyQuest, creditHm,
+  createSoloQuest, cancelSoloQuest, createPartyQuest, creditHm,
   diffProgress, fetchHiscores, cleanRsn, soloHmReward, partyHmReward,
+  soloTargetPool,
 } = require("./src/quests");
+const { SKILL_LABELS, bossLabel } = require("./src/jagex");
 const { checkSoloQuests, checkPartyQuest, completePartyQuest, sweepExpiredQuests } = require("./src/progress");
 const {
   PERK_TIERS, BOOST_TIERS, CONSUMABLES, perkBonusPercent, boostBonusLabel,
   getBalance, getPerks, getPerkTier, getInventory, getActiveBoosts,
-  buyPerk, buyBoost, buyConsumable, consumeItem, activateBoost,
+  buyPerk, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
 } = require("./src/shop");
 const {
   COLOR, HM_EMOJI,
-  renderClaimPanel,
+  renderClaimPanel, renderGuide,
   renderDatabase, renderQuestBoard, renderShop, syncPanel, emptyPage,
 } = require("./src/panels");
 const {
@@ -124,6 +126,10 @@ async function refreshPanels(guildId) {
     await syncPanel(guildId, claimCh, "claim", renderClaimPanel(setup));
   }
   if (questsCh) {
+    // Guide posts first so a brand-new channel reads top-to-bottom as
+    // "what is this" -> "the board" -> "the shop", the same order a
+    // first-timer should actually look at them in.
+    await syncPanel(guildId, questsCh, "guide", renderGuide(setup));
     await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId));
     await syncPanel(guildId, questsCh, "shop", await renderShop(guildId));
   }
@@ -357,7 +363,7 @@ async function handleHm(interaction) {
       ? perks.map((p) => `• ${TREE_BY_KEY[p.tree]?.emoji || ""} ${TREE_BY_KEY[p.tree]?.label || p.tree} — T${p.tier} (+${perkBonusPercent(p.tier)}%)`).join("\n")
       : "_None yet_";
     const boostLines = boosts.length
-      ? boosts.map((b) => `• ${b.tree} — ${boostBonusLabel(b.multiplier)} until <t:${Math.floor(new Date(b.expires_at).getTime() / 1000)}:R>`).join("\n")
+      ? boosts.map((b) => `• ${TREE_BY_KEY[b.tree]?.label || b.tree} — ${boostBonusLabel(b.multiplier)} quest-completion XP, ends <t:${Math.floor(new Date(b.expires_at).getTime() / 1000)}:R>`).join("\n")
       : "_None active_";
 
     return interaction.editReply({
@@ -370,7 +376,7 @@ async function handleHm(interaction) {
             { name: "Earned total", value: `\`${bal.total_earned.toLocaleString()}\``, inline: true },
             { name: "Spent total", value: `\`${bal.total_spent.toLocaleString()}\``, inline: true },
             { name: "Perks", value: perkLines },
-            { name: "Boosts", value: boostLines }
+            { name: "Active Boosts", value: boostLines }
           ),
       ],
     });
@@ -475,14 +481,92 @@ async function handlePickTree(interaction, questType) {
   });
 }
 
-async function handleCreateSolo(interaction, questType, tree) {
+/** Pretty label for a solo-quest target pool entry (skill or boss key). */
+function targetLabel(kind, key) {
+  if (kind === "skill") return SKILL_LABELS[key] || key;
+  return bossLabel(key);
+}
+
+/**
+ * After a category is picked, a member who owns a Quest Choice Token gets
+ * offered the chance to spend it hand-picking the exact target instead of
+ * letting the bot roll one at random. Nothing changes for anyone who doesn't
+ * own one — they go straight to a random quest, same as before.
+ */
+async function handleTreeChosen(interaction, questType, tree) {
+  const inv = await getInventory(interaction.user.id);
+  const hasChoiceToken = inv.some((i) => i.tree === "quest_choice_token" && i.boost_tier === 0 && i.quantity > 0);
+
+  if (!hasChoiceToken) {
+    return handleCreateSolo(interaction, questType, tree);
+  }
+
+  return interaction.update({
+    embeds: [
+      emptyPage(
+        "🎯 You own a Quest Choice Token",
+        "Spend it to hand-pick this quest's exact target, or skip it and let the bot roll one at random — " +
+        "the token stays in your inventory either way if you skip it."
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`hm_quest_choose:${questType}:${tree}`).setLabel("🎯 Hand-pick (uses token)").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`hm_quest_random:${questType}:${tree}`).setLabel("🎲 Random (keep token)").setStyle(ButtonStyle.Secondary)
+      ),
+    ],
+  });
+}
+
+/** Shows the pool for this category so the member can pick their own target(s). */
+async function handleQuestChoose(interaction, questType, tree) {
+  const spec = soloTargetPool(tree, questType);
+  if (!spec || !spec.pool.length) {
+    return handleCreateSolo(interaction, questType, tree);
+  }
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`hm_pick_target:${questType}:${tree}`)
+    .setPlaceholder(`Pick ${spec.count === 1 ? "your target" : `${spec.count} targets`}…`)
+    .setMinValues(spec.count)
+    .setMaxValues(spec.count)
+    .addOptions(
+      spec.pool.slice(0, 25).map((key) =>
+        new StringSelectMenuOptionBuilder().setLabel(targetLabel(spec.kind, key)).setValue(key)
+      )
+    );
+
+  return interaction.update({
+    embeds: [
+      emptyPage(
+        "🎯 Pick Your Target",
+        spec.pool.length > 25
+          ? `Showing the first 25 of ${spec.pool.length} options.`
+          : `Select exactly ${spec.count}.`
+      ).embed,
+    ],
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function handlePickTarget(interaction, questType, tree, picks) {
   await interaction.deferUpdate();
+  const used = await consumeItem(interaction.user.id, "quest_choice_token");
+  // If the token is somehow already gone (e.g. spent in another tab a moment
+  // ago), fall back to a random target rather than leaving the member with
+  // nothing — the picks they made simply don't get honoured without payment.
+  return handleCreateSolo(interaction, questType, tree, used ? picks : null);
+}
+
+async function handleCreateSolo(interaction, questType, tree, picks = null) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
   const member = await getMember(interaction.user.id);
   const result = await createSoloQuest({
     guildId: interaction.guildId,
     member,
     tree,
     questType,
+    picks,
   });
 
   if (result.error) {
@@ -766,26 +850,38 @@ async function handleShopPerks(interaction) {
     const next = PERK_TIERS[owned];
     options.push(
       new StringSelectMenuOptionBuilder()
-        .setLabel(`${t.label} — T${next.tier} (${next.cost.toLocaleString()} HM)`)
+        .setLabel(`${t.label} — Tier ${next.tier} (${next.cost.toLocaleString()} HM)`)
         .setValue(t.key)
         .setEmoji(t.emoji)
         .setDescription(
           owned > 0
-            ? `Owned T${owned} (+${perkBonusPercent(owned)}%) → +${perkBonusPercent(next.tier)}%`
-            : `+${perkBonusPercent(next.tier)}% HM from ${t.label.toLowerCase()} quests`
+            ? `You have T${owned} (+${perkBonusPercent(owned)}%) → buying this raises it to +${perkBonusPercent(next.tier)}%`
+            : `+${perkBonusPercent(next.tier)}% HM from every ${t.label.toLowerCase()} quest you finish, forever`
         )
     );
   }
 
   if (!options.length) {
     return interaction.reply({
-      embeds: [emptyPage("🎖️ Perks", "You already own every perk at maximum tier.").embed],
+      embeds: [emptyPage("🎖️ Perks", "You already own every perk at maximum tier (+25% in every category).").embed],
       flags: MessageFlags.Ephemeral,
     });
   }
 
   return interaction.reply({
-    embeds: [emptyPage("🎖️ Perks", "Each tier adds +5% Honour Marks from quests in that category. Tiers must be bought in order.").embed],
+    embeds: [
+      emptyPage(
+        "🎖️ Perks — what these actually do",
+        `A Perk is a **permanent** upgrade for one quest category. It never expires, is never used up, and can't ` +
+        `be sold back — once you own it, every quest you finish in that category simply pays more ${HM_EMOJI} HM ` +
+        `from then on.\n\n` +
+        `Each category has **5 tiers** you buy in order (you can't skip ahead): +5% at T1, up to +25% at T5. ` +
+        `Perks only affect ${HM_EMOJI} HM — they have no effect on Rank XP, and a perk in one category (say, ` +
+        `Combat) does nothing for quests in any other category.\n\n` +
+        `Prices: T1 1,750 • T2 10,062 • T3 24,150 • T4 48,300 • T5 100,625 ${HM_EMOJI}. Pick a category below to buy ` +
+        `its next tier.`
+      ).embed,
+    ],
     components: [
       new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
@@ -831,7 +927,7 @@ async function handleShopBoosts(interaction) {
       options.push(
         new StringSelectMenuOptionBuilder()
           .setLabel(`${t.label} — T${spec.tier} (${spec.cost.toLocaleString()} HM)`)
-          .setDescription(`${boostBonusLabel(spec.multiplier)} Rank XP for ${spec.weeks} week${spec.weeks === 1 ? "" : "s"}`)
+          .setDescription(`${boostBonusLabel(spec.multiplier)} quest-completion XP in ${t.label}, ${spec.weeks} week${spec.weeks === 1 ? "" : "s"}`)
           .setValue(`${t.key}:${spec.tier}`)
           .setEmoji(t.emoji)
       );
@@ -841,10 +937,18 @@ async function handleShopBoosts(interaction) {
   return interaction.reply({
     embeds: [
       emptyPage(
-        "⚡ Boosts",
+        "⚡ Boosts — what these actually do",
         `You hold **${bal.balance.toLocaleString()}** ${HM_EMOJI}.\n\n` +
-        "Boosts are bought here and **activated from your Inventory** whenever you're ready — " +
-        "so you can buy ahead of a busy week."
+        `A Boost is a **temporary multiplier on quest-completion Rank XP** — nothing else. It does **not** touch ` +
+        `${HM_EMOJI} HM, and it does **nothing** for a quest that expires instead of finishing. It only applies ` +
+        `to quests in the one category you buy it for.\n\n` +
+        `Buying one doesn't start the clock — it goes into your **Inventory** first. Open Inventory and activate ` +
+        `it whenever you actually want it running, so you can buy ahead of a busy week without wasting time on it. ` +
+        `Once active, every quest you FINISH in that category while it's running pays Rank XP multiplied by the ` +
+        `number shown (e.g. a normal 250 Rank XP quest under a 2.0× boost pays 500). If you somehow have two active ` +
+        `boosts for the same category, only the stronger one applies — they don't add together.\n\n` +
+        `**T1** — 750 HM — 1.5× for 1 week\n**T2** — 2,250 HM — 2.0× for 2 weeks\n**T3** — 7,500 HM — 2.5× for 1 week\n\n` +
+        `Pick one below to buy it.`
       ).embed,
     ],
     components: [
@@ -889,7 +993,7 @@ async function handleShopConsumables(interaction) {
   const options = Object.entries(CONSUMABLES).map(([key, spec]) =>
     new StringSelectMenuOptionBuilder()
       .setLabel(`${spec.label} (${spec.cost} HM)`)
-      .setDescription(spec.desc)
+      .setDescription(spec.desc.slice(0, 100))
       .setValue(key)
       .setEmoji(spec.emoji)
   );
@@ -897,9 +1001,11 @@ async function handleShopConsumables(interaction) {
   return interaction.reply({
     embeds: [
       emptyPage(
-        "🎫 Consumables",
+        "🎫 Consumables — what these actually do",
         `You hold **${bal.balance.toLocaleString()}** ${HM_EMOJI}.\n\n` +
-        Object.values(CONSUMABLES).map((c) => `${c.emoji} **${c.label}** — ${c.cost} HM\n_${c.desc}_`).join("\n\n")
+        `Consumables are **one-time use**: buying one just adds it to your **Inventory**, and it's spent the ` +
+        `moment you actually use it — buying it doesn't do anything by itself.\n\n` +
+        Object.values(CONSUMABLES).map((c) => `${c.emoji} **${c.label}** — ${c.cost} ${HM_EMOJI}\n_${c.desc}_`).join("\n\n")
       ).embed,
     ],
     components: [
@@ -932,6 +1038,15 @@ async function handleBuyConsumable(interaction, key) {
   });
 }
 
+async function handleGuideOpen(interaction) {
+  const setup = await readSetup(interaction.guildId);
+  const pages = renderGuide(setup || {});
+  return interaction.reply({
+    embeds: pages.map((p) => p.embed),
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
 async function handleLfgOpen(interaction) {
   // Honest placeholder rather than a dead button: the board needs a join/leave
   // flow that isn't built yet, and a button that silently fails is worse than
@@ -957,14 +1072,14 @@ async function handleInventory(interaction) {
 
   const boostLines = inv.filter((i) => i.boost_tier > 0).map((i) => {
     const spec = BOOST_TIERS.find((t) => t.tier === i.boost_tier);
-    return `• ${TREE_BY_KEY[i.tree]?.label || i.tree} — T${i.boost_tier} (${boostBonusLabel(spec?.multiplier)}) ×${i.quantity}`;
+    return `• ${TREE_BY_KEY[i.tree]?.label || i.tree} — T${i.boost_tier}, ${boostBonusLabel(spec?.multiplier)} quest-completion XP for ${spec?.weeks || "?"} week(s) — not active yet ×${i.quantity}`;
   });
   const consumableLines = inv.filter((i) => i.boost_tier === 0).map((i) => {
     const spec = CONSUMABLES[i.tree];
     return `• ${spec?.emoji || "🎫"} ${spec?.label || i.tree} ×${i.quantity}`;
   });
   const activeLines = boosts.map(
-    (b) => `• ${b.tree} — ${boostBonusLabel(b.multiplier)} until <t:${Math.floor(new Date(b.expires_at).getTime() / 1000)}:R>`
+    (b) => `• ${TREE_BY_KEY[b.tree]?.label || b.tree} — ${boostBonusLabel(b.multiplier)} quest-completion XP, ends <t:${Math.floor(new Date(b.expires_at).getTime() / 1000)}:R>`
   );
   const perkLines = perks.map(
     (p) => `• ${TREE_BY_KEY[p.tree]?.label || p.tree} — T${p.tier} (+${perkBonusPercent(p.tier)}%)`
@@ -1066,7 +1181,44 @@ async function handleMyQuests(interaction) {
     }
   }
 
-  return interaction.editReply({ embeds: embeds.slice(0, 10) });
+  const components = [];
+  const inv = await getInventory(interaction.user.id);
+  const skipTokens = inv.find((i) => i.tree === "quest_skip_token" && i.boost_tier === 0)?.quantity || 0;
+  if (skipTokens > 0 && solo.length) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        solo.slice(0, 5).map((q) =>
+          new ButtonBuilder()
+            .setCustomId(`hm_cancel_quest:${q.id}`)
+            .setLabel(`❌ Cancel ${q.quest_type}`)
+            .setStyle(ButtonStyle.Danger)
+        )
+      )
+    );
+  }
+
+  return interaction.editReply({ embeds: embeds.slice(0, 10), components });
+}
+
+async function handleCancelQuest(interaction, questId) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const used = await consumeItem(interaction.user.id, "quest_skip_token");
+  if (!used) {
+    return interaction.editReply({ content: "You don't have a Quest Skip Token. Buy one in the Shop under Consumables." });
+  }
+
+  const result = await cancelSoloQuest(interaction.user.id, questId);
+  if (result.error) {
+    // The quest it would have cancelled is already gone (finished or expired
+    // a moment earlier) — refund the token since it was never actually used.
+    await grantConsumable(interaction.user.id, interaction.guildId, "quest_skip_token");
+    return interaction.editReply({ content: result.error });
+  }
+
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    content: "✅ Quest cancelled — no penalty, no reward, and that slot is free again. Press **My Quests** to start a new one.",
+  });
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
@@ -1082,6 +1234,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      const btnId = interaction.customId;
+      if (btnId.startsWith("hm_quest_choose:")) {
+        const [, questType, tree] = btnId.split(":");
+        return await handleQuestChoose(interaction, questType, tree);
+      }
+      if (btnId.startsWith("hm_quest_random:")) {
+        const [, questType, tree] = btnId.split(":");
+        return await handleCreateSolo(interaction, questType, tree);
+      }
+      if (btnId.startsWith("hm_cancel_quest:")) {
+        const questId = btnId.split(":")[1];
+        return await handleCancelQuest(interaction, questId);
+      }
+
       switch (interaction.customId) {
         case "hm_quest_start": return await handleQuestStart(interaction);
         case "hm_team_start": return await handleTeamStart(interaction);
@@ -1095,6 +1261,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "hm_shop_consumables": return await handleShopConsumables(interaction);
         case "hm_lfg_open": return await handleLfgOpen(interaction);
         case "hm_inventory": return await handleInventory(interaction);
+        case "hm_guide_open": return await handleGuideOpen(interaction);
         case "hm_db_page": // disabled label button; never fires, kept so a
                            // stray click can never leave an unacked interaction
         case "hm_db_refresh": {
@@ -1114,7 +1281,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (id.startsWith("hm_pick_tree:")) {
         const questType = id.split(":")[1];
-        return await handleCreateSolo(interaction, questType, interaction.values[0]);
+        return await handleTreeChosen(interaction, questType, interaction.values[0]);
+      }
+      if (id.startsWith("hm_pick_target:")) {
+        const [, questType, tree] = id.split(":");
+        return await handlePickTarget(interaction, questType, tree, interaction.values);
       }
       if (id === "hm_buy_perk") {
         return await handleBuyPerk(interaction, interaction.values[0]);

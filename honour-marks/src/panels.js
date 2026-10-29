@@ -14,7 +14,7 @@ const COLOR = {
   bad: 0xe74c3c,
 };
 
-const HM_EMOJI = "🪙";
+const HM_EMOJI = "<:hm:1565236821330493512>";
 
 /**
  * THE EMBED LIMIT, SOLVED
@@ -73,7 +73,8 @@ function buildPanelComponents(panelKey, pageIndex, pageCount) {
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("hm_shop_open").setLabel("🛒 Shop & Inventory").setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId("hm_lfg_open").setLabel("🔍 Looking For Group").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("hm_my_quests").setLabel("📜 My Quests").setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId("hm_my_quests").setLabel("📜 My Quests").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("hm_guide_open").setLabel("📖 How This Works").setStyle(ButtonStyle.Secondary)
       )
     );
   }
@@ -259,24 +260,36 @@ function renderClaimPanel(setup = {}) {
 }
 
 // ── Shop ─────────────────────────────────────────────────────────────────────
+/**
+ * The public shop panel is an overview, not the full catalogue — Discord's
+ * embed limit and DESC_BUDGET don't leave room for a full explanation of
+ * every tier of every perk here. The buttons below open an ephemeral reply
+ * (see handleShopPerks/Boosts/Consumables in index.js) with the complete,
+ * first-timer-friendly breakdown of every single purchase, its cost, exactly
+ * what it does and doesn't do, and whether it stacks.
+ */
 async function renderShop(guildId) {
-  const perkLines = TREES.map((t) => `${t.emoji} **${t.label}** — +5% HM per tier, 5 tiers`);
+  const perkLines = TREES.map((t) => `${t.emoji} **${t.label}** — 5 tiers, +5% HM each (max +25%)`);
   const boostLines = [
-    "T1 — +0.5× Rank XP, 1 week",
-    "T2 — +1× Rank XP, 2 weeks",
-    "T3 — +1.5× Rank XP, 1 week",
+    "T1 — 750 HM — ×1.5 quest completion XP for 1 week",
+    "T2 — 2,250 HM — ×2.0 quest completion XP for 2 weeks",
+    "T3 — 7,500 HM — ×2.5 quest completion XP for 1 week",
   ];
 
   const embed = new EmbedBuilder()
     .setColor(COLOR.gold)
     .setTitle("🛒 Honour Marks Shop")
     .setDescription(
-      `Spend ${HM_EMOJI} **Honour Marks** on permanent upgrades and temporary boosts.\n\n` +
-      `**🎖️ Perks** — permanent, +5% HM from quests in that category per tier (max +25%)\n` +
+      `New here? Press **📖 How This Works** on the quest board first — it explains what ${HM_EMOJI} Honour Marks ` +
+      `even are. This panel is just the price list; press a button below for the full explanation of each item.\n\n` +
+      `**🎖️ Perks — permanent** — once bought, a perk never expires or gets used up. ` +
+      `Each tier adds +5% more ${HM_EMOJI} HM from every quest you finish in that one category (stacks up to +25% at tier 5).\n` +
       `${perkLines.join("\n")}\n\n` +
-      `**⚡ Boosts** — temporary **Rank XP** multipliers, bought here and activated from your Inventory when you're ready\n` +
+      `**⚡ Boosts — temporary, Quest Completion XP only** — a boost does nothing to HM. ` +
+      `While one is running, every quest you FINISH (not one that times out) in that category pays extra **Rank XP** — ` +
+      `the XP that counts toward your actual clan rank. Buy it here, then open **Inventory** to switch it on whenever you want the clock to start.\n` +
       `${boostLines.join("\n")}\n\n` +
-      `**🎫 Consumables**\n` +
+      `**🎫 Consumables — one-time use, spent the moment you use them**\n` +
       `🎫 **Quest Skip Token** (4 ${HM_EMOJI}) — cancel an active solo quest, no penalty\n` +
       `🎯 **Quest Choice Token** (50 ${HM_EMOJI}) — hand-pick your next quest's target`
     )
@@ -291,6 +304,102 @@ async function renderShop(guildId) {
   );
 
   return [{ embed, components: [row] }];
+}
+
+// ── Guide ────────────────────────────────────────────────────────────────────
+/**
+ * The explainer post. Written for someone who has never seen this bot before
+ * and has no idea what Honour Marks are. A pure function of `setup` (channel
+ * IDs only) so it can be synced as a normal panel AND reused verbatim for the
+ * "📖 How This Works" button's ephemeral reply.
+ */
+function renderGuide(setup = {}) {
+  const claimCh = setup.channels?.claim ? `<#${setup.channels.claim}>` : "**the role channel**";
+  const questsCh = setup.channels?.quests ? `<#${setup.channels.quests}>` : "**the quest board**";
+  const dbCh = setup.channels?.database ? `<#${setup.channels.database}>` : "**the database channel**";
+
+  const page1 = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("📖 What Is Honour Marks?")
+    .setDescription(
+      `**Honour Marks** is this clan's quest and reward system. You complete OSRS goals (skill XP, boss kills, ` +
+      `raids, minigames), and every time you finish one you get paid in two completely separate currencies ` +
+      `at the same time:\n\n` +
+      `${HM_EMOJI} **Honour Marks (HM)** — a spendable currency. It does nothing by itself except sit in your ` +
+      `balance until you spend it in the **Shop** on permanent upgrades or temporary boosts. It is **not** part of ` +
+      `your clan rank.\n\n` +
+      `🏅 **Rank XP** — a small amount of progress toward your actual clan rank (the one Heimdall, the other bot, ` +
+      `shows on the member list). This runs **side by side** with the XP you earn just from being a clan member over ` +
+      `time (tenure XP) — the two are added together for your rank, but neither one affects how the other is earned.\n\n` +
+      `Nothing here is required. It's an optional side-game for people who want extra rewards for playing — your ` +
+      `clan rank still climbs on its own from tenure alone even if you never touch a quest.`
+    )
+    .setFooter({ text: "Odinheim • Honour Marks — Page 1/4: The Basics" });
+
+  const page2 = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("🚀 Your First 10 Minutes")
+    .setDescription(
+      `**1. Claim the role.** Go to ${claimCh} and press **Claim Role**. This unlocks ${questsCh} (the quest ` +
+      `board and shop) and ${dbCh} (everyone's stats). You can press **Drop Role** there any time to hide those ` +
+      `channels again — nothing you've earned is lost.\n\n` +
+      `**2. Link your RuneScape account.** Run \`/register <your RSN>\` anywhere in the server. This is required — ` +
+      `your Discord nickname is NOT used for tracking, because nicknames can be changed, denied, or shared. ` +
+      `\`/register\` checks your name against the real OSRS hiscores before saving it, so make sure it's spelled ` +
+      `exactly right and your profile isn't set to private.\n\n` +
+      `**3. Start a quest.** Open ${questsCh} and press **📋 Start a Solo Quest**. Pick Daily, Weekly or Monthly, ` +
+      `then a category. The bot reads your hiscores right now as your starting point ("baseline") — only progress ` +
+      `made *after* this moment counts.\n\n` +
+      `**4. Go play.** There's nothing else to click. Just play OSRS normally.\n\n` +
+      `**5. Come back and press ✅ Check Quests & Collect.** This is the one manual step — the bot doesn't watch you ` +
+      `live, it checks your hiscores only when you press this button. If you've hit the target, you get paid ` +
+      `${HM_EMOJI} HM and Rank XP right then.`
+    )
+    .setFooter({ text: "Odinheim • Honour Marks — Page 2/4: Getting Started" });
+
+  const page3 = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("📜 How Quests Actually Work")
+    .setDescription(
+      `**Solo quests** — you can hold one Daily, one Weekly and one Monthly at the same time, each in whatever ` +
+      `category you pick (Gathering, Production, Combat, Utility, Boss PvM, Raids, Minigames). A Daily must be ` +
+      `finished within 1 day, a Weekly within 7 days, a Monthly within 30 days.\n\n` +
+      `**Team quests (duo/trio/quad)** — press **👥 Start a Team Quest** and bring 1-3 others. The whole group ` +
+      `shares one target and everyone's progress adds together, so it finishes faster with more people pulling ` +
+      `their weight. A team quest runs for 14 days. Every member must already be registered with \`/register\`.\n\n` +
+      `**What happens if time runs out?** The quest is cancelled automatically — there's no penalty beyond that. ` +
+      `You still get paid ${HM_EMOJI} HM for the percentage of the target you actually reached (e.g. 40% done = ` +
+      `40% of the HM reward), but you get **zero Rank XP** for an unfinished quest. Rank XP only pays out for a ` +
+      `quest you actually finish in time.\n\n` +
+      `**Checking progress doesn't cost you anything** — press ✅ **Check Quests & Collect** as often as you like ` +
+      `to see your live percentage; it only pays out once a target is actually met.`
+    )
+    .setFooter({ text: "Odinheim • Honour Marks — Page 3/4: Quests" });
+
+  const page4 = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("🛒 Where Your HM Goes")
+    .setDescription(
+      `Every quest also pays ${HM_EMOJI} Honour Marks — that's the currency you spend in the **Shop**, reachable ` +
+      `from the 🛒 **Shop & Inventory** button. Three kinds of things to buy, and the Shop panel explains every ` +
+      `single tier of each one in detail when you open it:\n\n` +
+      `**🎖️ Perks** — permanent. Each one you buy makes future quests in that category pay more HM, forever.\n\n` +
+      `**⚡ Boosts** — temporary. While active, they multiply the **Rank XP** a finished quest in that category ` +
+      `pays — not the HM. Buy one, then switch it on from **Inventory** whenever you're ready to start the clock.\n\n` +
+      `**🎫 Consumables** — one-time-use items like the Quest Skip Token and Quest Choice Token.\n\n` +
+      `Check your balance, perks and active boosts any time with \`/hm balance\`, or see the whole clan's standing ` +
+      `in ${dbCh}.\n\n` +
+      `_This post is kept up to date automatically — if anything about the system ever changes, this guide changes ` +
+      `with it._`
+    )
+    .setFooter({ text: "Odinheim • Honour Marks — Page 4/4: The Shop" });
+
+  return [
+    { embed: page1, components: [] },
+    { embed: page2, components: [] },
+    { embed: page3, components: [] },
+    { embed: page4, components: [] },
+  ];
 }
 
 function emptyPage(title, description) {
@@ -387,7 +496,7 @@ async function syncPanel(guildId, channel, panelKey, pages) {
 module.exports = {
   COLOR, HM_EMOJI, DESC_BUDGET,
   chunkLines, buildPanelComponents,
-  renderClaimPanel,
+  renderClaimPanel, renderGuide,
   renderDatabase, renderQuestBoard, renderShop, emptyPage,
   getPanelLedger, syncPanel,
   getRankForXp, formatRankProgress,
