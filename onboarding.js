@@ -537,6 +537,70 @@ function formatMultiplier(mult) {
   return mult === null || mult === undefined ? "n/a" : `${mult}x`;
 }
 
+// ── Rank progress display ────────────────────────────────────────────────────
+// The member list deliberately does NOT print a rank multiplier.
+//
+// Rank is now the sum of two independent XP streams: `tenure_xp` (replayed from
+// the join date, and the only stream that ever applies a multiplier) and
+// `bonus_xp` (flat Honour Marks quest XP, never multiplied). Because both feed
+// the displayed rank, a member CAN rank up above their tenure tier — but their
+// tenure awards still use the tenure-tier multiplier. Printing "Ruby (3x)" next
+// to a member who is actually earning 2.5x on their weekly was a lie the embed
+// could never fix.
+//
+// So we drop the multiplier from the member line entirely and show distance to
+// the next rank instead. That is both accurate and the thing that actually
+// motivates: a 100 XP quest visibly moves the bar.
+const RANK_PROGRESS_SEGMENTS = 10;
+
+function buildRankProgressBar(xp, nextTier) {
+  const currentTier = getRankForXp(xp);
+  if (!nextTier) return "▰".repeat(RANK_PROGRESS_SEGMENTS);
+
+  const span = nextTier.xpNeeded - currentTier.xpNeeded;
+  const into = Math.max(0, (Number(xp) || 0) - currentTier.xpNeeded);
+  const ratio = span > 0 ? Math.min(1, into / span) : 1;
+  const filled = Math.min(
+    RANK_PROGRESS_SEGMENTS,
+    Math.max(0, Math.round(ratio * RANK_PROGRESS_SEGMENTS))
+  );
+  return "▰".repeat(filled) + "▱".repeat(RANK_PROGRESS_SEGMENTS - filled);
+}
+
+/** e.g. `▰▰▰▱▱▱▱▱▱▱ 26% → Onyx (39,950 XP)` */
+function formatRankProgress(xp, nextTierOverride = null) {
+  const numericXp = Number(xp) || 0;
+  const tier = getRankForXp(numericXp);
+  const next = nextTierOverride || getNextRankTier(tier.name);
+
+  if (!next) {
+    return "▰▰▰▰▰▰▰▰▰▰ **Max rank reached**";
+  }
+
+  const span = next.xpNeeded - tier.xpNeeded;
+  const into = Math.max(0, numericXp - tier.xpNeeded);
+  const pct = span > 0 ? Math.min(100, Math.floor((into / span) * 100)) : 100;
+  const remaining = Math.max(0, next.xpNeeded - numericXp);
+
+  return `${buildRankProgressBar(numericXp, next)} ${pct}% → ${formatRankName(next.name)} (${remaining.toLocaleString()} XP)`;
+}
+
+/** Tenure-stream XP for a member row (safe to call before the split is applied). */
+function getTenureRankXp(member = {}) {
+  const tenureXp = Number(member.tenure_xp);
+  const bonusXp = Number(member.bonus_xp) || 0;
+  // Legacy rows (and rows written before the split) have no tenure_xp yet —
+  // fall back to the stored total so nothing reads as 0 during/after migration.
+  return Number.isFinite(tenureXp) && tenureXp > 0
+    ? tenureXp
+    : Math.max(0, (Number(member.xp) || 0) - bonusXp);
+}
+
+/** Total XP is the ONLY place the two streams meet: tenure + bonus. */
+function getTotalRankXp(member = {}) {
+  return getTenureRankXp(member) + (Number(member.bonus_xp) || 0);
+}
+
 function formatTenureDuration(days) {
   const d = Math.max(0, Math.floor(Number(days) || 0));
   const years = Math.floor(d / 365);
@@ -546,7 +610,10 @@ function formatTenureDuration(days) {
   if (years > 0) parts.push(`${years}y`);
   if (months > 0) parts.push(`${months}m`);
   if (remDays > 0 || parts.length === 0) parts.push(`${remDays}d`);
-  return `${parts.join(" ")} (${d}d)`;
+  const short = parts.join(" ");
+  const total = `${d}d`;
+  // Avoid "17d (17d)" for anything under a month — the two halves matched.
+  return short === total ? total : `${short} (${total})`;
 }
 
 /**
@@ -2242,7 +2309,7 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     .filter((m) => m.active !== false)
     .slice()
     .sort((a, b) => {
-      const xpDiff = (Number(b.xp) || 0) - (Number(a.xp) || 0);
+      const xpDiff = getTotalRankXp(b) - getTotalRankXp(a);
       if (xpDiff !== 0) return xpDiff;
       return String(a.rsn || "").localeCompare(String(b.rsn || ""));
     });
@@ -2259,17 +2326,18 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
 
   const headerDesc =
     "** Clan Rank Progression & Member Standings**\n" +
-    `Weekly: \`+${WEEKLY_BASE_XP.toLocaleString()} XP × Multiplier\` • ` +
-    `Monthly: \`+${MONTHLY_BASE_XP.toLocaleString()} XP\` • ` +
-    `Yearly: \`+${YEARLY_BASE_XP.toLocaleString()} XP\`\n\n` +
+    `**Tenure XP:** Weekly \`+${WEEKLY_BASE_XP.toLocaleString()} XP × tenure rank multiplier\` • ` +
+    `Monthly \`+${MONTHLY_BASE_XP.toLocaleString()}\` • Yearly \`+${YEARLY_BASE_XP.toLocaleString()}\`\n` +
+    `**Honour Marks quests:** flat XP, never multiplied\n` +
+    `**Rank** = Tenure XP + Quest XP\n\n` +
     `**Rank Tiers:**\n${buildRankTableSummary()}\n\n` +
     `**Active Clan Members:** \`${activeMembers.length}\` • **Last Synced:** <t:${nowUnix}:R>`;
 
   const lines = activeMembers.map((m, idx) => {
-    const xp = Number(m.xp) || 0;
+    // Rank is driven by the COMBINED total (tenure + flat quest XP)...
+    const xp = getTotalRankXp(m);
     const eligibleTier = getRankForXp(xp);
     const confirmedRank = m.confirmed_rank || "Bronze";
-    const multStr = formatMultiplier(eligibleTier.multiplier);
     const joined = parseJoinedDate(m.joined_date);
     const days = joined && asOfParsed ? Math.max(0, Math.floor((asOfParsed.utcMs - joined.utcMs) / MS_PER_DAY)) : 0;
     const joinedStr = joined ? joined.iso : "Unknown";
@@ -2278,9 +2346,23 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
         ? ` *(⏳ Rank-up to ${formatRankName(eligibleTier.name)} pending)*`
         : "";
 
+    // ...but the multiplier is earned from the tenure stream alone, so we never
+    // print it here — see formatRankProgress for why. Progress toward the next
+    // rank replaces it.
+    const progress = formatRankProgress(xp);
+
+    // Only show the tenure/quest split when quest XP actually exists, so the
+    // line stays short for members who have never turned in a quest.
+    const bonusXp = Number(m.bonus_xp) || 0;
+    const tenureXp = Math.max(0, xp - bonusXp);
+    const split =
+      bonusXp > 0
+        ? `Tenure \`${tenureXp.toLocaleString()}\` + Quests \`${bonusXp.toLocaleString()}\` • `
+        : "";
+
     return (
-      `**${idx + 1}. ${m.rsn}** — ${formatRankName(confirmedRank)} (${multStr}) • \`${xp.toLocaleString()} XP\`\n` +
-      `┗ Joined: \`${joinedStr}\` (${formatTenureDuration(days)})${pendingTag}`
+      `**${idx + 1}. ${m.rsn}** — ${formatRankName(confirmedRank)} • \`${xp.toLocaleString()} XP\`\n` +
+      `┗ Joined \`${joinedStr}\` • ${formatTenureDuration(days)} • ${split}${progress}${pendingTag}`
     );
   });
 
@@ -2447,6 +2529,9 @@ function buildRankUpAlertStep1(member, targetRankName) {
   const currentRank = member.confirmed_rank || "Bronze";
   const targetTier = RANK_TIERS.find((t) => t.name === targetRankName) || getRankForXp(xp);
   const nextTier = getNextRankTier(targetTier.name);
+  const tenureXp = getTenureRankXp(member);
+  const bonusXp = Math.max(0, Number(member.bonus_xp) || 0);
+  const tenureTier = getRankForXp(tenureXp);
   const joined = parseJoinedDate(member.joined_date);
   const days = joined ? Math.max(0, Math.floor((Date.now() - joined.utcMs) / MS_PER_DAY)) : 0;
 
@@ -2460,8 +2545,18 @@ function buildRankUpAlertStep1(member, targetRankName) {
     .addFields(
       { name: "Member (RSN)", value: `\`${member.rsn}\``, inline: true },
       { name: "Previous Rank", value: `${formatRankName(currentRank)}`, inline: true },
-      { name: "New Rank", value: `${formatRankName(targetTier.name)} (${formatMultiplier(targetTier.multiplier)})`, inline: true },
-      { name: "Total Rank XP", value: `\`${xp.toLocaleString()} XP\``, inline: true },
+      // No multiplier here: rank comes from combined XP, but the multiplier is
+      // earned from tenure alone. Showing the new tier's multiplier would
+      // advertise a rate this member doesn't actually get. The tenure tier's
+      // multiplier is shown separately below, where it's true.
+      { name: "New Rank", value: `${formatRankName(targetTier.name)}`, inline: true },
+      {
+        name: "Total Rank XP",
+        value: `\`${xp.toLocaleString()} XP\`` +
+          (bonusXp > 0 ? `\nTenure \`${tenureXp.toLocaleString()}\` + Quests \`${bonusXp.toLocaleString()}\`` : ""),
+        inline: true,
+      },
+      { name: "Tenure Multiplier", value: `${formatRankName(tenureTier.name)} → ${formatMultiplier(tenureTier.multiplier)}`, inline: true },
       { name: "Next Rank Goal", value: nextTier ? `${formatRankName(nextTier.name)} (\`${nextTier.xpNeeded.toLocaleString()} XP\`)` : "Max Rank Reached", inline: true },
       { name: "Time in Clan", value: `${formatTenureDuration(days)} (Joined \`${joined ? joined.iso : member.joined_date}\`)`, inline: true }
     )
@@ -2929,6 +3024,144 @@ async function ensureStaffAlertMessage(supabase, member, alertType, payload) {
 
 let rankSyncInFlight = false;
 let lastRankSyncFinishedAt = 0;
+
+// ── Honour Marks quest XP intake ─────────────────────────────────────────────
+// The HM bot never writes `clan_members` directly. It appends to
+// `pending_rank_xp`, and Heimdall is the only writer of the ladder. That keeps
+// the tenure stream (replayed from the join date) and the quest stream (flat,
+// additive) fully independent: neither reads the other, they only meet when
+// `xp` is summed for display and rank.
+//
+// Consumption is claim-first: the conditional update on `consumed_at is null`
+// is what stops a double credit when the 30-minute timer and a Realtime nudge
+// overlap. Claim, THEN credit — never the reverse.
+const PENDING_RANK_XP_BATCH = 200;
+
+async function claimPendingRow(supabase, id) {
+  const { data } = await supabase
+    .from("pending_rank_xp")
+    .update({ consumed_at: new Date().toISOString(), consumed_by: "heimdall" })
+    .eq("id", id)
+    .is("consumed_at", null)
+    .select("id");
+  return Array.isArray(data) && data.length > 0;
+}
+
+async function deferPendingRow(supabase, row) {
+  // The RSN isn't on the roster yet (roster upload lag, or a typo). Push the
+  // row to the back of the queue rather than letting it clog the batch head.
+  try {
+    await supabase
+      .from("pending_rank_xp")
+      .update({
+        attempts: (Number(row.attempts) || 0) + 1,
+        last_attempt_at: new Date().toISOString(),
+      })
+      .eq("id", row.id);
+  } catch { /* non-fatal */ }
+}
+
+/** Resolves a queue row to a roster key (lowercased RSN). */
+async function resolvePendingRsn(supabase, row, byRsn) {
+  const own = row.rsn ? String(row.rsn).trim().toLowerCase() : null;
+  if (own && byRsn.has(own)) return own;
+
+  if (row.user_id) {
+    // Mimir keeps the Discord id -> RSN mapping in hm_members, same database.
+    try {
+      const { data } = await supabase
+        .from("hm_members")
+        .select("rsn")
+        .eq("user_id", String(row.user_id))
+        .maybeSingle();
+      const mapped = data?.rsn ? String(data.rsn).trim().toLowerCase() : null;
+      if (mapped && byRsn.has(mapped)) return mapped;
+    } catch { /* hm_members may not exist yet — fall through */ }
+  }
+  return null;
+}
+
+/**
+ * Drains unconsumed `pending_rank_xp` rows into each member's `bonus_xp`.
+ * Mutates the passed member objects in place, so the caller's loop sees the
+ * credited amount. Returns a small summary for logging.
+ */
+async function consumePendingRankXp(supabase, members = []) {
+  const summary = { rows: 0, credited: 0, deferred: 0 };
+  if (!Array.isArray(members) || members.length === 0) return summary;
+
+  const byRsn = new Map();
+  for (const m of members) {
+    if (m && m.rsn) byRsn.set(String(m.rsn).trim().toLowerCase(), m);
+  }
+  if (byRsn.size === 0) return summary;
+
+  let pending = [];
+  try {
+    const { data, error } = await supabase
+      .from("pending_rank_xp")
+      .select("*")
+      .is("consumed_at", null)
+      // Rows that keep failing to resolve sink to the back so a single bad
+      // entry can't starve the queue head forever.
+      .order("attempts", { ascending: true })
+      .order("created_at", { ascending: true })
+      .limit(PENDING_RANK_XP_BATCH);
+    if (error) {
+      console.error("[RankSync] Could not read pending_rank_xp:", error.message);
+      return summary;
+    }
+    pending = data || [];
+  } catch (e) {
+    console.error("[RankSync] pending_rank_xp read failed:", e.message);
+    return summary;
+  }
+
+  for (const row of pending) {
+    summary.rows += 1;
+    const key = await resolvePendingRsn(supabase, row, byRsn);
+    const member = key ? byRsn.get(key) : null;
+    if (!member) {
+      summary.deferred += 1;
+      await deferPendingRow(supabase, row);
+      continue;
+    }
+
+    const amount = Math.round(Number(row.amount) || 0);
+    if (amount <= 0) {
+      await claimPendingRow(supabase, row.id); // nothing to credit; don't retry
+      continue;
+    }
+
+    if (!(await claimPendingRow(supabase, row.id))) continue; // lost the race — skip
+
+    member.bonus_xp = (Number(member.bonus_xp) || 0) + amount;
+    summary.credited += amount;
+
+    try {
+      await supabase.from("hm_audit_log").insert({
+        guild_id: row.guild_id || null,
+        kind: "rank_xp_credited",
+        subject_id: row.user_id || null,
+        amount,
+        detail: {
+          rsn: member.rsn,
+          event_key: row.event_key || null,
+          reason: row.reason || null,
+          source: "pending_rank_xp",
+        },
+      });
+    } catch { /* audit is best-effort */ }
+  }
+
+  if (summary.rows > 0) {
+    console.log(
+      `[RankSync] Quest XP: ${summary.rows} row(s), ${summary.credited.toLocaleString()} XP credited, ${summary.deferred} deferred.`
+    );
+  }
+  return summary;
+}
+
 async function syncClanRanks(asOfDate = new Date()) {
   if (rankSyncInFlight) return;
   const supabase = getSupabase();
@@ -2948,6 +3181,10 @@ async function syncClanRanks(asOfDate = new Date()) {
       return;
     }
 
+    // Pull any Honour Marks quest XP before we compute ranks, so a member who
+    // just completed a quest ranks up in this same pass instead of the next one.
+    await consumePendingRankXp(supabase, members);
+
     for (const member of members) {
       if (member.active !== false) {
         const parsedJoin = parseJoinedDate(member.joined_date);
@@ -2959,22 +3196,34 @@ async function syncClanRanks(asOfDate = new Date()) {
         }
 
         // Active clan member: calculate tenure & award any new weekly/monthly/yearly milestones
+        //
+        // The tenure replay only ever sees the tenure stream — `calc.xp` is
+        // tenure XP alone. Quest XP is `bonus_xp`, added on afterwards. The two
+        // meet in exactly one place: the total written to `xp`.
         const calc = calculateTenureProgression(effectiveJoinedDate, asOfDate, member);
-        const xpChanged = calc.xp !== (Number(member.xp) || 0);
-        const rankChanged = calc.eligibleRank.name !== member.eligible_rank;
+        const tenureXp = calc.xp;
+        const bonusXp = Math.max(0, Number(member.bonus_xp) || 0);
+        const totalXp = tenureXp + bonusXp;
+        const combinedRank = getRankForXp(totalXp);
+
+        const xpChanged = totalXp !== (Number(member.xp) || 0);
+        const tenureChanged = tenureXp !== (Number(member.tenure_xp) || 0);
+        const rankChanged = combinedRank.name !== member.eligible_rank;
         const countersChanged =
           calc.weeksAwarded !== (Number(member.weeks_awarded) || 0) ||
           calc.monthsAwarded !== (Number(member.months_awarded) || 0) ||
           calc.yearsAwarded !== (Number(member.years_awarded) || 0);
 
-        if (xpChanged || rankChanged || countersChanged || dateClamped) {
+        if (xpChanged || tenureChanged || rankChanged || countersChanged || dateClamped) {
           const nowIso = new Date().toISOString();
           await supabase
             .from("clan_members")
             .update({
               joined_date: effectiveJoinedDate,
-              xp: calc.xp,
-              eligible_rank: calc.eligibleRank.name,
+              tenure_xp: tenureXp,
+              bonus_xp: bonusXp,
+              xp: totalXp,
+              eligible_rank: combinedRank.name,
               weeks_awarded: calc.weeksAwarded,
               months_awarded: calc.monthsAwarded,
               years_awarded: calc.yearsAwarded,
@@ -2982,14 +3231,16 @@ async function syncClanRanks(asOfDate = new Date()) {
             })
             .eq("id", member.id);
 
-          member.xp = calc.xp;
-          member.eligible_rank = calc.eligibleRank.name;
+          member.tenure_xp = tenureXp;
+          member.bonus_xp = bonusXp;
+          member.xp = totalXp;
+          member.eligible_rank = combinedRank.name;
           member.weeks_awarded = calc.weeksAwarded;
           member.months_awarded = calc.monthsAwarded;
           member.years_awarded = calc.yearsAwarded;
 
           if (calc.newEvents.length > 0) {
-            await logXpAwardToDiscord(member.rsn, calc.newEvents, calc.xp, calc.eligibleRank.name);
+            await logXpAwardToDiscord(member.rsn, calc.newEvents, totalXp, combinedRank.name);
           }
         }
 
@@ -3046,6 +3297,13 @@ function startRankingSyncLoop() {
       .on("postgres_changes", { event: "*", schema: "public", table: "roster_upload" }, () => {
         if (rankSyncInFlight) return;
         syncClanRanks().catch((e) => console.error("[RankSync] Roster upload sync error:", e.message));
+      })
+      // The HM bot appends quest XP here. Reacting to inserts means the member
+      // list reflects a quest completion in seconds instead of waiting up to
+      // 30 minutes for the next scheduled sync.
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "pending_rank_xp" }, () => {
+        if (rankSyncInFlight || Date.now() - lastRankSyncFinishedAt < 5000) return;
+        syncClanRanks().catch((e) => console.error("[RankSync] Quest XP sync error:", e.message));
       })
       .subscribe();
   } catch (err) {
@@ -4086,6 +4344,11 @@ module.exports = {
   getRankEmoji,
   formatRankName,
   getNextRankTier,
+  getTotalRankXp,
+  getTenureRankXp,
+  buildRankProgressBar,
+  formatRankProgress,
+  consumePendingRankXp,
   calculateTenureProgression,
   buildGrowthSeries,
   filterAndDownsampleGrowth,

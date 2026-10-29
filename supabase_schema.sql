@@ -46,6 +46,24 @@ before insert or update on public.clan_members
 for each row
 execute function public.clamp_clan_creation_date();
 
+-- 1b. SPLIT THE XP STREAMS
+--     `xp` is the DISPLAYED / RANK total.
+--     `tenure_xp`  = replayed from the join date by Heimdall. The only stream
+--                    that applies a multiplier. Safe to recompute any time.
+--     `bonus_xp`   = flat Honour Marks quest XP, additive only, never recomputed.
+--     The streams never read each other; they are summed only into `xp`.
+alter table public.clan_members add column if not exists tenure_xp integer not null default 0;
+alter table public.clan_members add column if not exists bonus_xp  integer not null default 0;
+
+-- One-time backfill for rows created before the split: everything they have is
+-- tenure, nothing is quest XP.
+update public.clan_members
+   set tenure_xp = xp,
+       bonus_xp  = 0
+ where tenure_xp = 0
+   and bonus_xp  = 0
+   and xp        > 0;
+
 -- 2. Staging table for easy CSV uploads from in-game clan list exports
 create table if not exists public.roster_upload (
   id bigserial primary key,
@@ -71,6 +89,40 @@ create table if not exists public.xp_rank_logs (
 
 create index if not exists idx_xp_rank_logs_rsn on public.xp_rank_logs (rsn);
 create index if not exists idx_xp_rank_logs_created_at on public.xp_rank_logs (created_at desc);
+
+-- 3b. RANK XP QUEUE — the one seam between Heimdall and the Honour Marks bot.
+--     The HM bot INSERTs here; it never touches clan_members. Heimdall is the
+--     sole writer of the ladder, so a quest award can't be silently overwritten
+--     by the tenure replay.
+--
+--     `idempotency_key` makes a retried insert a no-op.
+--     `consumed_at` + the conditional claim in Heimdall prevent double credits
+--     when the 30-minute timer and a Realtime nudge overlap.
+--     `attempts` lets an unresolvable row (RSN not on the roster yet) sink to
+--     the back of the queue instead of blocking it forever.
+create table if not exists public.pending_rank_xp (
+  id              bigserial primary key,
+  guild_id        text,
+  user_id         text,
+  rsn             text,
+  amount          integer not null check (amount > 0),
+  reason          text,
+  event_key       text,
+  idempotency_key text unique,
+  attempts        integer not null default 0,
+  last_attempt_at timestamptz,
+  created_at      timestamptz not null default now(),
+  consumed_at     timestamptz,
+  consumed_by     text
+);
+
+create index if not exists idx_pending_rank_xp_open
+  on public.pending_rank_xp (attempts asc, created_at asc)
+  where consumed_at is null;
+
+create index if not exists idx_pending_rank_xp_rsn
+  on public.pending_rank_xp (lower(rsn))
+  where consumed_at is null;
 
 -- 4. Dated Clan Growth History table (tracks member count & net change over time)
 create table if not exists public.clan_growth_history (
@@ -107,6 +159,7 @@ alter table public.roster_upload disable row level security;
 alter table public.xp_rank_logs disable row level security;
 alter table public.clan_growth_history disable row level security;
 alter table public.weekly_events disable row level security;
+alter table public.pending_rank_xp disable row level security;
 
 -- 5. Enable Realtime on clan_members, roster_upload, and clan_growth_history
 do $$
@@ -130,6 +183,15 @@ begin
     where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'clan_growth_history'
   ) then
     alter publication supabase_realtime add table public.clan_growth_history;
+  end if;
+
+  -- Lets Heimdall react to a quest award in seconds instead of waiting for the
+  -- next 30-minute sync.
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'pending_rank_xp'
+  ) then
+    alter publication supabase_realtime add table public.pending_rank_xp;
   end if;
 exception
   when others then
