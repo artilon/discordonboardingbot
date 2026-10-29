@@ -48,6 +48,7 @@ const client = new Client({
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 const { commands } = require("./src/commands");
+const { syncCommands } = require("./src/register");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 async function isStaff(interaction) {
@@ -1159,13 +1160,22 @@ client.once(Events.ClientReady, async () => {
 
   const rest = new REST({ version: "10" }).setToken(config.token);
   try {
-    if (config.devGuildId) {
-      await rest.put(Routes.applicationGuildCommands(config.clientId, config.devGuildId), { body: commands });
-      console.log(`[Honour Marks] Commands registered to guild ${config.devGuildId}.`);
-    } else {
-      await rest.put(Routes.applicationCommands(config.clientId), { body: commands });
-      console.log("[Honour Marks] Commands registered globally (can take up to an hour to appear).");
-    }
+    // Writes the wanted scope, then empties the other one. Without the second
+    // half, a server that has held both a global and a guild registration keeps
+    // both and the picker shows every subcommand twice.
+    await syncCommands({
+      rest,
+      routes: {
+        global: () => Routes.applicationCommands(config.clientId),
+        guild: (guildId) => Routes.applicationGuildCommands(config.clientId, guildId),
+      },
+      clientId: config.clientId,
+      commands,
+      devGuildId: config.devGuildId,
+      guildIds: [...client.guilds.cache.keys()],
+      log: (msg) => console.log(`[Honour Marks] ${msg}`),
+      warn: (msg) => console.warn(`[Honour Marks] ${msg}`),
+    });
   } catch (e) {
     console.error("[Honour Marks] Command registration failed:", e.message);
   }
