@@ -160,9 +160,10 @@ async function renderDatabase(guildId) {
 }
 
 // ── Quest board ──────────────────────────────────────────────────────────────
-async function renderQuestBoard(guildId) {
+async function renderQuestBoard(guildId, setup = {}) {
   const supabase = getSupabase();
   if (!supabase) return [emptyPage("📜 Quest Board", "Database unavailable.")];
+  const shopCh = setup.channels?.shop ? `<#${setup.channels.shop}>` : "the Shop";
 
   const { data: activeQuests } = await supabase
     .from("hm_quests")
@@ -208,7 +209,7 @@ async function renderQuestBoard(guildId) {
     .setColor(COLOR.main)
     .setTitle("📜 Quest Board")
     .setDescription(
-      `Earn ${HM_EMOJI} **Honour Marks** by completing tasks, then spend them in the Shop.\n` +
+      `Earn ${HM_EMOJI} **Honour Marks** by completing tasks, then spend them in ${shopCh}.\n` +
       `Every completed quest also awards a small amount of **Rank XP**.\n\n` +
       lines.join("\n").slice(0, DESC_BUDGET)
     )
@@ -230,16 +231,22 @@ async function renderQuestBoard(guildId) {
  */
 function renderClaimPanel(setup = {}) {
   const roleMention = setup.honourMarksRoleId ? `<@&${setup.honourMarksRoleId}>` : "**Honour Marks**";
+  const unlocked = [
+    setup.channels?.guide ? `<#${setup.channels.guide}>` : null,
+    setup.channels?.quests ? `<#${setup.channels.quests}>` : null,
+    setup.channels?.shop ? `<#${setup.channels.shop}>` : null,
+    setup.channels?.database ? `<#${setup.channels.database}>` : null,
+  ].filter(Boolean).join(", ");
 
   const embed = new EmbedBuilder()
     .setColor(COLOR.gold)
     .setTitle("🎖️ Honour Marks Role")
     .setDescription(
-      `Claim the ${roleMention} role to unlock the quest board and shop, or drop it any time.\n\n` +
-      `**Claim Role** — unlocks <#${setup.channels?.quests || "0"}> and <#${setup.channels?.database || "0"}> ` +
-      `so you can start earning Honour Marks from quests.\n\n` +
+      `Claim the ${roleMention} role to unlock the guide, quest board, shop and database, or drop it any time.\n\n` +
+      `**Claim Role** — unlocks ${unlocked || "the Honour Marks channels"} so you can start earning Honour Marks ` +
+      `from quests.\n\n` +
       `**Drop Role** — removes the role again. You can come back here and claim it whenever you like.\n\n` +
-      `_These channels are read-only. Everything you do happens through buttons on the quest board._`
+      `_These channels are read-only. Everything you do happens through buttons on their panels._`
     )
     .setFooter({ text: "Odinheim • Honour Marks" });
 
@@ -316,6 +323,7 @@ async function renderShop(guildId) {
 function renderGuide(setup = {}) {
   const claimCh = setup.channels?.claim ? `<#${setup.channels.claim}>` : "**the role channel**";
   const questsCh = setup.channels?.quests ? `<#${setup.channels.quests}>` : "**the quest board**";
+  const shopCh = setup.channels?.shop ? `<#${setup.channels.shop}>` : "**the shop**";
   const dbCh = setup.channels?.database ? `<#${setup.channels.database}>` : "**the database channel**";
 
   const page1 = new EmbedBuilder()
@@ -341,8 +349,8 @@ function renderGuide(setup = {}) {
     .setTitle("🚀 Your First 10 Minutes")
     .setDescription(
       `**1. Claim the role.** Go to ${claimCh} and press **Claim Role**. This unlocks ${questsCh} (the quest ` +
-      `board and shop) and ${dbCh} (everyone's stats). You can press **Drop Role** there any time to hide those ` +
-      `channels again — nothing you've earned is lost.\n\n` +
+      `board), ${shopCh} and ${dbCh} (everyone's stats). You can press **Drop Role** there any time to hide ` +
+      `those channels again — nothing you've earned is lost.\n\n` +
       `**2. Link your RuneScape account.** Run \`/register <your RSN>\` anywhere in the server. This is required — ` +
       `your Discord nickname is NOT used for tracking, because nicknames can be changed, denied, or shared. ` +
       `\`/register\` checks your name against the real OSRS hiscores before saving it, so make sure it's spelled ` +
@@ -380,9 +388,9 @@ function renderGuide(setup = {}) {
     .setColor(COLOR.gold)
     .setTitle("🛒 Where Your HM Goes")
     .setDescription(
-      `Every quest also pays ${HM_EMOJI} Honour Marks — that's the currency you spend in the **Shop**, reachable ` +
-      `from the 🛒 **Shop & Inventory** button. Three kinds of things to buy, and the Shop panel explains every ` +
-      `single tier of each one in detail when you open it:\n\n` +
+      `Every quest also pays ${HM_EMOJI} Honour Marks — that's the currency you spend in ${shopCh}, also reachable ` +
+      `any time from the 🛒 **Shop & Inventory** button on the quest board. Three kinds of things to buy, and the ` +
+      `Shop panel explains every single tier of each one in detail when you open it:\n\n` +
       `**🎖️ Perks** — permanent. Each one you buy makes future quests in that category pay more HM, forever.\n\n` +
       `**⚡ Boosts** — temporary. While active, they multiply the **Rank XP** a finished quest in that category ` +
       `pays — not the HM. Buy one, then switch it on from **Inventory** whenever you're ready to start the clock.\n\n` +
@@ -450,7 +458,18 @@ async function syncPanel(guildId, channel, panelKey, pages) {
         edited += 1;
         continue;
       }
-      // Message was deleted by someone. Repost at the same index.
+      // Not found in this channel. Either someone deleted it, OR this panel
+      // was just reassigned to a different channel (e.g. splitting the guide
+      // or shop out of the quests channel) — in which case the old copy is
+      // still sitting, untouched, in whatever channel the ledger remembers.
+      // Clean that one up so a channel reorganization doesn't leave stale
+      // duplicate panels behind.
+      if (row.channel_id && row.channel_id !== channel.id) {
+        const oldChannel = await channel.client.channels.fetch(row.channel_id).catch(() => null);
+        const oldMsg = oldChannel?.isTextBased?.() ? await oldChannel.messages.fetch(row.message_id).catch(() => null) : null;
+        if (oldMsg) await oldMsg.delete().catch(() => {});
+      }
+      // Repost at the same index, in the (possibly new) channel.
       const reposted = await channel.send({ embeds: [embed], components }).catch(() => null);
       if (reposted) {
         await supabase.from("hm_panels").update({

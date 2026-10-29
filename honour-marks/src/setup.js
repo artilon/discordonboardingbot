@@ -141,6 +141,7 @@ async function bindGuild(guildId, {
     clanMemberRoleId: clanMemberRoleId || config.roles.clanMember || null,
     channels: {
       claim: channels.claim || config.channels.claim || null,
+      guide: channels.guide || config.channels.guide || null,
       quests: channels.quests || config.channels.quests || null,
       shop: channels.shop || config.channels.shop || null,
       database: channels.database || config.channels.database || null,

@@ -40,6 +40,7 @@ const config = {
   // Optional pre-existing channels. Blank => /setup creates them.
   channels: {
     claim: envStr("HM_CLAIM_CHANNEL_ID"),
+    guide: envStr("HM_GUIDE_CHANNEL_ID"),
     quests: envStr("HM_QUESTS_CHANNEL_ID"),
     shop: envStr("HM_SHOP_CHANNEL_ID"),
     database: envStr("HM_DATABASE_CHANNEL_ID"),

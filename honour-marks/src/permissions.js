@@ -41,14 +41,26 @@ const BOT_PERMS = [
 const CHANNEL_SPECS = [
   {
     key: "claim",
-    name: "get-honour-marks",
-    topic: "Claim or drop the Honour Marks role to unlock the quest board and shop",
+    name: "hm-role",
+    topic: "Claim or drop the Honour Marks role to unlock the guide, quest board and shop",
     audience: "clanMember",
   },
   {
+    key: "guide",
+    name: "hm-guide",
+    topic: "Start here — how Honour Marks works, read only",
+    audience: "honourMarks",
+  },
+  {
     key: "quests",
-    name: "honour-marks",
-    topic: "Quest board and shop — read only",
+    name: "hm-quests",
+    topic: "Quest board — read only",
+    audience: "honourMarks",
+  },
+  {
+    key: "shop",
+    name: "hm-shop",
+    topic: "Spend your Honour Marks — read only",
     audience: "honourMarks",
   },
   {
