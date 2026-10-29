@@ -1,2 +1,5 @@
 node_modules/
 .env
+*.log
+honour-marks/.env
+honour-marks/node_modules/

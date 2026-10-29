@@ -1,0 +1,1161 @@
+"use strict";
+/**
+ * ODINHEIM — HONOUR MARKS
+ * Quests, shop, and the HM database channel.
+ *
+ * Shares a Supabase project with Heimdall. This bot owns HM; Heimdall owns the
+ * rank ladder. Rank XP leaves here only as inserts into `pending_rank_xp`.
+ */
+
+const {
+  Client, GatewayIntentBits, Events, REST, Routes,
+  SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  StringSelectMenuBuilder, StringSelectMenuOptionBuilder, UserSelectMenuBuilder,
+  MessageFlags, PermissionFlagsBits,
+} = require("discord.js");
+
+const { config, assertConfig } = require("./src/config");
+const { getSupabase } = require("./src/db");
+const { getRankForXp, formatRankProgress } = require("./src/ranks");
+const {
+  TREES, TREE_BY_KEY, QUEST_TREES,
+  getMember, getMemberByRsn, getCounts,
+  getActiveSoloQuests, getActivePartyQuestForUser,
+  createSoloQuest, createPartyQuest, creditHm,
+  diffProgress, fetchHiscores, cleanRsn, soloHmReward, partyHmReward,
+} = require("./src/quests");
+const { checkSoloQuests, checkPartyQuest, completePartyQuest, sweepExpiredQuests } = require("./src/progress");
+const {
+  PERK_TIERS, BOOST_TIERS, CONSUMABLES, perkBonusPercent, boostBonusLabel,
+  getBalance, getPerks, getPerkTier, getInventory, getActiveBoosts,
+  buyPerk, buyBoost, buyConsumable, consumeItem, activateBoost,
+} = require("./src/shop");
+const {
+  COLOR, HM_EMOJI,
+  renderDatabase, renderQuestBoard, renderShop, syncPanel, emptyPage,
+} = require("./src/panels");
+const {
+  readSetup, bindGuild, createStructure, verifyBindings, seedDefaults,
+} = require("./src/setup");
+
+assertConfig();
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+});
+
+// ── Commands ─────────────────────────────────────────────────────────────────
+const commands = [
+  new SlashCommandBuilder()
+    .setName("setup")
+    .setDescription("Set up Honour Marks (staff)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand((s) =>
+      s.setName("auto").setDescription("Create the Honour Marks category and channels automatically")
+    )
+    .addSubcommand((s) =>
+      s
+        .setName("manual")
+        .setDescription("Bind Honour Marks to channels you already have")
+        .addChannelOption((o) => o.setName("quests").setDescription("Quest board + shop channel").setRequired(true))
+        .addChannelOption((o) => o.setName("database").setDescription("Database channel").setRequired(true))
+        .addChannelOption((o) => o.setName("staff").setDescription("Staff channel (optional)"))
+        .addChannelOption((o) => o.setName("log").setDescription("Audit log channel (optional)"))
+        .addRoleOption((o) => o.setName("staff_role").setDescription("Role allowed to adjust HM"))
+    )
+    .addSubcommand((s) => s.setName("repair").setDescription("Reconcile channels and repost any missing panels"))
+    .addSubcommand((s) => s.setName("status").setDescription("Show the current Honour Marks setup")),
+
+  new SlashCommandBuilder()
+    .setName("register")
+    .setDescription("Link your RuneScape name to your Discord account")
+    .addStringOption((o) =>
+      o.setName("rsn").setDescription("Your exact in-game name").setRequired(true)
+    )
+    .addUserOption((o) =>
+      o.setName("member").setDescription("Register someone else (staff only)").setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("hm")
+    .setDescription("Honour Marks admin")
+    .addSubcommand((s) =>
+      s
+        .setName("give")
+        .setDescription("Award HM to a member (staff)")
+        .addUserOption((o) => o.setName("member").setDescription("Member").setRequired(true))
+        .addIntegerOption((o) => o.setName("amount").setDescription("Amount").setRequired(true).setMinValue(1))
+        .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(false))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName("take")
+        .setDescription("Remove HM from a member (staff)")
+        .addUserOption((o) => o.setName("member").setDescription("Member").setRequired(true))
+        .addIntegerOption((o) => o.setName("amount").setDescription("Amount").setRequired(true).setMinValue(1))
+        .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(false))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName("balance")
+        .setDescription("Show a member's HM")
+        .addUserOption((o) => o.setName("member").setDescription("Member").setRequired(false))
+    )
+    .addSubcommand((s) =>
+      s.setName("refresh").setDescription("Force-refresh all Honour Marks panels")
+    ),
+].map((c) => c.toJSON());
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+async function isStaff(interaction) {
+  const setup = await readSetup(interaction.guildId);
+  if (!setup?.staffRoleId) {
+    // No staff role configured — fall back to Discord permissions so a fresh
+    // install isn't unusable before /setup finishes.
+    return interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild) ?? false;
+  }
+  return interaction.member?.roles?.cache?.has(setup.staffRoleId) || false;
+}
+
+function formatPart(part) {
+  if (part.kind === "skill") {
+    return `${part.label}: \`${part.gained.toLocaleString()} / ${part.needed.toLocaleString()}\` XP`;
+  }
+  return `${part.label}: \`${part.gained.toLocaleString()} / ${part.needed.toLocaleString()}\` KC`;
+}
+
+function questProgressEmbed(quest, progress) {
+  const isSkill = Object.keys(quest.targets?.skills || {}).length > 0;
+  const lines = progress.parts.map((p) => `• ${formatPart(p)} — **${Math.floor(p.pct)}%**`);
+
+  return new EmbedBuilder()
+    .setColor(progress.totalPct >= 100 ? COLOR.ok : COLOR.main)
+    .setTitle(`${quest.quest_type.toUpperCase()} • ${quest.tree}`)
+    .setDescription(
+      `**Progress: ${progress.totalPct}%**\n\n${lines.join("\n")}\n\n` +
+      `Ends <t:${Math.floor(new Date(quest.expires_at).getTime() / 1000)}:R>`
+    )
+    .setFooter({ text: isSkill ? "Skill XP gained since the quest started" : "Kills gained since the quest started" });
+}
+
+// ── Panel refresh ────────────────────────────────────────────────────────────
+let refreshTimer = null;
+const pendingRefresh = new Set();
+
+/** Coalesced refresh: many mutations in a burst become one render pass. */
+function scheduleRefresh(guildId) {
+  pendingRefresh.add(guildId);
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(async () => {
+    const guilds = [...pendingRefresh];
+    pendingRefresh.clear();
+    refreshTimer = null;
+    for (const id of guilds) {
+      try {
+        await refreshPanels(id);
+      } catch (e) {
+        console.error("[Panels] refresh failed:", e.message);
+      }
+    }
+  }, config.panelRefreshDebounceMs);
+}
+
+async function refreshPanels(guildId) {
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) return;
+  const setup = await readSetup(guildId);
+  if (!setup) return;
+
+  const questsCh = setup.channels.quests
+    ? await guild.channels.fetch(setup.channels.quests).catch(() => null)
+    : null;
+  const dbCh = setup.channels.database
+    ? await guild.channels.fetch(setup.channels.database).catch(() => null)
+    : null;
+
+  if (questsCh) {
+    await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId));
+    await syncPanel(guildId, questsCh, "shop", await renderShop(guildId));
+  }
+  if (dbCh) {
+    await syncPanel(guildId, dbCh, "database", await renderDatabase(guildId));
+  }
+}
+
+// ── Interaction: slash commands ──────────────────────────────────────────────
+async function handleSetup(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const guild = interaction.guild;
+
+  if (sub === "auto") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const me = await guild.members.fetchMe();
+    if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return interaction.editReply({
+        content: "I need the **Manage Channels** permission to create the Honour Marks category.",
+      });
+    }
+
+    try {
+      const created = await createStructure(guild);
+      const setup = await bindGuild(guild.id, {
+        mode: "auto",
+        categoryId: created.categoryId,
+        channels: {
+          quests: created.quests,
+          database: created.database,
+          staff: created.staff,
+          log: created.log,
+          shop: created.quests, // shop panel lives in the quests channel
+        },
+      });
+      await seedDefaults(guild.id);
+      await refreshPanels(guild.id);
+
+      return interaction.editReply({
+        content:
+          `✅ **Honour Marks is set up.**\n\n` +
+          `• <#${setup.channels.quests}> — quest board and shop\n` +
+          `• <#${setup.channels.database}> — member database\n` +
+          `• <#${setup.channels.staff}> — staff channel\n` +
+          `• <#${setup.channels.log}> — audit log\n\n` +
+          `Members can now run \`/register\` to link their RuneScape name.`,
+      });
+    } catch (e) {
+      console.error("[Setup] auto failed:", e);
+      return interaction.editReply({
+        content: `Setup failed: \`${e.message}\`\n\nCheck that I have **Manage Channels**.`,
+      });
+    }
+  }
+
+  if (sub === "manual") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const quests = interaction.options.getChannel("quests");
+    const database = interaction.options.getChannel("database");
+    const staff = interaction.options.getChannel("staff");
+    const log = interaction.options.getChannel("log");
+    const staffRole = interaction.options.getRole("staff_role");
+
+    const setup = await bindGuild(guild.id, {
+      mode: "manual",
+      staffRoleId: staffRole?.id || null,
+      channels: {
+        quests: quests.id,
+        shop: quests.id,
+        database: database.id,
+        staff: staff?.id || null,
+        log: log?.id || null,
+      },
+    });
+    await seedDefaults(guild.id);
+    await refreshPanels(guild.id);
+
+    return interaction.editReply({
+      content:
+        `✅ **Honour Marks bound to your channels.**\n\n` +
+        `• Quests + shop → <#${setup.channels.quests}>\n` +
+        `• Database → <#${setup.channels.database}>\n` +
+        (setup.channels.staff ? `• Staff → <#${setup.channels.staff}>\n` : "") +
+        (setup.channels.log ? `• Log → <#${setup.channels.log}>\n` : ""),
+    });
+  }
+
+  if (sub === "repair") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const setup = await readSetup(guild.id);
+    if (!setup) return interaction.editReply({ content: "Nothing to repair — run `/setup auto` first." });
+
+    const check = await verifyBindings(guild, setup);
+    await refreshPanels(guild.id);
+
+    return interaction.editReply({
+      content: check.ok
+        ? "✅ All channels present. Panels reconciled — any missing message has been reposted."
+        : `⚠️ Reposted panels, but these need attention:\n${check.problems.map((p) => `• ${p}`).join("\n")}`,
+    });
+  }
+
+  if (sub === "status") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const setup = await readSetup(guild.id);
+    if (!setup) return interaction.editReply({ content: "Honour Marks is not set up yet. Run `/setup auto`." });
+
+    const check = await verifyBindings(guild, setup);
+    const lines = Object.entries(setup.channels)
+      .filter(([, id]) => id)
+      .map(([k, id]) => `• **${k}** → <#${id}>`);
+    lines.push("", check.ok ? "✅ All channels reachable." : `⚠️ ${check.problems.join(" ")}`);
+
+    return interaction.editReply({
+      content: `**Honour Marks setup** (${setup.mode})\n\n${lines.join("\n")}`,
+    });
+  }
+}
+
+async function handleRegister(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const target = interaction.options.getUser("member") || interaction.user;
+  const rsn = cleanRsn(interaction.options.getString("rsn", true));
+
+  if (target.id !== interaction.user.id && !(await isStaff(interaction))) {
+    return interaction.editReply({ content: "Only staff can register another member." });
+  }
+  if (rsn.length < 1 || rsn.length > 12) {
+    return interaction.editReply({ content: "That doesn't look like a RuneScape name (1–12 characters)." });
+  }
+
+  const existingName = await getMemberByRsn(interaction.guildId, rsn);
+  if (existingName && existingName.user_id !== target.id) {
+    return interaction.editReply({ content: `**${rsn}** is already registered to <@${existingName.user_id}>.` });
+  }
+
+  // Verify the name resolves before accepting it, so nobody ends up with a
+  // dead registration they can't quest with.
+  await interaction.editReply({ content: `Checking **${rsn}** on the hiscores…` });
+  const snap = await fetchHiscores(rsn);
+  if (!snap) {
+    return interaction.editReply({
+      content:
+        `Couldn't find **${rsn}** on the OSRS hiscores.\n\n` +
+        `• Check the spelling and capitalisation\n` +
+        `• Make sure your profile isn't private\n` +
+        `• New accounts don't appear until they have some XP`,
+    });
+  }
+
+  const supabase = getSupabase();
+  const { error } = await supabase.from("hm_members").upsert(
+    {
+      user_id: target.id,
+      guild_id: interaction.guildId,
+      rsn,
+      display_name: target.username,
+      active: true,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "user_id" }
+  );
+  if (error) return interaction.editReply({ content: `Couldn't save that: \`${error.message}\`` });
+
+  await supabase.from("hm_balances").upsert(
+    { user_id: target.id, guild_id: interaction.guildId },
+    { onConflict: "user_id" }
+  );
+
+  scheduleRefresh(interaction.guildId);
+
+  return interaction.editReply({
+    content:
+      `✅ Linked **${rsn}** to ${target.id === interaction.user.id ? "your account" : `<@${target.id}>`}.\n\n` +
+      `Open the quest board and press **Start a Solo Quest** to earn your first Honour Marks.`,
+  });
+}
+
+async function handleHm(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const target = interaction.options.getUser("member");
+
+  if (sub === "balance") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const user = target || interaction.user;
+    const member = await getMember(user.id);
+    const bal = await getBalance(user.id);
+    const perks = await getPerks(user.id);
+    const boosts = await getActiveBoosts(user.id);
+
+    if (!member?.rsn) {
+      return interaction.editReply({ content: `<@${user.id}> hasn't registered yet.` });
+    }
+
+    const perkLines = perks.length
+      ? perks.map((p) => `• ${TREE_BY_KEY[p.tree]?.emoji || ""} ${TREE_BY_KEY[p.tree]?.label || p.tree} — T${p.tier} (+${perkBonusPercent(p.tier)}%)`).join("\n")
+      : "_None yet_";
+    const boostLines = boosts.length
+      ? boosts.map((b) => `• ${b.tree} — ${boostBonusLabel(b.multiplier)} until <t:${Math.floor(new Date(b.expires_at).getTime() / 1000)}:R>`).join("\n")
+      : "_None active_";
+
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.main)
+          .setTitle(`${HM_EMOJI} ${member.rsn}`)
+          .addFields(
+            { name: "Held", value: `\`${bal.balance.toLocaleString()}\``, inline: true },
+            { name: "Earned total", value: `\`${bal.total_earned.toLocaleString()}\``, inline: true },
+            { name: "Spent total", value: `\`${bal.total_spent.toLocaleString()}\``, inline: true },
+            { name: "Perks", value: perkLines },
+            { name: "Boosts", value: boostLines }
+          ),
+      ],
+    });
+  }
+
+  if (!(await isStaff(interaction))) {
+    return interaction.reply({ content: "Staff only.", flags: MessageFlags.Ephemeral });
+  }
+
+  if (sub === "give" || sub === "take") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const amount = interaction.options.getInteger("amount", true);
+    const reason = interaction.options.getString("reason") || "Staff adjustment";
+    const member = await getMember(target.id);
+
+    if (!member?.rsn) {
+      return interaction.editReply({ content: `<@${target.id}> hasn't registered a RuneScape name.` });
+    }
+
+    const supabase = getSupabase();
+    if (sub === "give") {
+      await creditHm({ guildId: interaction.guildId, userId: target.id, amount, kind: "staff_grant", reason });
+    } else {
+      const bal = await getBalance(target.id);
+      const next = Math.max(0, bal.balance - amount);
+      await supabase.from("hm_balances").update({
+        balance: next,
+        total_spent: bal.total_spent + Math.min(amount, bal.balance),
+        updated_at: new Date().toISOString(),
+      }).eq("user_id", target.id);
+      await supabase.from("hm_transactions").insert({
+        guild_id: interaction.guildId,
+        user_id: target.id,
+        delta: -Math.min(amount, bal.balance),
+        balance_after: next,
+        kind: "staff_remove",
+        reason,
+      });
+    }
+
+    await supabase.from("hm_audit_log").insert({
+      guild_id: interaction.guildId,
+      kind: sub === "give" ? "staff_grant" : "staff_remove",
+      actor_id: interaction.user.id,
+      subject_id: target.id,
+      amount: sub === "give" ? amount : -amount,
+      detail: { reason },
+    });
+
+    scheduleRefresh(interaction.guildId);
+    return interaction.editReply({
+      content: `${sub === "give" ? "Awarded" : "Removed"} \`${amount.toLocaleString()}\` ${HM_EMOJI} ${sub === "give" ? "to" : "from"} <@${target.id}>.`,
+    });
+  }
+
+  if (sub === "refresh") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    await refreshPanels(interaction.guildId);
+    return interaction.editReply({ content: "Panels refreshed." });
+  }
+}
+
+// ── Interaction: buttons and menus ───────────────────────────────────────────
+async function handleQuestStart(interaction) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("hm_pick_type")
+    .setPlaceholder("Select quest type…")
+    .addOptions(
+      new StringSelectMenuOptionBuilder().setLabel("Daily").setValue("daily").setDescription("Short target, resets daily"),
+      new StringSelectMenuOptionBuilder().setLabel("Weekly").setValue("weekly").setDescription("Bigger target, resets weekly"),
+      new StringSelectMenuOptionBuilder().setLabel("Monthly").setValue("monthly").setDescription("Largest target, resets monthly")
+    );
+
+  return interaction.reply({
+    embeds: [emptyPage("📋 Start a Solo Quest", "Pick a quest type. You can hold one Daily, one Weekly, and one Monthly at the same time.").embed],
+    components: [new ActionRowBuilder().addComponents(menu)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handlePickTree(interaction, questType) {
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) {
+    return interaction.update({
+      embeds: [emptyPage("Not registered", "Run `/register` first so I know which RuneScape account to track.").embed],
+      components: [],
+    });
+  }
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`hm_pick_tree:${questType}`)
+    .setPlaceholder("Select a category…")
+    .addOptions(
+      TREES.map((t) =>
+        new StringSelectMenuOptionBuilder().setLabel(t.label).setValue(t.key).setEmoji(t.emoji)
+      )
+    );
+
+  return interaction.update({
+    embeds: [emptyPage("📋 Pick a Category", `Your **${questType}** quest will target something in this category.`).embed],
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function handleCreateSolo(interaction, questType, tree) {
+  await interaction.deferUpdate();
+  const member = await getMember(interaction.user.id);
+  const result = await createSoloQuest({
+    guildId: interaction.guildId,
+    member,
+    tree,
+    questType,
+  });
+
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Couldn't start that quest", result.error).embed], components: [] });
+  }
+
+  const quests = await getActiveSoloQuests(interaction.user.id);
+  const quest = quests.find((q) => q.quest_type === questType);
+  const snap = await fetchHiscores(member.rsn);
+  const progress = diffProgress(quest?.baseline, snap, quest?.targets || {});
+
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    embeds: [questProgressEmbed(quest, progress)],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("hm_check").setLabel("✅ Check Progress").setStyle(ButtonStyle.Success)
+      ),
+    ],
+  });
+}
+
+async function handleCheck(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) {
+    return interaction.editReply({ content: "Run `/register` first." });
+  }
+
+  const result = await checkSoloQuests({
+    guildId: interaction.guildId,
+    userId: interaction.user.id,
+    memberRsn: member.rsn,
+  });
+
+  if (result.error) return interaction.editReply({ content: result.error });
+
+  const active = await getActiveSoloQuests(interaction.user.id);
+  const team = await getActivePartyQuestForUser(interaction.user.id);
+
+  const embeds = [];
+
+  for (const r of result.results) {
+    embeds.push(questProgressEmbed(r.quest, r.progress));
+  }
+
+  if (team) {
+    const evaluated = await checkPartyQuest(team);
+    if (evaluated?.progress) {
+      embeds.push(
+        new EmbedBuilder()
+          .setColor(evaluated.finished ? COLOR.ok : COLOR.main)
+          .setTitle(`👥 TEAM • ${team.size} • ${team.tree}`)
+          .setDescription(
+            `**Team progress: ${evaluated.progress.totalPct}%**\n\n` +
+            evaluated.progress.parts.map((p) => `• ${formatPart(p)} — **${Math.floor(p.pct)}%**`).join("\n")
+          )
+      );
+      if (evaluated.finished) {
+        await completePartyQuest(team, evaluated.progress);
+        scheduleRefresh(interaction.guildId);
+      }
+    }
+  }
+
+  if (!embeds.length) {
+    embeds.push(
+      emptyPage(
+        "No active quests",
+        "You don't have any quests in progress. Press **Start a Solo Quest** on the quest board."
+      ).embed
+    );
+  }
+
+  const summary = [];
+  if (result.completed > 0) {
+    summary.push(
+      `✅ **${result.completed} quest${result.completed === 1 ? "" : "s"} completed** — ` +
+      `+\`${result.awardedHm.toLocaleString()}\` ${HM_EMOJI} and +\`${result.awardedXp.toLocaleString()}\` Rank XP.`
+    );
+  }
+  if (team && !embeds.find((e) => e.data.title?.includes("Team"))) {
+    summary.push("Team quest progress shown above.");
+  }
+
+  if (summary.length) {
+    embeds.unshift(
+      new EmbedBuilder().setColor(COLOR.ok).setDescription(summary.join("\n"))
+    );
+  }
+
+  if (result.completed > 0) scheduleRefresh(interaction.guildId);
+
+  return interaction.editReply({ embeds: embeds.slice(0, 10) });
+}
+
+async function handleTeamStart(interaction) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("hm_pick_size")
+    .setPlaceholder("Select team size…")
+    .addOptions(
+      new StringSelectMenuOptionBuilder().setLabel("Duo (2)").setValue("duo"),
+      new StringSelectMenuOptionBuilder().setLabel("Trio (3)").setValue("trio"),
+      new StringSelectMenuOptionBuilder().setLabel("Quad (4)").setValue("quad")
+    );
+
+  return interaction.reply({
+    embeds: [emptyPage("👥 Start a Team Quest", "Team progress combines from everyone toward one shared target. Everyone gets the full reward.").embed],
+    components: [new ActionRowBuilder().addComponents(menu)],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+const PARTY_SIZES = { duo: 2, trio: 3, quad: 4 };
+
+async function handlePickSize(interaction, size) {
+  if (!PARTY_SIZES[size]) {
+    return interaction.update({ embeds: [emptyPage("Unknown size", "Try again.").embed], components: [] });
+  }
+  return interaction.update({
+    embeds: [
+      emptyPage(
+        "👥 Pick a Category",
+        `Your **${size}** quest targets something in this category. Everyone on the team works toward one shared total.`
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`hm_pick_team_tree:${size}`)
+          .setPlaceholder("Select a category…")
+          .addOptions(TREES.map((t) => new StringSelectMenuOptionBuilder().setLabel(t.label).setValue(t.key).setEmoji(t.emoji)))
+      ),
+    ],
+  });
+}
+
+async function handlePickTeamMembers(interaction, size, tree) {
+  const needed = PARTY_SIZES[size] - 1; // you count as the first member
+  const picker = new UserSelectMenuBuilder()
+    .setCustomId(`hm_team_members:${size}:${tree}`)
+    .setPlaceholder(`Pick ${needed} teammate${needed === 1 ? "" : "s"}…`)
+    .setMinValues(needed)
+    .setMaxValues(needed);
+
+  return interaction.update({
+    embeds: [
+      emptyPage(
+        "👥 Pick Your Team",
+        `A **${size}** needs ${PARTY_SIZES[size]} members total, so pick ${needed} more. ` +
+        `Everyone must have run \`/register\` first.`
+      ).embed,
+    ],
+    components: [new ActionRowBuilder().addComponents(picker)],
+  });
+}
+
+async function handleCreateTeam(interaction, size, tree) {
+  await interaction.deferUpdate();
+  const picked = interaction.values.filter((id) => id !== interaction.user.id);
+  const members = [interaction.user.id, ...picked];
+
+  const result = await createPartyQuest({
+    guildId: interaction.guildId,
+    members,
+    tree,
+    size,
+    difficulty: "easy",
+  });
+
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Couldn't start that quest", result.error).embed], components: [] });
+  }
+
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        "👥 Team quest started",
+        `**${size} • ${TREE_BY_KEY[tree].label}**\n\n` +
+        `${members.map((m) => `<@${m}>`).join(", ")}\n\n` +
+        "Progress combines from everyone. Press **Check Quests & Collect** on the quest board when you think you've hit the target."
+      ).embed,
+    ],
+    components: [],
+  });
+}
+
+async function handleShopOpen(interaction) {
+  const bal = await getBalance(interaction.user.id);
+  return interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR.gold)
+        .setTitle(`${HM_EMOJI} Shop`)
+        .setDescription(`You hold **${bal.balance.toLocaleString()}** Honour Marks.\n\nChoose a section.`)
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("hm_shop_perks").setLabel("🎖️ Perks").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("hm_shop_boosts").setLabel("⚡ Boosts").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("hm_shop_consumables").setLabel("🎫 Consumables").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("hm_inventory").setLabel("🎒 Inventory").setStyle(ButtonStyle.Secondary)
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleShopPerks(interaction) {
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) {
+    return interaction.reply({ content: "Run `/register` first.", flags: MessageFlags.Ephemeral });
+  }
+  const options = [];
+  for (const t of TREES) {
+    const owned = await getPerkTier(interaction.user.id, t.key);
+    if (owned >= PERK_TIERS.length) continue; // maxed — nothing to sell
+    const next = PERK_TIERS[owned];
+    options.push(
+      new StringSelectMenuOptionBuilder()
+        .setLabel(`${t.label} — T${next.tier} (${next.cost.toLocaleString()} HM)`)
+        .setValue(t.key)
+        .setEmoji(t.emoji)
+        .setDescription(
+          owned > 0
+            ? `Owned T${owned} (+${perkBonusPercent(owned)}%) → +${perkBonusPercent(next.tier)}%`
+            : `+${perkBonusPercent(next.tier)}% HM from ${t.label.toLowerCase()} quests`
+        )
+    );
+  }
+
+  if (!options.length) {
+    return interaction.reply({
+      embeds: [emptyPage("🎖️ Perks", "You already own every perk at maximum tier.").embed],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  return interaction.reply({
+    embeds: [emptyPage("🎖️ Perks", "Each tier adds +5% Honour Marks from quests in that category. Tiers must be bought in order.").embed],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("hm_buy_perk")
+          .setPlaceholder("Buy a perk tier…")
+          .addOptions(options.slice(0, 25))
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleBuyPerk(interaction, tree) {
+  await interaction.deferUpdate();
+  const result = await buyPerk({ guildId: interaction.guildId, userId: interaction.user.id, tree });
+
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Purchase failed", result.error).embed], components: [] });
+  }
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        "🎖️ Perk upgraded",
+        `**${TREE_BY_KEY[tree].label}** is now tier **${result.tier}** (+${perkBonusPercent(result.tier)}% HM).\n\n` +
+        `Cost \`${result.cost.toLocaleString()}\` • Balance \`${result.balance.toLocaleString()}\``
+      ).embed,
+    ],
+    components: [],
+  });
+}
+
+async function handleShopBoosts(interaction) {
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) {
+    return interaction.reply({ content: "Run `/register` first.", flags: MessageFlags.Ephemeral });
+  }
+  const bal = await getBalance(interaction.user.id);
+
+  const options = [];
+  for (const t of TREES) {
+    for (const spec of BOOST_TIERS) {
+      options.push(
+        new StringSelectMenuOptionBuilder()
+          .setLabel(`${t.label} — T${spec.tier} (${spec.cost.toLocaleString()} HM)`)
+          .setDescription(`${boostBonusLabel(spec.multiplier)} Rank XP for ${spec.weeks} week${spec.weeks === 1 ? "" : "s"}`)
+          .setValue(`${t.key}:${spec.tier}`)
+          .setEmoji(t.emoji)
+      );
+    }
+  }
+
+  return interaction.reply({
+    embeds: [
+      emptyPage(
+        "⚡ Boosts",
+        `You hold **${bal.balance.toLocaleString()}** ${HM_EMOJI}.\n\n` +
+        "Boosts are bought here and **activated from your Inventory** whenever you're ready — " +
+        "so you can buy ahead of a busy week."
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("hm_buy_boost")
+          .setPlaceholder("Buy a boost…")
+          .addOptions(options.slice(0, 25))
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleBuyBoost(interaction, value) {
+  await interaction.deferUpdate();
+  const [tree, tierRaw] = value.split(":");
+  const result = await buyBoost({
+    guildId: interaction.guildId,
+    userId: interaction.user.id,
+    tree,
+    tier: Number(tierRaw),
+  });
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Purchase failed", result.error).embed], components: [] });
+  }
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        "⚡ Boost purchased",
+        `**${TREE_BY_KEY[tree].label} T${tierRaw}** is in your inventory. ` +
+        `Open **Inventory** to activate it when you're ready.\n\n` +
+        `Cost \`${result.cost.toLocaleString()}\` • Balance \`${result.balance.toLocaleString()}\``
+      ).embed,
+    ],
+    components: [],
+  });
+}
+
+async function handleShopConsumables(interaction) {
+  const bal = await getBalance(interaction.user.id);
+  const options = Object.entries(CONSUMABLES).map(([key, spec]) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(`${spec.label} (${spec.cost} HM)`)
+      .setDescription(spec.desc)
+      .setValue(key)
+      .setEmoji(spec.emoji)
+  );
+
+  return interaction.reply({
+    embeds: [
+      emptyPage(
+        "🎫 Consumables",
+        `You hold **${bal.balance.toLocaleString()}** ${HM_EMOJI}.\n\n` +
+        Object.values(CONSUMABLES).map((c) => `${c.emoji} **${c.label}** — ${c.cost} HM\n_${c.desc}_`).join("\n\n")
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("hm_buy_consumable")
+          .setPlaceholder("Buy a consumable…")
+          .addOptions(options)
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleBuyConsumable(interaction, key) {
+  await interaction.deferUpdate();
+  const result = await buyConsumable({ guildId: interaction.guildId, userId: interaction.user.id, key });
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Purchase failed", result.error).embed], components: [] });
+  }
+  const spec = CONSUMABLES[key];
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        `${spec.emoji} ${spec.label} purchased`,
+        `Cost \`${result.cost.toLocaleString()}\` • Balance \`${result.balance.toLocaleString()}\``
+      ).embed,
+    ],
+    components: [],
+  });
+}
+
+async function handleLfgOpen(interaction) {
+  // Honest placeholder rather than a dead button: the board needs a join/leave
+  // flow that isn't built yet, and a button that silently fails is worse than
+  // one that explains itself.
+  return interaction.reply({
+    embeds: [
+      emptyPage(
+        "🔍 Looking For Group",
+        "The public board isn't live yet. For now, start a team quest with **Start a Team Quest** " +
+        "on the quest board and invite your members directly.\n\n" +
+        "_An open LFG board is on the list._"
+      ).embed,
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleInventory(interaction) {
+  const bal = await getBalance(interaction.user.id);
+  const inv = await getInventory(interaction.user.id);
+  const boosts = await getActiveBoosts(interaction.user.id);
+  const perks = await getPerks(interaction.user.id);
+
+  const boostLines = inv.filter((i) => i.boost_tier > 0).map((i) => {
+    const spec = BOOST_TIERS.find((t) => t.tier === i.boost_tier);
+    return `• ${TREE_BY_KEY[i.tree]?.label || i.tree} — T${i.boost_tier} (${boostBonusLabel(spec?.multiplier)}) ×${i.quantity}`;
+  });
+  const consumableLines = inv.filter((i) => i.boost_tier === 0).map((i) => {
+    const spec = CONSUMABLES[i.tree];
+    return `• ${spec?.emoji || "🎫"} ${spec?.label || i.tree} ×${i.quantity}`;
+  });
+  const activeLines = boosts.map(
+    (b) => `• ${b.tree} — ${boostBonusLabel(b.multiplier)} until <t:${Math.floor(new Date(b.expires_at).getTime() / 1000)}:R>`
+  );
+  const perkLines = perks.map(
+    (p) => `• ${TREE_BY_KEY[p.tree]?.label || p.tree} — T${p.tier} (+${perkBonusPercent(p.tier)}%)`
+  );
+
+  const rows = [];
+  const boostOptions = inv
+    .filter((i) => i.boost_tier > 0)
+    .map((i) =>
+      new StringSelectMenuOptionBuilder()
+        .setLabel(`Activate ${TREE_BY_KEY[i.tree]?.label || i.tree} T${i.boost_tier}`)
+        .setValue(`${i.tree}:${i.boost_tier}`)
+    );
+
+  if (boostOptions.length) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("hm_activate_boost")
+          .setPlaceholder("Activate a boost…")
+          .addOptions(boostOptions.slice(0, 25))
+      )
+    );
+  }
+
+  return interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR.main)
+        .setTitle("🎒 Inventory")
+        .setDescription(`You hold **${bal.balance.toLocaleString()}** ${HM_EMOJI}`)
+        .addFields(
+          { name: "Perks", value: perkLines.join("\n") || "_None_", inline: false },
+          { name: "Boosts owned", value: boostLines.join("\n") || "_None_", inline: false },
+          { name: "Consumables", value: consumableLines.join("\n") || "_None_", inline: false },
+          { name: "Active boosts", value: activeLines.join("\n") || "_None_", inline: false }
+        ),
+    ],
+    components: rows,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleActivateBoost(interaction, value) {
+  await interaction.deferUpdate();
+  const [tree, tierRaw] = value.split(":");
+  const result = await activateBoost({
+    guildId: interaction.guildId,
+    userId: interaction.user.id,
+    tree,
+    tier: Number(tierRaw),
+  });
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Couldn't activate", result.error).embed], components: [] });
+  }
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        "⚡ Boost activated",
+        `Your **${TREE_BY_KEY[tree]?.label || tree}** boost is live until <t:${Math.floor(result.expiresAt.getTime() / 1000)}:F>.`
+      ).embed,
+    ],
+    components: [],
+  });
+}
+
+async function handleMyQuests(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) return interaction.editReply({ content: "Run `/register` first." });
+
+  const solo = await getActiveSoloQuests(interaction.user.id);
+  const team = await getActivePartyQuestForUser(interaction.user.id);
+
+  if (!solo.length && !team) {
+    return interaction.editReply({ content: "You have no active quests. Open the quest board and press **Start a Solo Quest**." });
+  }
+
+  const snap = await fetchHiscores(member.rsn);
+  const embeds = [];
+
+  for (const q of solo) {
+    const progress = diffProgress(q.baseline, snap, q.targets);
+    embeds.push(questProgressEmbed(q, progress));
+  }
+  if (team) {
+    const evaluated = await checkPartyQuest(team);
+    if (evaluated?.progress) {
+      embeds.push(
+        new EmbedBuilder()
+          .setColor(COLOR.main)
+          .setTitle(`👥 TEAM • ${team.size} • ${team.tree}`)
+          .setDescription(
+            `**Team progress: ${evaluated.progress.totalPct}%**\n\n` +
+            evaluated.progress.parts.map((p) => `• ${formatPart(p)} — **${Math.floor(p.pct)}%**`).join("\n") +
+            `\n\nEnds <t:${Math.floor(new Date(team.expires_at).getTime() / 1000)}:R>`
+          )
+      );
+    }
+  }
+
+  return interaction.editReply({ embeds: embeds.slice(0, 10) });
+}
+
+// ── Router ───────────────────────────────────────────────────────────────────
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      switch (interaction.commandName) {
+        case "setup": return await handleSetup(interaction);
+        case "register": return await handleRegister(interaction);
+        case "hm": return await handleHm(interaction);
+        default: return;
+      }
+    }
+
+    if (interaction.isButton()) {
+      switch (interaction.customId) {
+        case "hm_quest_start": return await handleQuestStart(interaction);
+        case "hm_team_start": return await handleTeamStart(interaction);
+        case "hm_check": return await handleCheck(interaction);
+        case "hm_my_quests": return await handleMyQuests(interaction);
+        case "hm_shop_open": return await handleShopOpen(interaction);
+        case "hm_shop_perks": return await handleShopPerks(interaction);
+        case "hm_shop_boosts": return await handleShopBoosts(interaction);
+        case "hm_shop_consumables": return await handleShopConsumables(interaction);
+        case "hm_lfg_open": return await handleLfgOpen(interaction);
+        case "hm_inventory": return await handleInventory(interaction);
+        case "hm_db_page": // disabled label button; never fires, kept so a
+                           // stray click can never leave an unacked interaction
+        case "hm_db_refresh": {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          await refreshPanels(interaction.guildId);
+          return interaction.editReply({ content: "Database refreshed." });
+        }
+        default: return;
+      }
+    }
+
+    if (interaction.isStringSelectMenu()) {
+      const id = interaction.customId;
+
+      if (id === "hm_pick_type") {
+        return await handlePickTree(interaction, interaction.values[0]);
+      }
+      if (id.startsWith("hm_pick_tree:")) {
+        const questType = id.split(":")[1];
+        return await handleCreateSolo(interaction, questType, interaction.values[0]);
+      }
+      if (id === "hm_buy_perk") {
+        return await handleBuyPerk(interaction, interaction.values[0]);
+      }
+      if (id === "hm_activate_boost") {
+        return await handleActivateBoost(interaction, interaction.values[0]);
+      }
+      if (id === "hm_buy_boost") {
+        return await handleBuyBoost(interaction, interaction.values[0]);
+      }
+      if (id === "hm_buy_consumable") {
+        return await handleBuyConsumable(interaction, interaction.values[0]);
+      }
+      if (id === "hm_pick_size") {
+        return await handlePickSize(interaction, interaction.values[0]);
+      }
+      if (id.startsWith("hm_pick_team_tree:")) {
+        const size = id.split(":")[1];
+        return await handlePickTeamMembers(interaction, size, interaction.values[0]);
+      }
+      return;
+    }
+
+    if (interaction.isUserSelectMenu()) {
+      const id = interaction.customId;
+      if (id.startsWith("hm_team_members:")) {
+        const [, size, tree] = id.split(":");
+        return await handleCreateTeam(interaction, size, tree);
+      }
+      return;
+    }
+  } catch (e) {
+    console.error("[Interaction]", interaction.customId || interaction.commandName, e);
+    const payload = { content: `Something went wrong: \`${e.message}\``, flags: MessageFlags.Ephemeral };
+    if (interaction.deferred || interaction.replied) await interaction.editReply(payload).catch(() => {});
+    else await interaction.reply(payload).catch(() => {});
+  }
+});
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+client.once(Events.ClientReady, async () => {
+  console.log(`[Honour Marks] Online as ${client.user.tag}`);
+
+  const rest = new REST({ version: "10" }).setToken(config.token);
+  try {
+    if (config.devGuildId) {
+      await rest.put(Routes.applicationGuildCommands(config.clientId, config.devGuildId), { body: commands });
+      console.log(`[Honour Marks] Commands registered to guild ${config.devGuildId}.`);
+    } else {
+      await rest.put(Routes.applicationCommands(config.clientId), { body: commands });
+      console.log("[Honour Marks] Commands registered globally (can take up to an hour to appear).");
+    }
+  } catch (e) {
+    console.error("[Honour Marks] Command registration failed:", e.message);
+  }
+
+  // Expiry sweep — pays partial HM for lapsed quests, awards no Rank XP.
+  const sweep = async () => {
+    try {
+      await sweepExpiredQuests();
+    } catch (e) {
+      console.error("[Honour Marks] Expiry sweep failed:", e.message);
+    }
+  };
+  await sweep();
+  setInterval(sweep, config.expirySweepMs).unref?.();
+
+  // Periodic panel reconciliation heals anything a moderator deleted.
+  setInterval(async () => {
+    for (const guild of client.guilds.cache.values()) {
+      await refreshPanels(guild.id).catch(() => {});
+    }
+  }, config.syncIntervalMs).unref?.();
+
+  for (const guild of client.guilds.cache.values()) {
+    await refreshPanels(guild.id).catch(() => {});
+  }
+});
+
+client.on(Events.GuildCreate, async (guild) => {
+  console.log(`[Honour Marks] Joined guild ${guild.name} (${guild.id})`);
+  // Panels are only posted after /setup runs — we don't assume a channel.
+});
+
+process.on("unhandledRejection", (e) => console.error("[Honour Marks] Unhandled rejection:", e));
+process.on("uncaughtException", (e) => console.error("[Honour Marks] Uncaught exception:", e));
+
+client.login(config.token);
+
+module.exports = { client, refreshPanels };
