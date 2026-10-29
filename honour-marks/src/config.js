@@ -33,8 +33,13 @@ const config = {
   // Leave blank for global registration.
   devGuildId: envStr("HM_DEV_GUILD_ID"),
 
+  // Only this Discord user sees #hm-log. Falls back to whoever runs /setup,
+  // so it never needs configuring for a single-owner clan.
+  logUserId: envStr("HM_LOG_USER_ID"),
+
   // Optional pre-existing channels. Blank => /setup creates them.
   channels: {
+    claim: envStr("HM_CLAIM_CHANNEL_ID"),
     quests: envStr("HM_QUESTS_CHANNEL_ID"),
     shop: envStr("HM_SHOP_CHANNEL_ID"),
     database: envStr("HM_DATABASE_CHANNEL_ID"),
@@ -42,9 +47,18 @@ const config = {
     log: envStr("HM_LOG_CHANNEL_ID"),
   },
 
-  // Optional pre-existing roles.
+  // Optional pre-existing roles. The Honour Marks and Clan Member defaults are
+  // Odinheim's; both are overridable so /setup works in any server.
   roles: {
     staff: envStr("HM_STAFF_ROLE_ID"),
+    honourMarks: envStr("HM_ROLE_ID", "1565209304628338728"),
+    clanMember: envStr("HM_CLAN_MEMBER_ROLE_ID", "1546403975656505354"),
+    // Roles that keep access to every Honour Marks channel regardless of
+    // audience — comma-separated in the env var.
+    manage: (envStr("HM_MANAGE_ROLE_IDS") || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
   },
 
   // ── Economy ───────────────────────────────────────────────────────────────

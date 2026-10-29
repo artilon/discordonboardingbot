@@ -217,6 +217,47 @@ async function renderQuestBoard(guildId) {
   return [{ embed, components: buildPanelComponents("quest_board", 0, 1) }];
 }
 
+// ── Role self-service ────────────────────────────────────────────────────────
+/**
+ * The claim panel.
+ *
+ * Two buttons rather than one toggle: this message is shared by the whole
+ * server, so its components cannot differ per viewer. A single button whose
+ * label changed based on who was looking would be impossible, and a toggle
+ * button labelled generically hides what it currently does. Two explicit
+ * buttons name both actions and are correct for every member at once.
+ */
+function renderClaimPanel(setup = {}) {
+  const roleMention = setup.honourMarksRoleId ? `<@&${setup.honourMarksRoleId}>` : "**Honour Marks**";
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("🎖️ Honour Marks Role")
+    .setDescription(
+      `Claim the ${roleMention} role to unlock the quest board and shop, or drop it any time.\n\n` +
+      `**Claim Role** — unlocks <#${setup.channels?.quests || "0"}> and <#${setup.channels?.database || "0"}> ` +
+      `so you can start earning Honour Marks from quests.\n\n` +
+      `**Drop Role** — removes the role again. You can come back here and claim it whenever you like.\n\n` +
+      `_These channels are read-only. Everything you do happens through buttons on the quest board._`
+    )
+    .setFooter({ text: "Odinheim • Honour Marks" });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("hm_claim_role")
+      .setLabel("Claim Role")
+      .setEmoji("🎖️")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("hm_drop_role")
+      .setLabel("Drop Role")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  return [{ embed, components: [row] }];
+}
+
 // ── Shop ─────────────────────────────────────────────────────────────────────
 async function renderShop(guildId) {
   const perkLines = TREES.map((t) => `${t.emoji} **${t.label}** — +5% HM per tier, 5 tiers`);
@@ -346,6 +387,7 @@ async function syncPanel(guildId, channel, panelKey, pages) {
 module.exports = {
   COLOR, HM_EMOJI, DESC_BUDGET,
   chunkLines, buildPanelComponents,
+  renderClaimPanel,
   renderDatabase, renderQuestBoard, renderShop, emptyPage,
   getPanelLedger, syncPanel,
   getRankForXp, formatRankProgress,
