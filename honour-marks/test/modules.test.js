@@ -150,6 +150,39 @@ check("raid difficulties collapse to one entry", () => {
   }
 });
 
+console.log("\n[quest choice token — hand-picked targets]");
+check("a valid pick is used instead of a random roll", () => {
+  for (let i = 0; i < 50; i++) {
+    const t = q.buildSoloTargets("gathering", "daily", ["mining"]);
+    assert.deepStrictEqual(Object.keys(t.skills), ["mining"]);
+  }
+});
+
+check("an invalid pick is topped up with a random one from the real pool, never dropped", () => {
+  const t = q.buildSoloTargets("gathering", "daily", ["not_a_real_skill"]);
+  const picked = Object.keys(t.skills);
+  assert.strictEqual(picked.length, 1, "still produces exactly one target");
+  assert.ok(q.SKILLS_BY_TREE.gathering.includes(picked[0]), "falls back into the real pool");
+});
+
+check("a monthly skill quest needing 2 picks keeps both valid choices", () => {
+  const t = q.buildSoloTargets("gathering", "monthly", ["mining", "woodcutting"]);
+  assert.deepStrictEqual(Object.keys(t.skills).sort(), ["mining", "woodcutting"]);
+  assert.strictEqual(t.skills.mining, 150000);
+});
+
+check("no picks at all still produces a valid random target (unchanged default behaviour)", () => {
+  const t = q.buildSoloTargets("boss", "weekly", null);
+  assert.strictEqual(Object.keys(t.bosses).length, 1);
+});
+
+check("soloTargetPool exposes the exact pool and count the picker UI needs", () => {
+  const spec = q.soloTargetPool("combat", "monthly");
+  assert.strictEqual(spec.kind, "skill");
+  assert.strictEqual(spec.count, 2);
+  assert.deepStrictEqual(spec.pool, q.SKILLS_BY_TREE.combat);
+});
+
 console.log("\n[rewards]");
 check("HM scales by size and difficulty", () => {
   assert.strictEqual(q.soloHmReward("daily"), 50);

@@ -116,6 +116,38 @@ create table if not exists public.pending_rank_xp (
   consumed_by     text
 );
 
+-- Safety net for a database that already has an OLDER `pending_rank_xp` from
+-- before these columns existed: `create table if not exists` is a no-op on a
+-- table that already exists, so without this, the indexes below would fail
+-- with "column does not exist" on a partially-migrated database. Every
+-- column this table needs is listed explicitly, so this file is safe to
+-- paste and re-run regardless of what state the table was already in.
+alter table public.pending_rank_xp add column if not exists guild_id        text;
+alter table public.pending_rank_xp add column if not exists user_id        text;
+alter table public.pending_rank_xp add column if not exists rsn            text;
+alter table public.pending_rank_xp add column if not exists reason         text;
+alter table public.pending_rank_xp add column if not exists event_key      text;
+alter table public.pending_rank_xp add column if not exists idempotency_key text;
+alter table public.pending_rank_xp add column if not exists attempts       integer not null default 0;
+alter table public.pending_rank_xp add column if not exists last_attempt_at timestamptz;
+alter table public.pending_rank_xp add column if not exists created_at     timestamptz not null default now();
+alter table public.pending_rank_xp add column if not exists consumed_at    timestamptz;
+alter table public.pending_rank_xp add column if not exists consumed_by    text;
+alter table public.pending_rank_xp alter column user_id drop not null;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'pending_rank_xp_idempotency_key_key'
+  ) then
+    alter table public.pending_rank_xp add constraint pending_rank_xp_idempotency_key_key unique (idempotency_key);
+  end if;
+exception
+  when duplicate_object then null;
+  when others then null;
+end $$;
+
 create index if not exists idx_pending_rank_xp_open
   on public.pending_rank_xp (attempts asc, created_at asc)
   where consumed_at is null;

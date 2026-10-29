@@ -10,7 +10,16 @@ function matchFilters(row, filters) {
     if (op === "eq") return String(cell) === String(val);
     if (op === "is") return val === null ? cell == null : cell === val;
     if (op === "lte") return String(cell) <= String(val);
-    if (op === "gt") return Number(cell) > Number(val);
+    if (op === "gt") {
+      // Numeric columns (quantity) compare as numbers; ISO timestamp columns
+      // (expires_at) aren't numeric, so fall back to string comparison, which
+      // works because ISO-8601 with a fixed-width UTC suffix sorts correctly
+      // as plain text.
+      const a = Number(cell);
+      const b = Number(val);
+      if (Number.isFinite(a) && Number.isFinite(b)) return a > b;
+      return String(cell) > String(val);
+    }
     if (op === "ilike") return String(cell || "").toLowerCase() === String(val || "").toLowerCase();
     if (op === "contains") return Array.isArray(cell) && val.every((v) => cell.includes(v));
     return true;
@@ -29,14 +38,18 @@ function createFakeSupabase(tables = {}) {
   }
 
   function builder(name) {
-    const q = { filters: [], payload: null, op: "select", cols: null, limit: null, order: [] };
+    const q = { filters: [], payload: null, op: "select", opLocked: false, cols: null, limit: null, order: [] };
 
     const api = {
-      select(cols) { q.cols = cols; if (!q.payload) q.op = "select"; return api; },
-      insert(payload) { q.op = "insert"; q.payload = payload; return api; },
-      update(payload) { q.op = "update"; q.payload = payload; return api; },
-      delete() { q.op = "delete"; return api; },
-      upsert(payload) { q.op = "upsert"; q.payload = payload; return api; },
+      // `.select()` only ever narrows which columns come back — chained after
+      // insert/update/delete/upsert (e.g. `.delete().eq(...).select("id")`,
+      // real PostgREST syntax for "tell me what was deleted"), it must NOT
+      // reset the operation back to a plain read.
+      select(cols) { q.cols = cols; if (!q.opLocked) q.op = "select"; return api; },
+      insert(payload) { q.op = "insert"; q.opLocked = true; q.payload = payload; return api; },
+      update(payload) { q.op = "update"; q.opLocked = true; q.payload = payload; return api; },
+      delete() { q.op = "delete"; q.opLocked = true; return api; },
+      upsert(payload) { q.op = "upsert"; q.opLocked = true; q.payload = payload; return api; },
       eq(col, val) { q.filters.push([col, "eq", val]); return api; },
       is(col, val) { q.filters.push([col, "is", val]); return api; },
       lte(col, val) { q.filters.push([col, "lte", val]); return api; },

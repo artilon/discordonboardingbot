@@ -40,8 +40,10 @@ npm start
 **4. `/setup` in Discord.**
 
 - `/setup auto` — creates a `Honour Marks` category with `#honour-marks`,
-  `#hm-database`, `#hm-staff`, `#hm-log`, posts every panel, seeds the XP rules.
-  Needs **Manage Channels**.
+  `#hm-database`, `#hm-staff`, `#hm-log`, posts every panel (including the
+  **📖 How This Works** guide — a plain-English explainer for someone who has
+  never seen this bot before, also one click away via a button on the quest
+  board), seeds the XP rules. Needs **Manage Channels**.
 - `/setup manual` — binds to channels you already have. Uses native channel and
   role pickers, so there are no IDs to paste.
 - `/setup repair` — re-verifies channels and reposts any missing panel.
@@ -213,22 +215,42 @@ months instead of being shortcut to 9.
 Adjust in `config.js` (`rankXp`). Existing guilds keep their own copy in
 `hm_rank_xp_rules` and are seeded on first setup.
 
+### Boosts — real quest-completion XP multipliers
+
+A Boost is bought in the Shop, sits in Inventory until activated, then for its
+duration multiplies the **Rank XP** a FINISHED quest in that one category
+pays out. It does nothing to HM, nothing to an expired/partial quest, and it
+is read fresh at the exact moment a quest completes (`getBoostMultiplier` in
+`src/shop.js`, applied in `src/progress.js` before the amount is queued into
+`pending_rank_xp`) — so it can never drift out of sync with what Heimdall
+actually receives, and the boosted number is what gets written onto the
+completion row in `#hm-database`.
+
+| Tier | Cost | Multiplier | Duration |
+|---|---|---|---|
+| T1 | 750 HM | ×1.5 | 1 week |
+| T2 | 2,250 HM | ×2.0 | 2 weeks |
+| T3 | 7,500 HM | ×2.5 | 1 week |
+
+Prices are 3x the original tuning, because a boost is now a real ongoing
+advantage rather than a display-only number.
+
 ## Tests
 
 ```bash
 npm test
 ```
 
-60 checks, no network required: rank ladder parity with Heimdall, hiscores diff
+80 checks, no network required: rank ladder parity with Heimdall, hiscores diff
 maths, quest target generation, boss grouping, the panel ledger (growth,
 shrinkage, self-heal), the full permission matrix, the slash-command payload
-against Discord's required-before-optional rule, and registration scope sync
-(the duplicate-subcommand fix).
+against Discord's required-before-optional rule, registration scope sync (the
+duplicate-subcommand fix), and — against a fake Supabase client — that an
+active Boost actually changes the Rank XP a finished quest queues, that a
+party quest writes exactly one completion row with a per-member XP breakdown,
+and that the Skip/Choice tokens are real inventory operations.
 
 ## Known gaps
 
-- **Choice token** is purchasable and consumable but doesn't yet force a target
-  — the selection flow needs a target picker.
 - **LFG board** is a placeholder button; team quests currently go straight to
   direct invitations.
-- **Skip token** is purchasable but not yet wired to cancel a quest.

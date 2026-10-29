@@ -150,18 +150,28 @@ create index if not exists idx_hm_qc_created on public.hm_quest_completions (cre
 
 -- 10. Party completion history — one row per team, attributed to every member
 create table if not exists public.hm_party_quest_completions (
-  id               bigserial primary key,
-  guild_id         text not null,
-  quest_id         bigint,
-  members          text[] not null,
-  size             text not null,
-  tree             text not null,
-  difficulty       text,
-  completed        boolean not null default true,
-  hm_awarded       integer not null default 0,
-  rank_xp_awarded  integer not null default 0,
-  created_at       timestamptz not null default now()
+  id                 bigserial primary key,
+  guild_id           text not null,
+  quest_id           bigint,
+  members            text[] not null,
+  size               text not null,
+  tree               text not null,
+  difficulty         text,
+  completed          boolean not null default true,
+  hm_awarded         integer not null default 0,
+  rank_xp_awarded    integer not null default 0,
+  -- Per-member Rank XP: { "<user_id>": <amount actually queued for them> }.
+  -- Needed because each member can have a DIFFERENT active Boost for this
+  -- quest's category, so they are no longer all paid the same amount —
+  -- `rank_xp_awarded` above is just the sum, kept for a quick total.
+  rank_xp_breakdown  jsonb not null default '{}'::jsonb,
+  created_at         timestamptz not null default now()
 );
+
+-- Safety net for a database that already ran an older copy of this file
+-- before `rank_xp_breakdown` existed.
+alter table public.hm_party_quest_completions
+  add column if not exists rank_xp_breakdown jsonb not null default '{}'::jsonb;
 
 create index if not exists idx_hm_pqc_members on public.hm_party_quest_completions using gin (members);
 
@@ -279,12 +289,16 @@ with solo as (
   from public.hm_quest_completions group by user_id
 ),
 party as (
+  -- Every member of a party was paid the same HM (the reward was always a
+  -- flat amount per member), but — since Boosts went live — NOT necessarily
+  -- the same Rank XP, so Rank XP is read per member out of the breakdown
+  -- instead of assuming everyone got the row's shared total.
   select m as user_id,
          count(*) filter (where size = 'duo'  and completed) as duo,
          count(*) filter (where size = 'trio' and completed) as trio,
          count(*) filter (where size = 'quad' and completed) as quad,
-         coalesce(sum(hm_awarded), 0)                       as party_hm,
-         coalesce(sum(rank_xp_awarded), 0)                  as party_rank_xp
+         coalesce(sum(hm_awarded), 0)                                       as party_hm,
+         coalesce(sum(coalesce((rank_xp_breakdown ->> m)::numeric, 0)), 0)  as party_rank_xp
   from public.hm_party_quest_completions, unnest(members) as m
   group by m
 )

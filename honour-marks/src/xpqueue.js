@@ -22,15 +22,26 @@ function makeIdempotencyKey(userId, eventKey, discriminator) {
 }
 
 /**
- * Queues flat Rank XP for a member.
- * @returns {{ok: boolean, amount: number, duplicate?: boolean}}
+ * Queues Rank XP for a member.
+ *
+ * `multiplier` is how an active Honour Marks Boost reaches the ladder: it is
+ * applied to the flat base rate right here, once, before the amount is ever
+ * written anywhere. Nothing downstream (Heimdall, the database channel, the
+ * ledger) needs to know a boost exists — they just see the number that was
+ * actually queued. This is the ONLY multiplier Rank XP ever sees; it is never
+ * combined with the tenure-side rank multiplier, which lives entirely inside
+ * Heimdall and never touches this queue.
+ *
+ * @returns {{ok: boolean, amount: number, base?: number, multiplier?: number, duplicate?: boolean}}
  */
-async function awardRankXp({ guildId, userId, rsn, eventKey, reason, discriminator }) {
-  const amount = Number(config.rankXp[eventKey]) || 0;
-  if (!userId || amount <= 0) return { ok: true, amount: 0 };
+async function awardRankXp({ guildId, userId, rsn, eventKey, reason, discriminator, multiplier = 1 }) {
+  const base = Number(config.rankXp[eventKey]) || 0;
+  const mult = Number.isFinite(Number(multiplier)) && Number(multiplier) > 0 ? Number(multiplier) : 1;
+  const amount = Math.round(base * mult);
+  if (!userId || amount <= 0) return { ok: true, amount: 0, base, multiplier: mult };
 
   const supabase = getSupabase();
-  if (!supabase) return { ok: false, amount: 0 };
+  if (!supabase) return { ok: false, amount: 0, base, multiplier: mult };
 
   const idempotencyKey = makeIdempotencyKey(userId, eventKey, discriminator || Date.now());
 
@@ -47,14 +58,14 @@ async function awardRankXp({ guildId, userId, rsn, eventKey, reason, discriminat
 
     if (error) {
       // 23505 = unique violation = this award already exists. Not an error.
-      if (error.code === "23505") return { ok: true, amount, duplicate: true };
+      if (error.code === "23505") return { ok: true, amount, base, multiplier: mult, duplicate: true };
       console.error("[XPQueue] insert failed:", error.message);
-      return { ok: false, amount: 0 };
+      return { ok: false, amount: 0, base, multiplier: mult };
     }
-    return { ok: true, amount };
+    return { ok: true, amount, base, multiplier: mult };
   } catch (e) {
     console.error("[XPQueue] insert threw:", e.message);
-    return { ok: false, amount: 0 };
+    return { ok: false, amount: 0, base, multiplier: mult };
   }
 }
 
