@@ -47,67 +47,7 @@ const client = new Client({
 });
 
 // ── Commands ─────────────────────────────────────────────────────────────────
-const commands = [
-  new SlashCommandBuilder()
-    .setName("setup")
-    .setDescription("Set up Honour Marks (staff)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand((s) =>
-      s.setName("auto").setDescription("Create the Honour Marks category and channels automatically")
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("manual")
-        .setDescription("Bind Honour Marks to channels you already have")
-        .addChannelOption((o) => o.setName("claim").setDescription("Channel with the Claim / Drop Role buttons"))
-        .addChannelOption((o) => o.setName("quests").setDescription("Quest board + shop channel").setRequired(true))
-        .addChannelOption((o) => o.setName("database").setDescription("Database channel").setRequired(true))
-        .addChannelOption((o) => o.setName("staff").setDescription("Staff channel (optional)"))
-        .addChannelOption((o) => o.setName("log").setDescription("Audit log channel (optional)"))
-        .addRoleOption((o) => o.setName("staff_role").setDescription("Role allowed to adjust HM"))
-    )
-    .addSubcommand((s) => s.setName("repair").setDescription("Reconcile channels and repost any missing panels"))
-    .addSubcommand((s) => s.setName("status").setDescription("Show the current Honour Marks setup")),
-
-  new SlashCommandBuilder()
-    .setName("register")
-    .setDescription("Link your RuneScape name to your Discord account")
-    .addStringOption((o) =>
-      o.setName("rsn").setDescription("Your exact in-game name").setRequired(true)
-    )
-    .addUserOption((o) =>
-      o.setName("member").setDescription("Register someone else (staff only)").setRequired(false)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("hm")
-    .setDescription("Honour Marks admin")
-    .addSubcommand((s) =>
-      s
-        .setName("give")
-        .setDescription("Award HM to a member (staff)")
-        .addUserOption((o) => o.setName("member").setDescription("Member").setRequired(true))
-        .addIntegerOption((o) => o.setName("amount").setDescription("Amount").setRequired(true).setMinValue(1))
-        .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(false))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("take")
-        .setDescription("Remove HM from a member (staff)")
-        .addUserOption((o) => o.setName("member").setDescription("Member").setRequired(true))
-        .addIntegerOption((o) => o.setName("amount").setDescription("Amount").setRequired(true).setMinValue(1))
-        .addStringOption((o) => o.setName("reason").setDescription("Reason").setRequired(false))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("balance")
-        .setDescription("Show a member's HM")
-        .addUserOption((o) => o.setName("member").setDescription("Member").setRequired(false))
-    )
-    .addSubcommand((s) =>
-      s.setName("refresh").setDescription("Force-refresh all Honour Marks panels")
-    ),
-].map((c) => c.toJSON());
+const { commands } = require("./src/commands");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 async function isStaff(interaction) {
