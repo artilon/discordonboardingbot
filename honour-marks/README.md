@@ -39,17 +39,28 @@ npm start
 
 **4. `/setup` in Discord.**
 
-- `/setup auto` — creates a `Honour Marks` category with `#honour-marks`,
-  `#hm-database`, `#hm-staff`, `#hm-log`, posts every panel (including the
-  **📖 How This Works** guide — a plain-English explainer for someone who has
-  never seen this bot before, also one click away via a button on the quest
-  board), seeds the XP rules. Needs **Manage Channels**.
+- `/setup auto` — creates a `Honour Marks` category with seven channels —
+  `#hm-role`, `#hm-guide`, `#hm-quests`, `#hm-shop`, `#hm-database`,
+  `#hm-staff`, `#hm-log` — posts every panel (the guide, quest board and shop
+  each get their own channel and their own panel now; the guide's
+  **📖 How This Works** explainer is also one click away via a button on the
+  quest board), seeds the XP rules. Needs **Manage Channels**.
 - `/setup manual` — binds to channels you already have. Uses native channel and
-  role pickers, so there are no IDs to paste.
+  role pickers, so there are no IDs to paste. `quests`, `database` and `shop`
+  are required; `claim`, `guide`, `staff` and `log` are optional.
 - `/setup repair` — re-verifies channels and reposts any missing panel.
 - `/setup status` — shows what's bound.
 
-You can run `/setup` again at any time; it reconciles rather than duplicating.
+`/setup repair` reconciles the *existing* binding (fixes permissions, reposts a
+panel if its message got deleted) without touching channels. `/setup auto` and
+`/setup manual`, on the other hand, **rebind** — they point the bot at whatever
+channels you gave them this time and start managing those, but they never
+delete anything. Re-running `/setup auto` to pick up new channels (for example,
+after upgrading from an older version with fewer channels) always **creates a
+brand new category** rather than adding the missing channels to the old one —
+delete the old `Honour Marks` category by hand afterward. Nothing in Supabase
+is touched either way, so no HM balances, Rank XP, or quest history is ever at
+risk from re-running setup.
 
 **5. Members.** `/register rsn:YourName` — verified against the OSRS hiscores
 before it's accepted, so nobody ends up with a dead registration.
@@ -116,15 +127,18 @@ the server with zero commands.
 
 ## Channels and permissions
 
-Five channels inside an `Honour Marks` category. The category denies `@everyone`,
-and each child re-allows only what it needs — because **category overwrites
-cascade to every child**, so allowing a role on the category would expose
-`#hm-log` too.
+Seven channels inside an `Honour Marks` category — the guide, quest board and
+shop each live in their own channel now, instead of all three being crammed
+into one. The category denies `@everyone`, and each child re-allows only what
+it needs — because **category overwrites cascade to every child**, so allowing
+a role on the category would expose `#hm-log` too.
 
 | Channel | Who can see it | Who can post |
 |---|---|---|
-| `#get-honour-marks` | Clan Member + Honour Marks | bot only |
-| `#honour-marks` (quests + shop) | Honour Marks | bot only |
+| `#hm-role` | Clan Member + Honour Marks | bot only |
+| `#hm-guide` | Honour Marks | bot only |
+| `#hm-quests` | Honour Marks | bot only |
+| `#hm-shop` | Honour Marks | bot only |
 | `#hm-database` | Honour Marks | bot only |
 | `#hm-staff` | Staff role | bot only |
 | `#hm-log` | **the setup runner only** | bot only |
@@ -144,11 +158,11 @@ read-only displays; all interaction happens through buttons and menus.
 
 ## Claim / Drop Role
 
-`#get-honour-marks` holds one embed with two buttons:
+`#hm-role` holds one embed with two buttons:
 
 | Button | Effect |
 |---|---|
-| 🎖️ **Claim Role** | Adds the Honour Marks role, unlocking the quest board and database |
+| 🎖️ **Claim Role** | Adds the Honour Marks role, unlocking the guide, quest board, shop and database |
 | ✅ **Drop Role** | Removes it. Progress, HM and history are all kept |
 
 Two buttons rather than one toggle because the message is shared by the whole
@@ -241,9 +255,12 @@ advantage rather than a display-only number.
 npm test
 ```
 
-80 checks, no network required: rank ladder parity with Heimdall, hiscores diff
+83 checks, no network required: rank ladder parity with Heimdall, hiscores diff
 maths, quest target generation, boss grouping, the panel ledger (growth,
-shrinkage, self-heal), the full permission matrix, the slash-command payload
+shrinkage, self-heal, and — now that the guide/quest board/shop live in
+separate channels — moving a panel to a new channel cleans up its old copy),
+the full permission matrix (including that `guide` and `shop` are genuinely
+separate channels from `quests`, not aliases of it), the slash-command payload
 against Discord's required-before-optional rule, registration scope sync (the
 duplicate-subcommand fix), and — against a fake Supabase client — that an
 active Boost actually changes the Rank XP a finished quest queues, that a

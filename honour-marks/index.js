@@ -112,8 +112,14 @@ async function refreshPanels(guildId) {
   const setup = await readSetup(guildId);
   if (!setup) return;
 
+  const guideCh = setup.channels.guide
+    ? await guild.channels.fetch(setup.channels.guide).catch(() => null)
+    : null;
   const questsCh = setup.channels.quests
     ? await guild.channels.fetch(setup.channels.quests).catch(() => null)
+    : null;
+  const shopCh = setup.channels.shop
+    ? await guild.channels.fetch(setup.channels.shop).catch(() => null)
     : null;
   const dbCh = setup.channels.database
     ? await guild.channels.fetch(setup.channels.database).catch(() => null)
@@ -125,13 +131,16 @@ async function refreshPanels(guildId) {
   if (claimCh) {
     await syncPanel(guildId, claimCh, "claim", renderClaimPanel(setup));
   }
+  // Guide, quest board and shop are three separate channels now — each one
+  // only has its own single panel, so there's no posting order to worry about.
+  if (guideCh) {
+    await syncPanel(guildId, guideCh, "guide", renderGuide(setup));
+  }
   if (questsCh) {
-    // Guide posts first so a brand-new channel reads top-to-bottom as
-    // "what is this" -> "the board" -> "the shop", the same order a
-    // first-timer should actually look at them in.
-    await syncPanel(guildId, questsCh, "guide", renderGuide(setup));
-    await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId));
-    await syncPanel(guildId, questsCh, "shop", await renderShop(guildId));
+    await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId, setup));
+  }
+  if (shopCh) {
+    await syncPanel(guildId, shopCh, "shop", await renderShop(guildId));
   }
   if (dbCh) {
     await syncPanel(guildId, dbCh, "database", await renderDatabase(guildId));
@@ -163,11 +172,12 @@ async function handleSetup(interaction) {
         logUserId: ownerId,
         channels: {
           claim: created.claim,
+          guide: created.guide,
           quests: created.quests,
+          shop: created.shop,
           database: created.database,
           staff: created.staff,
           log: created.log,
-          shop: created.quests, // shop panel lives in the quests channel
         },
       });
       await seedDefaults(guild.id);
@@ -182,7 +192,9 @@ async function handleSetup(interaction) {
         content:
           `✅ **Honour Marks is set up.**\n\n` +
           `• <#${setup.channels.claim}> — claim or drop the Honour Marks role\n` +
-          `• <#${setup.channels.quests}> — quest board and shop\n` +
+          `• <#${setup.channels.guide}> — how everything works\n` +
+          `• <#${setup.channels.quests}> — quest board\n` +
+          `• <#${setup.channels.shop}> — shop\n` +
           `• <#${setup.channels.database}> — member database\n` +
           `• <#${setup.channels.staff}> — staff channel\n` +
           `• <#${setup.channels.log}> — audit log (only you can see this)\n\n` +
@@ -200,7 +212,9 @@ async function handleSetup(interaction) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const claim = interaction.options.getChannel("claim");
+    const guide = interaction.options.getChannel("guide");
     const quests = interaction.options.getChannel("quests");
+    const shop = interaction.options.getChannel("shop");
     const database = interaction.options.getChannel("database");
     const staff = interaction.options.getChannel("staff");
     const log = interaction.options.getChannel("log");
@@ -212,8 +226,9 @@ async function handleSetup(interaction) {
       logUserId: interaction.user.id,
       channels: {
         claim: claim?.id || null,
+        guide: guide?.id || null,
         quests: quests.id,
-        shop: quests.id,
+        shop: shop.id,
         database: database.id,
         staff: staff?.id || null,
         log: log?.id || null,
@@ -227,7 +242,9 @@ async function handleSetup(interaction) {
       content:
         `✅ **Honour Marks bound to your channels.**\n\n` +
         (setup.channels.claim ? `• Claim / Drop role → <#${setup.channels.claim}>\n` : "• _No claim channel set — add one with `/setup manual claim:#channel`_\n") +
-        `• Quests + shop → <#${setup.channels.quests}>\n` +
+        (setup.channels.guide ? `• Guide → <#${setup.channels.guide}>\n` : "• _No guide channel set — add one with `/setup manual guide:#channel`_\n") +
+        `• Quests → <#${setup.channels.quests}>\n` +
+        `• Shop → <#${setup.channels.shop}>\n` +
         `• Database → <#${setup.channels.database}>\n` +
         (setup.channels.staff ? `• Staff → <#${setup.channels.staff}>\n` : "") +
         (setup.channels.log ? `• Log → <#${setup.channels.log}> (only you)\n` : "") +
@@ -785,8 +802,16 @@ async function handleClaimRole(interaction) {
   return interaction.editReply({
     content:
       `🎖️ **Honour Marks unlocked.**\n\n` +
-      `You now have access to <#${setup.channels.quests}> and <#${setup.channels.database}>.\n\n` +
-      `Head to <#${setup.channels.quests}> and press **Start a Solo Quest**. ` +
+      `You now have access to ` +
+      [
+        setup.channels.guide ? `<#${setup.channels.guide}>` : null,
+        setup.channels.quests ? `<#${setup.channels.quests}>` : null,
+        setup.channels.shop ? `<#${setup.channels.shop}>` : null,
+        setup.channels.database ? `<#${setup.channels.database}>` : null,
+      ].filter(Boolean).join(", ") +
+      `.\n\n` +
+      `New here? Start at ${setup.channels.guide ? `<#${setup.channels.guide}>` : "the guide channel"}. ` +
+      `Ready to go? Head to <#${setup.channels.quests}> and press **Start a Solo Quest**. ` +
       `If you ever want to drop the role, it's still at <#${setup.channels.claim}>.`,
   });
 }

@@ -59,27 +59,36 @@ class MessageStore extends Map {
   }
 }
 
+// A shared registry so a channel's `.client.channels.fetch(id)` can resolve
+// ANY channel made through makeChannel, not just itself — this is what
+// syncPanel uses to find and clean up a panel's old message after it's
+// reassigned to a different channel.
+const channelRegistry = new Map();
+const fakeClient = { channels: { fetch: async (id) => channelRegistry.get(id) || null } };
+
 /** Minimal channel double: tracks messages by id, supports send/fetch/delete. */
-function makeChannel() {
+function makeChannel(id = "chan-1") {
   const channel = {
-    id: "chan-1",
+    id,
+    client: fakeClient,
+    isTextBased: () => true,
     deletes: 0,
     sends: 0,
     edits: 0,
     async send(payload) {
-      const id = `msg-${++channel._nextId}`;
-      channel._nextId = channel._nextId || 0;
-      channel.messages.set(id, { id, ...payload });
+      const msgId = `msg-${channel.id}-${++channel._nextId}`;
+      channel.messages.set(msgId, { id: msgId, ...payload });
       channel.sends += 1;
       return {
-        id,
-        edit: async (p) => { Object.assign(channel.messages.get(id), p); channel.edits += 1; return true; },
-        delete: async () => { channel.messages.delete(id); channel.deletes += 1; return true; },
+        id: msgId,
+        edit: async (p) => { Object.assign(channel.messages.get(msgId), p); channel.edits += 1; return true; },
+        delete: async () => { channel.messages.delete(msgId); channel.deletes += 1; return true; },
       };
     },
   };
-  channel._nextId = 1;
+  channel._nextId = 0;
   channel.messages = new MessageStore(channel);
+  channelRegistry.set(id, channel);
   return channel;
 }
 
@@ -89,7 +98,7 @@ function page(n) {
 
 (async () => {
   const guildId = "g1";
-  const channel = makeChannel();
+  const channel = makeChannel("chan-1");
 
   console.log("\n[panel ledger]");
 
@@ -147,6 +156,23 @@ function page(n) {
   await syncPanel(guildId, channel, "quest_board", [page("only")]);
   assert.strictEqual(fake.db.hm_panels.filter((r) => r.panel_key === "quest_board").length, 1);
   check("shrinking to one page prunes the rest", () => {});
+
+  // ── 9. moving a panel to a different channel cleans up the old message ────
+  // This is what happens in practice when the guide/shop panels get split out
+  // of the quests channel into their own dedicated channels on an existing
+  // install: the ledger still points at the old channel until the next sync.
+  const otherChannel = makeChannel("chan-2");
+  await syncPanel(guildId, channel, "guide", [page("guide-0")]);
+  const oldMsgId = [...channel.messages.keys()].find((id) => channel.messages.get(id).embeds[0].page === "guide-0");
+  assert.ok(channel.messages.has(oldMsgId), "guide panel should exist in the original channel first");
+
+  const moveResult = await syncPanel(guildId, otherChannel, "guide", [page("guide-0")]);
+  assert.strictEqual(moveResult.posted, 1, "should repost in the new channel");
+  assert.ok(!channel.messages.has(oldMsgId), "stale message in the old channel should be deleted");
+  assert.strictEqual(otherChannel.messages.size, 1, "new channel should have exactly the one guide message");
+  const guideRow = fake.db.hm_panels.find((r) => r.panel_key === "guide");
+  assert.strictEqual(guideRow.channel_id, "chan-2", "ledger should now point at the new channel");
+  check("moving a panel to a new channel deletes the old copy and updates the ledger", () => {});
 
   console.log(`\n${passed} checks passed.\n`);
 })().catch((e) => {

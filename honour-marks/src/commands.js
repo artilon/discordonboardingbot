@@ -28,9 +28,11 @@ const raw = [
         // Required options MUST come before optional ones. Discord rejects the
         // entire command payload otherwise, which silently removes EVERY
         // command from the server — not just this subcommand.
-        .addChannelOption((o) => o.setName("quests").setDescription("Quest board + shop channel").setRequired(true))
+        .addChannelOption((o) => o.setName("quests").setDescription("Quest board channel").setRequired(true))
         .addChannelOption((o) => o.setName("database").setDescription("Database channel").setRequired(true))
+        .addChannelOption((o) => o.setName("shop").setDescription("Shop channel").setRequired(true))
         .addChannelOption((o) => o.setName("claim").setDescription("Channel with the Claim / Drop Role buttons"))
+        .addChannelOption((o) => o.setName("guide").setDescription("Channel for the how-it-works guide (optional)"))
         .addChannelOption((o) => o.setName("staff").setDescription("Staff channel (optional)"))
         .addChannelOption((o) => o.setName("log").setDescription("Audit log channel (optional)"))
         .addRoleOption((o) => o.setName("staff_role").setDescription("Role allowed to adjust HM"))

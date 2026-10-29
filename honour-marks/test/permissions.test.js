@@ -49,9 +49,23 @@ check("claim channel exists and is the clan-facing one", () => {
 
 check("every spec key the panel renderer expects exists", () => {
   const keys = CHANNEL_SPECS.map((s) => s.key);
-  for (const k of ["claim", "quests", "database", "staff", "log"]) {
+  for (const k of ["claim", "guide", "quests", "shop", "database", "staff", "log"]) {
     assert.ok(keys.includes(k), `missing ${k}`);
   }
+});
+
+check("guide and shop are their own channels, not aliases of quests", () => {
+  const byKey = Object.fromEntries(CHANNEL_SPECS.map((s) => [s.key, s]));
+  assert.notStrictEqual(byKey.guide.name, byKey.quests.name, "guide shares a channel name with quests");
+  assert.notStrictEqual(byKey.shop.name, byKey.quests.name, "shop shares a channel name with quests");
+  assert.notStrictEqual(byKey.guide.name, byKey.shop.name, "guide shares a channel name with shop");
+  assert.strictEqual(byKey.guide.audience, "honourMarks");
+  assert.strictEqual(byKey.shop.audience, "honourMarks");
+});
+
+check("every channel name is unique", () => {
+  const names = CHANNEL_SPECS.map((s) => s.name);
+  assert.strictEqual(new Set(names).size, names.length, "duplicate channel name in CHANNEL_SPECS");
 });
 
 console.log("\n[claim channel]");
