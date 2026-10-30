@@ -656,14 +656,17 @@ function renderGuide(setup = {}) {
         `category asks for: -2% at T1, -5% at T2, -10% at T3. Prices: 600 / 1,400 / 5,000 HM.\n\n` +
         `**💬 Slot 2 — Clan Chat XP Bonus** — raises the **Rank XP** (not HM — that's what Perks already do) a ` +
         `quest in that category pays: +2% / +5% / +10%. Prices: 900 / 1,750 / 10,062 HM.\n\n` +
-        `**📜 Slot 3 — Quest Expansion** — for Gathering, Production, Combat, Utility and Boss PvM, this adds ` +
-        `extra full-requirement targets: T1 adds 1 (2 total), T2 adds 2 (3 total), T3 adds 3 (4 total) — each ` +
-        `extra target needs the FULL normal requirement, same as any other target. For Raids and Minigames, ` +
-        `which only ever have one target, it instead adds +2% / +5% / +10% to that single target's requirement. ` +
+        `**📜 Slot 3 — Quest Expansion** — this one works differently depending on the category:\n` +
+        `• **Gathering, Production, Combat, Utility, Boss PvM** — adds extra full-requirement targets: ` +
+        `T1 adds 1 (2 total), T2 adds 2 (3 total), T3 adds 3 (4 total). Each extra target needs the FULL ` +
+        `normal requirement, same as any other target.\n` +
+        `• **Raids, Minigames** — these only ever have one target, so instead it adds +2% / +5% / +10% to ` +
+        `that single target's requirement.\n\n` +
         `Either way, the quest's ${HM_EMOJI} HM and Rank XP pay out **exactly proportionally** more for the ` +
         `extra work — a 4-target Quest Expansion skill quest pays 4× what a normal 1-target quest of the same ` +
-        `length pays, never a diminished rate. Prices: Gathering/Production/Combat/Utility/Boss PvM — ` +
-        `5,000 / 15,000 / 35,000 HM. Raids/Minigames — 2,000 / 6,000 / 18,000 HM.\n\n` +
+        `length pays, never a diminished rate.\n\n` +
+        `Prices: Gathering/Production/Combat/Utility/Boss PvM — 5,000 / 15,000 / 35,000 HM. ` +
+        `Raids/Minigames — 2,000 / 6,000 / 18,000 HM.\n\n` +
         `**Buying one:** open ${shopCh}, press **🗃️ Items**, and pick a purchase from the dropdown — it shows ` +
         `every slot across every category you haven't maxed, with its next tier's cost and effect. It's bought ` +
         `**immediately** if you can afford it, with no confirmation step.\n\n` +
