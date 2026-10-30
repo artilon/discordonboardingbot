@@ -186,7 +186,16 @@ async function fetchHiscores(rsn, { useCache = true } = {}) {
     const skills = {};
     for (const s of data.skills) {
       const mapped = SKILL_MAP[s.name];
-      if (mapped) skills[mapped] = { experience: Math.max(0, Number(s.xp) || 0) };
+      if (mapped) {
+        // `level` is captured alongside XP for the boss safety check and the
+        // weighted-skill-roll system — both need the player's actual current
+        // level, not an XP->level estimate. A negative/missing level (an
+        // unranked skill reports -1) floors to 1, same as a fresh account.
+        skills[mapped] = {
+          experience: Math.max(0, Number(s.xp) || 0),
+          level: Math.max(1, Number(s.level) || 1),
+        };
+      }
     }
     const bosses = {};
     for (const a of data.activities || []) {

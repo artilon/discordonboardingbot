@@ -6,6 +6,32 @@ const {
   BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys,
 } = require("./jagex");
 const { awardRankXp } = require("./xpqueue");
+const { safeBossPool, levelsFromSnapshot, pickEasiestBoss } = require("./bossSafety");
+
+// ── Shop item slots that affect quest generation/rewards ───────────────────
+// Lives here (not src/shop.js) because createPartyQuest/joinOpenTeam need to
+// read these for a whole roster without creating a circular import — shop.js
+// already depends on this file, not the other way around. The DB table and
+// slot values are unchanged from the original design; only slots 2 and 3 were
+// RE-PURPOSED (see comments below) rather than renamed, so no migration or
+// schema change was needed to bring them back.
+const ITEM_SLOT = {
+  REDUCTION: "quest_reduction",  // -2%/-5%/-10% off the XP/KC/clears/completions required
+  CLAN_CHAT_XP: "hm_bonus",      // was "HM Bonus" — repurposed to +2%/+5%/+10% RANK XP instead
+  EXPANSION: "boost_length",     // was "Boost Length Extension" — repurposed into "Quest Expansion"
+};
+const ITEM_PCT_BY_TIER = [0, 2, 5, 10]; // index = tier (0 = not owned)
+
+function itemPercentForTier(tier) {
+  return ITEM_PCT_BY_TIER[Math.max(0, Math.min(3, Number(tier) || 0))];
+}
+
+/** Mirrors shop.js's `perkBonusPercent` (tier * 5%) — kept as a one-line
+ *  constant here too, since this file can't import shop.js without creating
+ *  a cycle (shop.js already imports this file). */
+function perkPercentForTier(tier) {
+  return (Number(tier) || 0) * 5;
+}
 
 // ── Categories ───────────────────────────────────────────────────────────────
 const TREES = [
@@ -124,6 +150,84 @@ function pickRandom(arr, n) {
   return out;
 }
 
+/**
+ * Weighted skill rolls — a quest randomly rolling the same maxed skill over
+ * and over while the one a member actually needs never comes up was the
+ * whole complaint. Weight falls off linearly with level: a level-1 skill is
+ * ~99x as likely as a level-99 one, but never literally zero — a 99 is still
+ * technically reachable, just rare, same as the real odds of it mattering.
+ */
+function skillWeight(level) {
+  return Math.max(1, 100 - (Number(level) || 1));
+}
+
+/**
+ * Weighted sample of `n` skills without replacement. `levelsList` is one
+ * `{skillKey: level}` object per player being asked about — a single-element
+ * array for a solo quest, one per member for a team quest. For a team, each
+ * skill is weighted by the LOWEST level among the team for it, so the roll
+ * favours whatever's least developed for *anyone* on the team, not just
+ * whoever's worst overall. Falls back to a uniform `pickRandom` when no
+ * level data is available (e.g. existing callers that don't pass a baseline).
+ */
+function pickWeightedSkills(pool, n, levelsList) {
+  if (!levelsList || !levelsList.length) return pickRandom(pool, n);
+
+  const remaining = [...pool];
+  const out = [];
+  for (let i = 0; i < n && remaining.length; i++) {
+    const weights = remaining.map((skill) => {
+      const lowest = Math.min(...levelsList.map((lv) => Number(lv?.[skill]) || 1));
+      return skillWeight(lowest);
+    });
+    const total = weights.reduce((a, b) => a + b, 0);
+    let roll = Math.random() * total;
+    let idx = weights.length - 1;
+    for (let w = 0; w < weights.length; w++) {
+      roll -= weights[w];
+      if (roll <= 0) { idx = w; break; }
+    }
+    out.push(remaining.splice(idx, 1)[0]);
+  }
+  return out;
+}
+
+/**
+ * Picks up to `count` safe boss targets at `baseKc` each (the boss safety
+ * check — see src/bossSafety.js). If fewer than `count` bosses are actually
+ * safe for everyone involved (every snapshot in `snapshots` must individually
+ * qualify), every available safe boss is used instead and its required KC is
+ * scaled up by (count ÷ actual) so the total expected grind — and the reward
+ * it earns, via the caller's `rewardScale` — stays equivalent to what the
+ * full target count would have asked for. `snapshots` of `null`/empty skips
+ * the safety filter entirely (keeps old behaviour for callers that don't
+ * pass one, e.g. existing tests).
+ */
+function pickBossTargets(pool, count, baseKc, snapshots) {
+  let usePool = pool;
+  if (snapshots && (Array.isArray(snapshots) ? snapshots.length : true)) {
+    const safe = safeBossPool(pool, snapshots, bossKeys);
+    if (safe.length) {
+      usePool = safe;
+    } else {
+      // Nobody qualifies for anything on file — fall back to the single
+      // easiest boss in the pool rather than either blocking the quest
+      // entirely or silently ignoring the safety check. Its KC gets scaled
+      // up below exactly like any other partial-pool fallback.
+      usePool = [pickEasiestBoss(pool)];
+    }
+  }
+
+  const actual = Math.min(count, usePool.length);
+  const picked = pickRandom(usePool, actual);
+  const scale = actual > 0 ? count / actual : 1;
+  const kc = Math.round(baseKc * scale);
+
+  const out = {};
+  for (const b of picked) out[b] = kc;
+  return out;
+}
+
 function treeKind(tree) {
   if (tree === "boss") return "boss";
   if (tree === "raids") return "raid";
@@ -136,16 +240,32 @@ function treeKind(tree) {
 // same content for quest purposes.
 const SOLO_RAID_POOL = ["chambers_of_xeric", "theatre_of_blood", "tombs_of_amascut"];
 
-/** Which pool a solo quest in this category/type is drawn from, and how many targets it needs. */
-function soloTargetPool(tree, questType) {
+/**
+ * Which pool a solo quest in this category/type is drawn from, and how many
+ * targets it needs. `expansionTier` (0-3, from a member's Quest Expansion
+ * item) adds that many extra targets for skill/boss categories, clamped to
+ * however many actually exist in the pool — used by the hand-pick UI so its
+ * "select exactly N" always matches what the quest will really require.
+ */
+function soloTargetPool(tree, questType, expansionTier = 0) {
   const kind = treeKind(tree);
   const req = SOLO_REQUIREMENTS[kind][questType];
   if (!req) return null;
 
-  if (kind === "skill") return { kind, count: req.count || 1, value: req.xp, pool: SKILLS_BY_TREE[tree] || [] };
-  if (kind === "boss") return { kind, count: req.count || 1, value: req.kc, pool: BOSS_POOL };
-  if (kind === "raid") return { kind, count: req.count || 1, value: req.kc, pool: SOLO_RAID_POOL };
-  return { kind, count: req.count || 1, value: req.kc, pool: MINIGAME_BOSSES };
+  const baseCount = req.count || 1;
+  const wantsExtra = (kind === "skill" || kind === "boss") && expansionTier > 0;
+
+  if (kind === "skill") {
+    const pool = SKILLS_BY_TREE[tree] || [];
+    const count = wantsExtra ? Math.min(baseCount + expansionTier, pool.length) : baseCount;
+    return { kind, count, value: req.xp, pool };
+  }
+  if (kind === "boss") {
+    const count = wantsExtra ? Math.min(baseCount + expansionTier, BOSS_POOL.length) : baseCount;
+    return { kind, count, value: req.kc, pool: BOSS_POOL };
+  }
+  if (kind === "raid") return { kind, count: baseCount, value: req.kc, pool: SOLO_RAID_POOL };
+  return { kind, count: baseCount, value: req.kc, pool: MINIGAME_BOSSES };
 }
 
 /**
@@ -156,16 +276,43 @@ function soloTargetPool(tree, questType) {
  * (validated against the real pool) and they're used as-is. Anything missing
  * or invalid is topped up with a random pick from the same pool, so a bad
  * `picks` value can never produce a quest with no targets at all.
+ *
+ * `baseline` (a hiscores snapshot) and `effects` (from `aggregateTeamEffects`)
+ * are both optional and both new: `baseline` drives the weighted skill roll
+ * and the boss safety check for whatever's randomly filled in (hand-picked
+ * targets are never weighted or safety-filtered — that's an intentional,
+ * informed choice). `effects` applies owned Items (reduction/expansion) to
+ * the requirement before anything is rolled. Omitting either reproduces the
+ * exact old behaviour (plain uniform random, base requirement, untouched).
  */
-function buildSoloTargets(tree, questType, picks = null) {
+function buildSoloTargets(tree, questType, picks = null, baseline = null, effects = null) {
   const spec = soloTargetPool(tree, questType);
   if (!spec) return { skills: {}, bosses: {} };
-  const { kind, count, value, pool } = spec;
+  const { kind, pool } = spec;
+  const { count, value } = effects
+    ? applyItemEffects(kind, spec.count, spec.value, effects, pool.length)
+    : spec;
   const targets = { skills: {}, bosses: {} };
 
   let chosen = Array.isArray(picks) ? [...new Set(picks)].filter((p) => pool.includes(p)).slice(0, count) : [];
-  if (chosen.length < count) {
-    chosen = chosen.concat(pickRandom(pool.filter((p) => !chosen.includes(p)), count - chosen.length));
+  const need = count - chosen.length;
+
+  if (kind === "boss") {
+    for (const key of chosen) targets.bosses[key] = value; // hand-picked: base value, never safety-filtered
+    if (need > 0) {
+      const fillPool = pool.filter((p) => !chosen.includes(p));
+      Object.assign(targets.bosses, pickBossTargets(fillPool, need, value, baseline ? [baseline] : null));
+    }
+    return targets;
+  }
+
+  if (need > 0) {
+    const fillPool = pool.filter((p) => !chosen.includes(p));
+    chosen = chosen.concat(
+      kind === "skill" && baseline
+        ? pickWeightedSkills(fillPool, need, [levelsFromSnapshot(baseline)])
+        : pickRandom(fillPool, need)
+    );
   }
 
   const bucket = kind === "skill" ? targets.skills : targets.bosses;
@@ -173,24 +320,46 @@ function buildSoloTargets(tree, questType, picks = null) {
   return targets;
 }
 
-function buildPartyTargets(tree, size, difficulty) {
+/**
+ * Builds the shared target map for a team quest. `baselines` is the
+ * `{userId: snapshot}` map already fetched for the roster — used both for
+ * the weighted skill roll (weighted by the LOWEST level across the team per
+ * skill) and the boss safety check (every member must qualify). `effects`
+ * comes from `aggregateTeamEffects(roster, tree)`. Both optional, both
+ * reproduce the exact old uniform-random, unmodified-requirement behaviour
+ * when omitted.
+ */
+function buildPartyTargets(tree, size, difficulty, baselines = null, effects = null) {
   const kind = treeKind(tree);
   const req = PARTY_REQUIREMENTS[kind][size];
   const mult = PARTY_DIFFICULTY_MULT[difficulty] || 1;
   const targets = { skills: {}, bosses: {} };
+  const snapshots = baselines ? Object.values(baselines) : null;
+
+  const basePool = kind === "skill" ? (SKILLS_BY_TREE[tree] || [])
+    : kind === "boss" ? BOSS_POOL
+    : kind === "raid" ? SOLO_RAID_POOL
+    : MINIGAME_BOSSES;
+
+  const baseCount = req.count || 1;
+  const baseValue = req.xp || req.kc;
+  const { count, value } = effects
+    ? applyItemEffects(kind, baseCount, baseValue, effects, basePool.length)
+    : { count: baseCount, value: baseValue };
+  const scaledValue = Math.round(value * mult);
 
   if (kind === "skill") {
-    const skills = pickRandom(SKILLS_BY_TREE[tree] || [], req.count);
-    for (const s of skills) targets.skills[s] = Math.round(req.xp * mult);
+    const levelsList = snapshots ? snapshots.map(levelsFromSnapshot) : null;
+    const skills = levelsList ? pickWeightedSkills(basePool, count, levelsList) : pickRandom(basePool, count);
+    for (const s of skills) targets.skills[s] = scaledValue;
   } else if (kind === "boss") {
-    const picked = pickRandom(BOSS_POOL, req.count);
-    for (const b of picked) targets.bosses[b] = Math.round(req.kc * mult);
+    Object.assign(targets.bosses, pickBossTargets(basePool, count, scaledValue, snapshots));
   } else if (kind === "raid") {
-    const picked = pickRandom(["chambers_of_xeric", "theatre_of_blood", "tombs_of_amascut"], 1);
-    for (const r of picked) targets.bosses[r] = Math.round(req.kc * mult);
+    const picked = pickRandom(basePool, 1);
+    for (const r of picked) targets.bosses[r] = scaledValue;
   } else {
-    const picked = pickRandom(MINIGAME_BOSSES, req.count || 1);
-    for (const m of picked) targets.bosses[m] = Math.round(req.kc * mult);
+    const picked = pickRandom(basePool, count);
+    for (const m of picked) targets.bosses[m] = scaledValue;
   }
   return targets;
 }
@@ -252,6 +421,117 @@ async function getMember(userId) {
   if (!supabase) return null;
   const { data } = await supabase.from("hm_members").select("*").eq("user_id", userId).maybeSingle();
   return data || null;
+}
+
+/** Moved here from src/shop.js: createPartyQuest/joinOpenTeam need to read a
+ *  whole roster's perks/items without a circular import (shop.js already
+ *  imports this file). shop.js now imports these back for its own display
+ *  code instead of defining its own copies. */
+async function getPerks(userId) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const { data } = await supabase.from("hm_perks").select("*").eq("user_id", userId);
+  return data || [];
+}
+
+async function getPerkTier(userId, tree) {
+  const perks = await getPerks(userId);
+  return Number(perks.find((p) => p.tree === tree)?.tier) || 0;
+}
+
+async function getItems(userId) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const { data } = await supabase.from("hm_items").select("*").eq("user_id", userId);
+  return data || [];
+}
+
+async function getItemTier(userId, tree, slot) {
+  const items = await getItems(userId);
+  return Number(items.find((i) => i.tree === tree && i.slot === slot)?.tier) || 0;
+}
+
+/**
+ * Combines one member's (or a whole team's) Perk + Item ownership for one
+ * category into the numbers quest generation actually needs.
+ *
+ *   perkPct        — summed across the roster, boosts HM (Perks, unchanged mechanic)
+ *   reductionPct   — summed across the roster, lowers the XP/KC/clears/completions required
+ *   clanChatPct    — summed across the roster, boosts RANK XP (the repurposed "HM Bonus" slot)
+ *   expansionMaxTier — for skill/boss categories: the HIGHEST tier anyone on the
+ *                      roster owns. Summing this additively (like the percentage
+ *                      slots) would let a 4-person team demand 16 skills from a
+ *                      single Tier-3-each purchase, so it uses the strongest
+ *                      single member's tier instead of the total.
+ *   expansionPct   — for raids/minigames: summed across the roster like the
+ *                     other percentage slots, since it just raises the single
+ *                     target's requirement rather than adding more targets.
+ *
+ * A solo quest calls this with a one-member roster, which collapses all of
+ * the above to that member's own numbers — no special-casing needed.
+ */
+async function aggregateTeamEffects(roster, tree) {
+  const kind = treeKind(tree);
+  let perkPct = 0;
+  let reductionPct = 0;
+  let clanChatPct = 0;
+  let expansionMaxTier = 0;
+  let expansionPct = 0;
+
+  for (const m of roster) {
+    const uid = m.user_id;
+    const [perkTier, reductionTier, clanChatTier, expansionTier] = await Promise.all([
+      getPerkTier(uid, tree),
+      getItemTier(uid, tree, ITEM_SLOT.REDUCTION),
+      getItemTier(uid, tree, ITEM_SLOT.CLAN_CHAT_XP),
+      getItemTier(uid, tree, ITEM_SLOT.EXPANSION),
+    ]);
+    perkPct += perkPercentForTier(perkTier);
+    reductionPct += itemPercentForTier(reductionTier);
+    clanChatPct += itemPercentForTier(clanChatTier);
+    if (kind === "skill" || kind === "boss") {
+      expansionMaxTier = Math.max(expansionMaxTier, expansionTier);
+    } else {
+      expansionPct += itemPercentForTier(expansionTier);
+    }
+  }
+
+  return {
+    kind,
+    perkPct,
+    reductionPct: Math.min(reductionPct, 90), // defensive floor so a requirement never hits 0 or negative
+    clanChatPct,
+    expansionMaxTier,
+    expansionPct,
+  };
+}
+
+/**
+ * Turns a base requirement (count + per-target XP/KC) into the real one for
+ * this quest, after Item effects:
+ *   - Quest & Threshold Reduction always lowers the per-target value.
+ *   - Quest Expansion adds extra full-value targets for skill/boss categories
+ *     (clamped to however many actually exist in the pool), or raises the
+ *     single target's requirement by a percentage for raids/minigames.
+ * `rewardScale` is how much more the quest's HM/Rank XP should pay because of
+ * Expansion — 1 when nothing is expanded.
+ */
+function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength = Infinity) {
+  const reductionPct = effects.reductionPct || 0;
+  let value = Math.max(1, Math.round(baseValue * (1 - reductionPct / 100)));
+  let count = baseCount;
+  let rewardScale = 1;
+
+  if (kind === "skill" || kind === "boss") {
+    const wanted = baseCount + (effects.expansionMaxTier || 0);
+    count = Number.isFinite(poolLength) ? Math.min(wanted, poolLength) : wanted;
+    rewardScale = baseCount > 0 ? count / baseCount : 1;
+  } else if (effects.expansionPct) {
+    value = Math.round(value * (1 + effects.expansionPct / 100));
+    rewardScale = 1 + effects.expansionPct / 100;
+  }
+
+  return { count, value, rewardScale };
 }
 
 async function getMemberByRsn(guildId, rsn) {
@@ -342,7 +622,22 @@ async function createSoloQuest({ guildId, member, tree, questType, picks = null 
     };
   }
 
-  const targets = buildSoloTargets(tree, questType, picks);
+  // Perks (+HM%), the Clan Chat XP item (+Rank XP%), the Quest & Threshold
+  // Reduction item (-requirement%), and the Quest Expansion item (more
+  // targets/requirement, scaled reward) are all applied once, right here, at
+  // creation time — baked into the stored targets/hm_reward/rank_xp_reward so
+  // nothing downstream (progress.js, the boost multiplier, the completion
+  // flow) needs to know any of this exists.
+  const effects = await aggregateTeamEffects([member], tree);
+  const targets = buildSoloTargets(tree, questType, picks, baseline, effects);
+  const spec = soloTargetPool(tree, questType);
+  const { rewardScale } = spec ? applyItemEffects(spec.kind, spec.count, spec.value, effects, spec.pool.length) : { rewardScale: 1 };
+
+  const hmReward = Math.round(soloHmReward(questType) * rewardScale * (1 + effects.perkPct / 100));
+  const rankXpReward = Math.round(
+    (config.rankXp[`quest_solo_${questType}`] || 0) * rewardScale * (1 + effects.clanChatPct / 100)
+  );
+
   const now = new Date();
   const expires = new Date(now.getTime() + QUEST_DURATION_DAYS[questType] * 86400000);
 
@@ -354,8 +649,8 @@ async function createSoloQuest({ guildId, member, tree, questType, picks = null 
     difficulty: "normal",
     targets,
     baseline,
-    hm_reward: soloHmReward(questType),
-    rank_xp_reward: config.rankXp[`quest_solo_${questType}`] || 0,
+    hm_reward: hmReward,
+    rank_xp_reward: rankXpReward,
     created_at: now.toISOString(),
     expires_at: expires.toISOString(),
   });
@@ -425,7 +720,25 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty }) {
     baselines[m.user_id] = snap;
   }
 
-  const targets = buildPartyTargets(tree, size, difficulty);
+  // Same Perk/Item application as createSoloQuest, but aggregated across the
+  // whole roster per `aggregateTeamEffects`'s stacking rules (percentage
+  // effects sum across the team; Quest Expansion's extra-target-count effect
+  // uses the strongest single member's tier, not the sum, or a 4-person team
+  // could demand 16 targets from one Tier-3-each purchase).
+  const effects = await aggregateTeamEffects(roster, tree);
+  const targets = buildPartyTargets(tree, size, difficulty, baselines, effects);
+
+  const kind = treeKind(tree);
+  const baseReq = PARTY_REQUIREMENTS[kind][size];
+  const baseCount = baseReq.count || 1;
+  const basePool = kind === "skill" ? (SKILLS_BY_TREE[tree] || []) : kind === "boss" ? BOSS_POOL : null;
+  const { rewardScale } = applyItemEffects(kind, baseCount, baseReq.xp || baseReq.kc, effects, basePool ? basePool.length : Infinity);
+
+  const hmReward = Math.round(partyHmReward(size, difficulty) * rewardScale * (1 + effects.perkPct / 100));
+  const rankXpReward = Math.round(
+    (config.rankXp[`quest_party_${size}`] || 0) * rewardScale * (1 + effects.clanChatPct / 100)
+  );
+
   const now = new Date();
   const expires = new Date(now.getTime() + PARTY_DURATION_DAYS * 86400000);
 
@@ -437,8 +750,8 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty }) {
     members: unique,
     targets,
     baseline: baselines,
-    hm_reward: partyHmReward(size, difficulty),
-    rank_xp_reward: config.rankXp[`quest_party_${size}`] || 0,
+    hm_reward: hmReward,
+    rank_xp_reward: rankXpReward,
     created_at: now.toISOString(),
     expires_at: expires.toISOString(),
   });
@@ -701,4 +1014,10 @@ module.exports = {
   getOpenTeams, getOpenTeamForUser, createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
   awardRankXp,
   diffProgress, fetchHiscores, cleanRsn,
+  // Perks/Items (moved/added here so a whole team roster can be read without
+  // a circular import — see the comment above aggregateTeamEffects).
+  getPerks, getPerkTier, getItems, getItemTier, ITEM_SLOT, ITEM_PCT_BY_TIER,
+  itemPercentForTier, perkPercentForTier, aggregateTeamEffects, applyItemEffects,
+  // Weighted skill rolls + the boss safety check's pool-filtering entry point.
+  skillWeight, pickWeightedSkills, pickBossTargets,
 };

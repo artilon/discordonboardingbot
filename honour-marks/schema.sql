@@ -185,6 +185,18 @@ create table if not exists public.hm_perks (
   primary key (user_id, tree)
 );
 
+-- This table predates the Items shop tier going live and was carried over
+-- unused. Its `slot` values keep their original column names for zero
+-- migration cost, but two of the three now mean something different from
+-- what the name suggests — no ALTER needed, this is purely a semantic note
+-- for anyone reading the schema cold:
+--   'quest_reduction' -> Slot 1, Quest & Threshold Reduction (name still matches: unchanged)
+--   'hm_bonus'        -> Slot 2, Clan Chat XP Bonus (renamed in product; this slot now
+--                         boosts RANK XP, not HM, despite the column value's name)
+--   'boost_length'     -> Slot 3, Quest Expansion (an entirely new mechanic reusing
+--                         this otherwise-dead enum value)
+-- See src/quests.js's ITEM_SLOT map for the single source of truth tying
+-- these raw strings back to their current meaning.
 create table if not exists public.hm_items (
   user_id    text not null,
   guild_id   text not null,
