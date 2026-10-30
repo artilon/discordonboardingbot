@@ -494,8 +494,10 @@ function renderGuide(setup = {}) {
         `**Durations**, counted from the moment you start (not from any clock reset): Daily = 1 day, ` +
         `Weekly = 7 days, Monthly = 30 days.\n\n` +
         `**Picking a target.** After you choose a category, the bot normally rolls a random skill or boss from ` +
-        `it for you. If you own a 🎯 Quest Choice Token (Page 10), you'll instead be offered a choice between ` +
-        `hand-picking the exact target yourself or rolling randomly anyway.\n\n` +
+        `it for you. If you own a 🎯 Quest Choice Token (Page 13), you'll instead be offered a choice between ` +
+        `hand-picking the exact target yourself or rolling randomly anyway. **Raids are the one exception** — ` +
+        `you always pick exactly which raid yourself, for free, with no random option and no token needed ` +
+        `(see Page 4 for why).\n\n` +
         `**Exact requirements**, by category type and length — when a quest needs more than one target, EACH ` +
         `one individually needs the full amount shown below; they are never split or added together:\n\n` +
         `**Skill categories** (Gathering, Production, Combat, Utility) — gain this much XP in one skill ` +
@@ -540,7 +542,12 @@ function renderGuide(setup = {}) {
         `Inferno) — note that regular TzTok-Jad (the Fight Caves) IS in the pool above; it's only the Inferno ` +
         `version that's excluded.\n\n` +
         `**Raids** are always one of Chambers of Xeric, Theatre of Blood, or Tombs of Amascut. Any difficulty ` +
-        `mode (Normal, Challenge Mode / Hard Mode / Expert Mode) counts identically toward the same clear count.\n\n` +
+        `mode (Normal, Challenge Mode / Hard Mode / Expert Mode) counts identically toward the same clear count. ` +
+        `**Unlike Boss PvM, a Raid is never rolled at random** — the three raids are different enough encounters ` +
+        `that a random pick could easily land on one you or your team can't actually do. Starting (or posting) ` +
+        `a Raids quest always stops first and asks exactly which raid you want, for free, whether or not you ` +
+        `own a 🎯 Quest Choice Token — the token stays untouched either way, since there's nothing left to spend ` +
+        `it on once you're always choosing anyway.\n\n` +
         `**Minigames** are rolled from: Guardians of the Rift, Wintertodt, Tempoross, Soul Wars, and Last Man ` +
         `Standing. One completion = one full round, as counted by the OSRS hiscores for that activity.\n\n` +
         `All of this applies to BOTH solo and team quests — team quests draw from exactly the same pools, just ` +
@@ -563,7 +570,7 @@ function renderGuide(setup = {}) {
         `skip it and let the bot roll one at random (the token stays in your inventory either way if you ` +
         `skip it). This is the ONLY point a hand-pick can happen — teammates and later joiners never get this ` +
         `choice, and it's locked in before the team is finalized specifically so that anyone browsing the ` +
-        `**Looking For Group** board can see the chosen target before deciding whether to join (Page 5).\n` +
+        `**Looking For Group** board can see the chosen target before deciding whether to join (Page 6).\n` +
         `4. Choose how to fill the rest of the team:\n` +
         `　• **Pick Teammates** — a member picker opens where you select the exact number of other people ` +
         `needed (1 for Duo, 2 for Trio, 3 for Quad). Everyone picked must already be registered with ` +
@@ -595,7 +602,7 @@ function renderGuide(setup = {}) {
         `you're signing up for before you join.\n\n` +
         `**Posting a listing, step by step:**\n` +
         `1. Press **👥 Start a Team Quest** → pick a size → pick a category, exactly like a normal team quest. ` +
-        `If you own a Quest Choice Token, this is also where you'd hand-pick the team's target (Page 4) — do ` +
+        `If you own a Quest Choice Token, this is also where you'd hand-pick the team's target (Page 5) — do ` +
         `it here, before posting, and it'll show on the board for everyone.\n` +
         `2. On the "how do you want to fill it" screen, press **📋 Post Open Listing** instead of Pick Teammates.\n` +
         `3. You're now the first member of an open listing, and it appears on the LFG board immediately.\n` +
@@ -630,7 +637,7 @@ function renderGuide(setup = {}) {
         `4. If you're on a team quest, it also shows the whole team's combined progress (and pays everyone out ` +
         `if the team just finished).\n` +
         `5. If you own any 🎫 Quest Skip Tokens AND have an active solo quest, cancel buttons appear underneath ` +
-        `so you can scrap a quest you don't want anymore (Page 10).\n\n` +
+        `so you can scrap a quest you don't want anymore (Page 13).\n\n` +
         `**How the percentage is calculated.** If a quest only has one target, the percentage shown is simply ` +
         `your progress toward it. If it has more than one target (e.g. a Monthly skill quest needs 2 skills), ` +
         `the percentage is the **average** across all of them — a quest only actually finishes once **every ` +
@@ -806,9 +813,9 @@ function renderGuide(setup = {}) {
         `**automatically refunded** and the error message confirms it.\n\n` +
         `**Team quests work too — creator only.** Whoever creates a team quest and picks its category can ` +
         `spend a Quest Choice Token on the team's shared target the same way, right after picking the ` +
-        `category and before the team is finalized (Page 4). Teammates and anyone who later joins from the ` +
+        `category and before the team is finalized (Page 5). Teammates and anyone who later joins from the ` +
         `Looking For Group board never get this choice — only the creator — and for an open listing the pick ` +
-        `is locked in and shown on the board (Page 5) before anyone joins. The refund rule is identical: if ` +
+        `is locked in and shown on the board (Page 6) before anyone joins. The refund rule is identical: if ` +
         `the team or listing fails to come together for any reason after the token is spent, it's ` +
         `automatically refunded to the creator.\n\n` +
         `Both tokens stack — you can own several of either at once.`,
@@ -847,7 +854,7 @@ function renderGuide(setup = {}) {
         `• Team Duo — 750 (per member) • Team Trio — 1,200 (per member) • Team Quad — 2,000 (per member)\n\n` +
         `A Boost only ever multiplies the quest's own Rank XP number above — it never touches tenure XP, and ` +
         `it's capped at whichever single boost is strongest if you somehow have more than one active for the ` +
-        `same category (Page 9).\n\n` +
+        `same category (Page 12).\n\n` +
         `**The full rank ladder**, in order — the same one Heimdall shows on the member list:\n${rankLadder}`,
     },
     {
