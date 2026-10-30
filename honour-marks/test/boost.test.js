@@ -22,6 +22,7 @@ const fake = createFakeSupabase({
   hm_members: [],
   hm_party_quests: [],
   hm_party_quest_completions: [],
+  hm_inventory: [],
   pending_rank_xp: [],
 });
 
@@ -46,7 +47,7 @@ require.cache[jagexPath] = {
   exports: { ...realJagex, fetchHiscores: async () => nextSnapshot },
 };
 
-const { getBoostMultiplier, BOOST_TIERS, consumeItem, grantConsumable } = require("../src/shop");
+const { getBoostMultiplier, BOOST_TIERS, consumeItem, grantConsumable, createSoloQuestWithChoiceToken } = require("../src/shop");
 const { checkSoloQuests, completePartyQuest } = require("../src/progress");
 const { awardRankXp } = require("../src/xpqueue");
 const { cancelSoloQuest } = require("../src/quests");
@@ -227,6 +228,65 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
     const result = await cancelSoloQuest("someone-else", 7001);
     assert.ok(result.error);
     assert.ok(fake.db.hm_quests.some((q) => q.id === 7001), "the quest must still exist — it wasn't this user's to cancel");
+  });
+
+  console.log("\n[quest choice token — refunded on any creation failure, not just the obvious one]");
+  await check("a rejected quest creation refunds a consumed Choice Token", async () => {
+    const member = { user_id: "u-choice-1", guild_id: "g1", rsn: "u-choice-1" };
+    fake.db.hm_members.push(member);
+    nextSnapshot = { skills: { mining: { experience: 20000 } }, bosses: {} };
+
+    // Already holding an active daily quest for this tree/type is the most
+    // common way createSoloQuest rejects — but the fix covers every reason,
+    // not just this one (see the assertion below using a period-cap reject).
+    fake.db.hm_quests.push({
+      id: 8000, guild_id: "g1", user_id: member.user_id, quest_type: "daily", tree: "gathering",
+      targets: {}, baseline: {}, hm_reward: 50,
+    });
+
+    const result = await createSoloQuestWithChoiceToken({
+      guildId: "g1", member, tree: "gathering", questType: "daily", picks: ["mining"], tokenConsumed: true,
+    });
+    assert.ok(result.error, "the creation attempt itself must still fail");
+    assert.strictEqual(result.refunded, true, "the token must come back");
+
+    const inv = fake.db.hm_inventory.find((i) => i.user_id === member.user_id && i.tree === "quest_choice_token");
+    assert.strictEqual(inv?.quantity, 1, "exactly one token landed back in the inventory");
+  });
+
+  await check("a rejected creation that never consumed a token refunds nothing", async () => {
+    const member = { user_id: "u-choice-2", guild_id: "g1", rsn: "u-choice-2" };
+    fake.db.hm_members.push(member);
+    fake.db.hm_quests.push({
+      id: 8001, guild_id: "g1", user_id: member.user_id, quest_type: "daily", tree: "combat",
+      targets: {}, baseline: {}, hm_reward: 50,
+    });
+
+    const result = await createSoloQuestWithChoiceToken({
+      guildId: "g1", member, tree: "combat", questType: "daily", picks: null, tokenConsumed: false,
+    });
+    assert.ok(result.error);
+    assert.strictEqual(result.refunded, false);
+    assert.ok(
+      !fake.db.hm_inventory.some((i) => i.user_id === member.user_id && i.tree === "quest_choice_token"),
+      "nothing was spent, so nothing should appear in the inventory"
+    );
+  });
+
+  await check("a successful creation with a consumed token never refunds", async () => {
+    const member = { user_id: "u-choice-3", guild_id: "g1", rsn: "u-choice-3" };
+    fake.db.hm_members.push(member);
+    nextSnapshot = { skills: { mining: { experience: 20000 } }, bosses: {} };
+
+    const result = await createSoloQuestWithChoiceToken({
+      guildId: "g1", member, tree: "gathering", questType: "weekly", picks: ["mining"], tokenConsumed: true,
+    });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.refunded, false, "the quest was actually created, so the token stays spent");
+    assert.ok(
+      !fake.db.hm_inventory.some((i) => i.user_id === member.user_id && i.tree === "quest_choice_token"),
+      "no refund entry should exist"
+    );
   });
 
   console.log("\n[consumables — grant/consume are real inventory operations]");

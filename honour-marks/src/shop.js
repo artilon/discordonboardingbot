@@ -1,6 +1,6 @@
 "use strict";
 const { getSupabase } = require("./db");
-const { TREES, TREE_BY_KEY } = require("./quests");
+const { TREES, TREE_BY_KEY, createSoloQuest } = require("./quests");
 
 /**
  * Shop, simplified from the original four-track system to three:
@@ -297,6 +297,28 @@ async function consumeItem(userId, key) {
   return true;
 }
 
+/**
+ * A Quest Choice Token is spent BEFORE the quest it pays for is known to
+ * actually succeed — `createSoloQuest` can still reject the attempt for any
+ * number of reasons that have nothing to do with the picks themselves
+ * (already have one of this type, already used this period, a hiscores read
+ * failure, a DB hiccup). Spending the token and then letting the quest fail
+ * anyway used to just eat it for nothing; this refunds it whenever that
+ * happens, the same way a Skip Token already refunds itself on a failed
+ * cancel. `tokenConsumed` should be `false` when the member didn't spend a
+ * token at all (the random-roll path), in which case this behaves exactly
+ * like a plain `createSoloQuest` call.
+ */
+async function createSoloQuestWithChoiceToken({ guildId, member, tree, questType, picks, tokenConsumed }) {
+  const result = await createSoloQuest({ guildId, member, tree, questType, picks: tokenConsumed ? picks : null });
+
+  if (result.error && tokenConsumed) {
+    const refunded = await grantConsumable(member.user_id, guildId, "quest_choice_token");
+    return { ...result, tokenConsumed, refunded };
+  }
+  return { ...result, tokenConsumed, refunded: false };
+}
+
 async function activateBoost({ guildId, userId, tree, tier }) {
   const supabase = getSupabase();
   const spec = BOOST_TIERS.find((t) => t.tier === Number(tier));
@@ -333,5 +355,6 @@ module.exports = {
   perkBonusPercent, boostBonusLabel,
   getBalance, getPerks, getPerkTier, getInventory, getActiveBoosts, getBoostMultiplier,
   tryDebit, buyPerk, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
+  createSoloQuestWithChoiceToken,
   TREES,
 };
