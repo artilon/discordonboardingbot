@@ -29,9 +29,10 @@ const {
 const { SKILL_LABELS, bossLabel } = require("./src/jagex");
 const { checkSoloQuests, checkPartyQuest, completePartyQuest, sweepExpiredQuests } = require("./src/progress");
 const {
-  PERK_TIERS, BOOST_TIERS, CONSUMABLES, perkBonusPercent, boostBonusLabel,
-  getBalance, getPerks, getPerkTier, getInventory, getActiveBoosts,
-  buyPerk, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
+  PERK_TIERS, BOOST_TIERS, CONSUMABLES, ITEM_CATALOG, ITEM_SLOT, ITEM_SLOT_LABEL,
+  perkBonusPercent, boostBonusLabel,
+  getBalance, getPerks, getPerkTier, getItems, getItemTier, getItemTiers, getInventory, getActiveBoosts,
+  buyPerk, buyItem, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
   createSoloQuestWithChoiceToken,
 } = require("./src/shop");
 const {
@@ -542,7 +543,13 @@ async function handleTreeChosen(interaction, questType, tree) {
 
 /** Shows the pool for this category so the member can pick their own target(s). */
 async function handleQuestChoose(interaction, questType, tree) {
-  const spec = soloTargetPool(tree, questType);
+  // A Quest Expansion item raises how many targets this quest actually needs
+  // (skills/bosses only — Raids/Minigames expand via a % instead, which
+  // doesn't change the hand-pick UI at all), so the "select exactly N" here
+  // has to account for it or a Tier-2+ owner would be stuck unable to pick
+  // the real target count.
+  const expansionTier = await getItemTier(interaction.user.id, tree, ITEM_SLOT.EXPANSION);
+  const spec = soloTargetPool(tree, questType, expansionTier);
   if (!spec || !spec.pool.length) {
     return handleCreateSolo(interaction, questType, tree);
   }
@@ -1039,6 +1046,94 @@ async function handleBuyPerk(interaction, tree) {
   });
 }
 
+const ITEM_SLOT_EMOJI = {
+  [ITEM_SLOT.REDUCTION]: "📉",
+  [ITEM_SLOT.CLAN_CHAT_XP]: "💬",
+  [ITEM_SLOT.EXPANSION]: "📜",
+};
+
+async function handleShopItems(interaction) {
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) {
+    return interaction.reply({ content: "Run `/register` first.", flags: MessageFlags.Ephemeral });
+  }
+
+  const options = [];
+  for (const t of TREES) {
+    const owned = await getItemTiers(interaction.user.id, t.key);
+    for (const slot of Object.values(ITEM_SLOT)) {
+      const catalog = ITEM_CATALOG[t.key][slot];
+      const ownedTier = owned[slot] || 0;
+      if (ownedTier >= catalog.length) continue; // maxed — nothing to sell
+      const next = catalog[ownedTier];
+      options.push(
+        new StringSelectMenuOptionBuilder()
+          .setLabel(`${t.label} — ${ITEM_SLOT_LABEL[slot]} T${next.tier} (${next.cost.toLocaleString()} HM)`)
+          .setValue(`${t.key}:${slot}`)
+          .setEmoji(ITEM_SLOT_EMOJI[slot])
+          .setDescription(`${next.name}: ${next.effect}`.slice(0, 100))
+      );
+    }
+  }
+
+  if (!options.length) {
+    return interaction.reply({
+      embeds: [emptyPage("🗃️ Items", "You already own every item at maximum tier, in every slot, in every category.").embed],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  return interaction.reply({
+    embeds: [
+      emptyPage(
+        "🗃️ Items — what these actually do",
+        `Items are **permanent**, like Perks, but each slot changes something different about a quest instead ` +
+        `of just adding HM. Every category (${TREES.map((t) => t.label).join(", ")}) has all three slots, 3 tiers ` +
+        `each, bought in order. Buying any slot for a category applies to BOTH your solo quests and any team ` +
+        `quest you're on in that category (Perks work the same way) — and on a team, these all add together ` +
+        `across whoever owns them, except Quest Expansion's extra-target-COUNT effect (skills/Boss PvM), which ` +
+        `uses whoever on the team owns the highest tier instead of adding everyone's together.\n\n` +
+        `**📉 Quest & Threshold Reduction** — lowers the XP/KC/clears/completions a quest asks for: -2%/-5%/-10%.\n` +
+        `**💬 Clan Chat XP Bonus** — raises the **Rank XP** (not HM) a quest pays: +2%/+5%/+10%.\n` +
+        `**📜 Quest Expansion** — for Gathering/Production/Combat/Utility/Boss PvM, adds 1/2/3 extra full targets ` +
+        `(2/3/4 total); for Raids/Minigames, instead adds +2%/+5%/+10% to the single target. Either way, the ` +
+        `quest's HM and Rank XP pay out proportionally more for the extra work — never less.\n\n` +
+        `Pick a purchase below.`
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("hm_buy_item")
+          .setPlaceholder("Buy an item…")
+          .addOptions(options.slice(0, 25))
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleBuyItem(interaction, value) {
+  await interaction.deferUpdate();
+  const [tree, slot] = value.split(":");
+  const result = await buyItem({ guildId: interaction.guildId, userId: interaction.user.id, tree, slot });
+
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Purchase failed", result.error).embed], components: [] });
+  }
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        "🗃️ Item purchased",
+        `**${result.name}** — ${TREE_BY_KEY[tree].label} ${ITEM_SLOT_LABEL[slot]}, tier **${result.tier}**.\n\n` +
+        `Cost \`${result.cost.toLocaleString()}\` • Balance \`${result.balance.toLocaleString()}\``
+      ).embed,
+    ],
+    components: [],
+  });
+}
+
 async function handleShopBoosts(interaction) {
   const member = await getMember(interaction.user.id);
   if (!member?.rsn) {
@@ -1185,6 +1280,7 @@ async function handleInventory(interaction) {
   const inv = await getInventory(interaction.user.id);
   const boosts = await getActiveBoosts(interaction.user.id);
   const perks = await getPerks(interaction.user.id);
+  const items = await getItems(interaction.user.id);
 
   const boostLines = inv.filter((i) => i.boost_tier > 0).map((i) => {
     const spec = BOOST_TIERS.find((t) => t.tier === i.boost_tier);
@@ -1200,6 +1296,10 @@ async function handleInventory(interaction) {
   const perkLines = perks.map(
     (p) => `• ${TREE_BY_KEY[p.tree]?.label || p.tree} — T${p.tier} (+${perkBonusPercent(p.tier)}%)`
   );
+  const itemLines = items.map((i) => {
+    const name = ITEM_CATALOG[i.tree]?.[i.slot]?.[i.tier - 1]?.name || i.slot;
+    return `• ${TREE_BY_KEY[i.tree]?.label || i.tree} — ${ITEM_SLOT_LABEL[i.slot] || i.slot} T${i.tier} (${name})`;
+  });
 
   const rows = [];
   const boostOptions = inv
@@ -1229,6 +1329,7 @@ async function handleInventory(interaction) {
         .setDescription(`You hold **${bal.balance.toLocaleString()}** ${HM_EMOJI}`)
         .addFields(
           { name: "Perks", value: perkLines.join("\n") || "_None_", inline: false },
+          { name: "Items", value: itemLines.join("\n") || "_None_", inline: false },
           { name: "Boosts owned", value: boostLines.join("\n") || "_None_", inline: false },
           { name: "Consumables", value: consumableLines.join("\n") || "_None_", inline: false },
           { name: "Active boosts", value: activeLines.join("\n") || "_None_", inline: false }
@@ -1325,6 +1426,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "hm_claim_role": return await handleClaimRole(interaction);
         case "hm_drop_role": return await handleDropRole(interaction);
         case "hm_shop_perks": return await handleShopPerks(interaction);
+        case "hm_shop_items": return await handleShopItems(interaction);
         case "hm_shop_boosts": return await handleShopBoosts(interaction);
         case "hm_shop_consumables": return await handleShopConsumables(interaction);
         case "hm_lfg_cancel_mine": return await handleLfgCancelMine(interaction);
@@ -1357,6 +1459,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (id === "hm_buy_perk") {
         return await handleBuyPerk(interaction, interaction.values[0]);
+      }
+      if (id === "hm_buy_item") {
+        return await handleBuyItem(interaction, interaction.values[0]);
       }
       if (id === "hm_activate_boost") {
         return await handleActivateBoost(interaction, interaction.values[0]);
