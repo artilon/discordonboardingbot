@@ -1166,10 +1166,18 @@ async function handleBuyConsumable(interaction, key) {
 async function handleGuideOpen(interaction) {
   const setup = await readSetup(interaction.guildId);
   const pages = renderGuide(setup || {});
-  return interaction.reply({
-    embeds: pages.map((p) => p.embed),
-    flags: MessageFlags.Ephemeral,
-  });
+  // Discord caps a single message at 10 embeds, and this guide has grown well
+  // past that — send it as however many ephemeral messages it takes instead
+  // of silently dropping the tail pages (or erroring outright) past #10.
+  const EMBEDS_PER_MESSAGE = 10;
+  for (let i = 0; i < pages.length; i += EMBEDS_PER_MESSAGE) {
+    const batch = pages.slice(i, i + EMBEDS_PER_MESSAGE).map((p) => p.embed);
+    if (i === 0) {
+      await interaction.reply({ embeds: batch, flags: MessageFlags.Ephemeral });
+    } else {
+      await interaction.followUp({ embeds: batch, flags: MessageFlags.Ephemeral });
+    }
+  }
 }
 
 async function handleInventory(interaction) {
