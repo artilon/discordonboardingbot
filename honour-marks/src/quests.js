@@ -329,38 +329,66 @@ function buildSoloTargets(tree, questType, picks = null, baseline = null, effect
  * reproduce the exact old uniform-random, unmodified-requirement behaviour
  * when omitted.
  */
-function buildPartyTargets(tree, size, difficulty, baselines = null, effects = null) {
-  const kind = treeKind(tree);
-  const req = PARTY_REQUIREMENTS[kind][size];
+/**
+ * Builds the shared target map for a team quest. `baselines` is the
+ * `{userId: snapshot}` map already fetched for the roster — used both for
+ * the weighted skill roll (weighted by the LOWEST level across the team per
+ * skill) and the boss safety check (every member must qualify). `effects`
+ * comes from `aggregateTeamEffects(roster, tree)`. Both optional, both
+ * reproduce the exact old uniform-random, unmodified-requirement behaviour
+ * when omitted.
+ *
+ * `picks` is how a team creator's Quest Choice Token hand-picks the shared
+ * target(s) up front, before the roster is even finalized — see
+ * `partyTargetPool`. Pass the exact skill/boss/raid/minigame keys they chose
+ * (validated against the real pool); anything missing or invalid is topped
+ * up with a random (or weighted, for skills) pick the same way an un-picked
+ * quest would be. Hand-picked bosses are never safety-filtered, same as the
+ * solo flow. Whenever `picks` is non-empty, `applyItemEffects` is told to
+ * lock the skill/boss count to the un-expanded base — a hand-pick is made
+ * before the final roster (and its Items) are known, so Quest Expansion's
+ * extra-target math can't safely apply on top of it; `createPartyQuest`
+ * mirrors this with the same `{ locked }` flag so the reward never implies
+ * more targets than were actually set.
+ */
+function buildPartyTargets(tree, size, difficulty, baselines = null, effects = null, picks = null) {
+  const spec = partyTargetPool(tree, size);
+  if (!spec) return { skills: {}, bosses: {} };
+  const { kind, pool } = spec;
   const mult = PARTY_DIFFICULTY_MULT[difficulty] || 1;
   const targets = { skills: {}, bosses: {} };
   const snapshots = baselines ? Object.values(baselines) : null;
 
-  const basePool = kind === "skill" ? (SKILLS_BY_TREE[tree] || [])
-    : kind === "boss" ? BOSS_POOL
-    : kind === "raid" ? SOLO_RAID_POOL
-    : MINIGAME_BOSSES;
-
-  const baseCount = req.count || 1;
-  const baseValue = req.xp || req.kc;
+  const hasPicks = Array.isArray(picks) && picks.length > 0;
   const { count, value } = effects
-    ? applyItemEffects(kind, baseCount, baseValue, effects, basePool.length)
-    : { count: baseCount, value: baseValue };
+    ? applyItemEffects(kind, spec.count, spec.value, effects, pool.length, { locked: hasPicks })
+    : spec;
   const scaledValue = Math.round(value * mult);
 
-  if (kind === "skill") {
-    const levelsList = snapshots ? snapshots.map(levelsFromSnapshot) : null;
-    const skills = levelsList ? pickWeightedSkills(basePool, count, levelsList) : pickRandom(basePool, count);
-    for (const s of skills) targets.skills[s] = scaledValue;
-  } else if (kind === "boss") {
-    Object.assign(targets.bosses, pickBossTargets(basePool, count, scaledValue, snapshots));
-  } else if (kind === "raid") {
-    const picked = pickRandom(basePool, 1);
-    for (const r of picked) targets.bosses[r] = scaledValue;
-  } else {
-    const picked = pickRandom(basePool, count);
-    for (const m of picked) targets.bosses[m] = scaledValue;
+  let chosen = hasPicks ? [...new Set(picks)].filter((p) => pool.includes(p)).slice(0, count) : [];
+  const need = count - chosen.length;
+
+  if (kind === "boss") {
+    for (const key of chosen) targets.bosses[key] = scaledValue; // hand-picked: never safety-filtered
+    if (need > 0) {
+      const fillPool = pool.filter((p) => !chosen.includes(p));
+      Object.assign(targets.bosses, pickBossTargets(fillPool, need, scaledValue, snapshots));
+    }
+    return targets;
   }
+
+  if (need > 0) {
+    const fillPool = pool.filter((p) => !chosen.includes(p));
+    const levelsList = snapshots ? snapshots.map(levelsFromSnapshot) : null;
+    chosen = chosen.concat(
+      kind === "skill" && levelsList
+        ? pickWeightedSkills(fillPool, need, levelsList)
+        : pickRandom(fillPool, need)
+    );
+  }
+
+  const bucket = kind === "skill" ? targets.skills : targets.bosses;
+  for (const key of chosen) bucket[key] = scaledValue;
   return targets;
 }
 
@@ -516,22 +544,69 @@ async function aggregateTeamEffects(roster, tree) {
  * `rewardScale` is how much more the quest's HM/Rank XP should pay because of
  * Expansion — 1 when nothing is expanded.
  */
-function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength = Infinity) {
+/**
+ * Turns a base requirement (count + per-target XP/KC) into the real one for
+ * this quest, after Item effects:
+ *   - Quest & Threshold Reduction always lowers the per-target value.
+ *   - Quest Expansion adds extra full-value targets for skill/boss categories
+ *     (clamped to however many actually exist in the pool), or raises the
+ *     single target's requirement by a percentage for raids/minigames.
+ * `rewardScale` is how much more the quest's HM/Rank XP should pay because of
+ * Expansion — 1 when nothing is expanded.
+ *
+ * `options.locked` is set when a Quest Choice Token has hand-picked the exact
+ * target set for a TEAM quest, before the roster (and therefore everyone's
+ * Item ownership) is even fully known — see buildPartyTargets. It pins the
+ * skill/boss count back to the un-expanded base count instead of applying
+ * `expansionMaxTier`, the same way the boss safety check and weighted skill
+ * rolls already don't apply to a hand-pick. It has no effect on the
+ * raids/minigames percentage branch, since picking which raid/minigame
+ * doesn't interact with that mechanic at all.
+ */
+function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength = Infinity, options = {}) {
   const reductionPct = effects.reductionPct || 0;
   let value = Math.max(1, Math.round(baseValue * (1 - reductionPct / 100)));
   let count = baseCount;
   let rewardScale = 1;
 
   if (kind === "skill" || kind === "boss") {
-    const wanted = baseCount + (effects.expansionMaxTier || 0);
-    count = Number.isFinite(poolLength) ? Math.min(wanted, poolLength) : wanted;
-    rewardScale = baseCount > 0 ? count / baseCount : 1;
+    if (options.locked) {
+      count = Number.isFinite(poolLength) ? Math.min(baseCount, poolLength) : baseCount;
+      rewardScale = 1;
+    } else {
+      const wanted = baseCount + (effects.expansionMaxTier || 0);
+      count = Number.isFinite(poolLength) ? Math.min(wanted, poolLength) : wanted;
+      rewardScale = baseCount > 0 ? count / baseCount : 1;
+    }
   } else if (effects.expansionPct) {
     value = Math.round(value * (1 + effects.expansionPct / 100));
     rewardScale = 1 + effects.expansionPct / 100;
   }
 
   return { count, value, rewardScale };
+}
+
+/**
+ * Which pool a TEAM quest in this category/size is drawn from, and how many
+ * targets it needs — the team-quest equivalent of `soloTargetPool`, used by
+ * the "hand-pick your team's target" UI (a Quest Choice Token, spent only by
+ * whoever is creating/posting the team, before anyone else has joined or the
+ * listing exists). Deliberately does NOT take a Quest Expansion tier like
+ * `soloTargetPool` does — unlike a solo quest, a team's Item ownership isn't
+ * fully known until every member is in, which for an open listing can be
+ * hours after this pick is made. `buildPartyTargets`/`applyItemEffects`'s
+ * `locked` option is what actually enforces that the hand-picked count stays
+ * authoritative once the roster (and its Items) are finally resolved.
+ */
+function partyTargetPool(tree, size) {
+  const kind = treeKind(tree);
+  const req = PARTY_REQUIREMENTS[kind]?.[size];
+  if (!req) return null;
+
+  if (kind === "skill") return { kind, count: req.count || 1, value: req.xp, pool: SKILLS_BY_TREE[tree] || [] };
+  if (kind === "boss") return { kind, count: req.count || 1, value: req.kc, pool: BOSS_POOL };
+  if (kind === "raid") return { kind, count: 1, value: req.kc, pool: SOLO_RAID_POOL };
+  return { kind, count: req.count || 1, value: req.kc, pool: MINIGAME_BOSSES };
 }
 
 async function getMemberByRsn(guildId, rsn) {
@@ -686,7 +761,7 @@ async function cancelSoloQuest(userId, questId) {
   return { ok: true };
 }
 
-async function createPartyQuest({ guildId, members, tree, size, difficulty }) {
+async function createPartyQuest({ guildId, members, tree, size, difficulty, picks = null }) {
   const supabase = getSupabase();
   if (!supabase) return { error: "Database unavailable." };
   if (!TREE_BY_KEY[tree]) return { error: "Unknown category." };
@@ -726,13 +801,17 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty }) {
   // uses the strongest single member's tier, not the sum, or a 4-person team
   // could demand 16 targets from one Tier-3-each purchase).
   const effects = await aggregateTeamEffects(roster, tree);
-  const targets = buildPartyTargets(tree, size, difficulty, baselines, effects);
+  const targets = buildPartyTargets(tree, size, difficulty, baselines, effects, picks);
 
-  const kind = treeKind(tree);
-  const baseReq = PARTY_REQUIREMENTS[kind][size];
-  const baseCount = baseReq.count || 1;
-  const basePool = kind === "skill" ? (SKILLS_BY_TREE[tree] || []) : kind === "boss" ? BOSS_POOL : null;
-  const { rewardScale } = applyItemEffects(kind, baseCount, baseReq.xp || baseReq.kc, effects, basePool ? basePool.length : Infinity);
+  // A hand-picked target (from the creator's Quest Choice Token) locks the
+  // skill/boss count to the un-expanded base — see buildPartyTargets — so the
+  // reward-scale math here has to use the exact same `{ locked }` flag or the
+  // payout could imply more targets than the quest actually has.
+  const hasPicks = Array.isArray(picks) && picks.length > 0;
+  const spec = partyTargetPool(tree, size);
+  const { rewardScale } = applyItemEffects(
+    spec.kind, spec.count, spec.value, effects, spec.pool.length, { locked: hasPicks }
+  );
 
   const hmReward = Math.round(partyHmReward(size, difficulty) * rewardScale * (1 + effects.perkPct / 100));
   const rankXpReward = Math.round(
@@ -803,7 +882,15 @@ async function getOpenTeamForUser(guildId, userId) {
   return data || null;
 }
 
-async function createOpenTeam({ guildId, posterId, size, tree }) {
+/**
+ * `picks` lets the poster hand-pick the shared target with a Quest Choice
+ * Token before anyone else can even see the listing — so when it finally
+ * shows up on the Looking For Group board, the target is already locked in
+ * and visible to anyone deciding whether to join (see `renderOpenTeams`).
+ * It's stored as-is on the listing row and only turned into real quest
+ * targets later, by `joinOpenTeam`, once the roster is actually complete.
+ */
+async function createOpenTeam({ guildId, posterId, size, tree, picks = null }) {
   const supabase = getSupabase();
   if (!supabase) return { error: "Database unavailable." };
   if (!PARTY_SIZES[size]) return { error: "Unknown team size." };
@@ -824,6 +911,7 @@ async function createOpenTeam({ guildId, posterId, size, tree }) {
     team_size: size,
     categories: [tree],
     members: [posterId],
+    picks: Array.isArray(picks) && picks.length ? picks : null,
   });
 
   if (error) {
@@ -887,7 +975,9 @@ async function joinOpenTeam({ guildId, postId, userId }) {
   const nextMembers = [...post.members, userId];
 
   if (nextMembers.length >= expected) {
-    const result = await createPartyQuest({ guildId, members: nextMembers, tree, size: post.team_size, difficulty: "easy" });
+    const result = await createPartyQuest({
+      guildId, members: nextMembers, tree, size: post.team_size, difficulty: "easy", picks: post.picks,
+    });
     if (result.error) return result;
 
     await supabase.from("hm_lfg_posts").delete().eq("id", postId).eq("guild_id", guildId);
@@ -1006,7 +1096,8 @@ module.exports = {
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
   SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY_MULT, PARTY_SIZES, LFG_EXPIRY_HOURS,
   QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD,
-  buildSoloTargets, buildPartyTargets, soloTargetPool, soloHmReward, partyHmReward,
+  buildSoloTargets, buildPartyTargets, soloTargetPool, partyTargetPool, treeKind,
+  soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestForUser,

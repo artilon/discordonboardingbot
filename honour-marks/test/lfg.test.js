@@ -163,6 +163,43 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
     await cancelOpenTeam("g1", "poster-6");
   });
 
+  console.log("\n[LFG — a hand-picked target is stored on the listing and honoured when it fills]");
+
+  await check("a hand-picked target is stored on the listing so a browser can see it before joining", async () => {
+    registerMember("poster-pick");
+    const posted = await createOpenTeam({ guildId: "g1", posterId: "poster-pick", size: "duo", tree: "boss", picks: ["zulrah"] });
+    assert.strictEqual(posted.ok, true, posted.error);
+
+    const [post] = await getOpenTeams("g1");
+    assert.deepStrictEqual(post.picks, ["zulrah"], "visible on the listing row itself, before anyone has joined");
+    await cancelOpenTeam("g1", "poster-pick");
+  });
+
+  await check("a listing posted with no pick stores no picks (rolls at random when it fills)", async () => {
+    registerMember("poster-nopick");
+    await createOpenTeam({ guildId: "g1", posterId: "poster-nopick", size: "duo", tree: "boss" });
+    const [post] = await getOpenTeams("g1");
+    assert.ok(post.picks == null);
+    await cancelOpenTeam("g1", "poster-nopick");
+  });
+
+  await check("a hand-picked target survives into the real quest once the listing fills", async () => {
+    registerMember("poster-pick2");
+    registerMember("joiner-pick2");
+    await createOpenTeam({ guildId: "g1", posterId: "poster-pick2", size: "duo", tree: "boss", picks: ["zulrah"] });
+    const [post] = await getOpenTeams("g1");
+
+    const result = await joinOpenTeam({ guildId: "g1", postId: post.id, userId: "joiner-pick2" });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.started, true);
+
+    const party = fake.db.hm_party_quests.find((p) =>
+      p.members.includes("poster-pick2") && p.members.includes("joiner-pick2")
+    );
+    assert.ok(party);
+    assert.deepStrictEqual(Object.keys(party.targets.bosses), ["zulrah"], "the pick made at post-time is what the real quest actually targets");
+  });
+
   console.log("\n[LFG — unfilled listings expire]");
 
   await check("a listing older than the expiry window is swept away", async () => {

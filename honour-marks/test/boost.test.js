@@ -23,6 +23,7 @@ const fake = createFakeSupabase({
   hm_party_quests: [],
   hm_party_quest_completions: [],
   hm_inventory: [],
+  hm_lfg_posts: [],
   pending_rank_xp: [],
 });
 
@@ -47,7 +48,10 @@ require.cache[jagexPath] = {
   exports: { ...realJagex, fetchHiscores: async () => nextSnapshot },
 };
 
-const { getBoostMultiplier, BOOST_TIERS, consumeItem, grantConsumable, createSoloQuestWithChoiceToken } = require("../src/shop");
+const {
+  getBoostMultiplier, BOOST_TIERS, consumeItem, grantConsumable,
+  createSoloQuestWithChoiceToken, createPartyQuestWithChoiceToken, createOpenTeamWithChoiceToken,
+} = require("../src/shop");
 const { checkSoloQuests, completePartyQuest } = require("../src/progress");
 const { awardRankXp } = require("../src/xpqueue");
 const { cancelSoloQuest } = require("../src/quests");
@@ -287,6 +291,91 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
       !fake.db.hm_inventory.some((i) => i.user_id === member.user_id && i.tree === "quest_choice_token"),
       "no refund entry should exist"
     );
+  });
+
+  console.log("\n[team quest choice token — the creator's hand-pick, refunded the same way]");
+  await check("a rejected team creation refunds a consumed Choice Token", async () => {
+    await Promise.all([
+      ["t-choice-creator", "t-choice-creator"],
+      ["t-choice-mate", "t-choice-mate"],
+    ].map(([id, rsn]) => fake.db.hm_members.push({ user_id: id, guild_id: "g1", rsn })));
+    nextSnapshot = { skills: { mining: { experience: 20000 } }, bosses: {} };
+
+    // The teammate is already on another active team quest — createPartyQuest
+    // rejects for a reason that has nothing to do with the hand-pick itself.
+    fake.db.hm_party_quests.push({
+      id: 9000, guild_id: "g1", tree: "gathering", size: "duo", difficulty: "easy",
+      members: ["t-choice-mate", "someone-else"], targets: {}, baseline: {}, hm_reward: 100,
+      expires_at: new Date(Date.now() + 86400000).toISOString(),
+    });
+
+    const result = await createPartyQuestWithChoiceToken({
+      guildId: "g1", members: ["t-choice-creator", "t-choice-mate"], tree: "gathering", size: "duo",
+      difficulty: "easy", picks: ["mining"], tokenConsumed: true, userId: "t-choice-creator",
+    });
+    assert.ok(result.error, "the creation attempt itself must still fail");
+    assert.strictEqual(result.refunded, true, "the token must come back to the CREATOR, not the teammate");
+
+    const inv = fake.db.hm_inventory.find((i) => i.user_id === "t-choice-creator" && i.tree === "quest_choice_token");
+    assert.strictEqual(inv?.quantity, 1);
+    assert.ok(
+      !fake.db.hm_inventory.some((i) => i.user_id === "t-choice-mate" && i.tree === "quest_choice_token"),
+      "the teammate never spent anything, so never gets refunded"
+    );
+  });
+
+  await check("a successful team creation with a consumed token never refunds", async () => {
+    fake.db.hm_members.push({ user_id: "t-choice-ok", guild_id: "g1", rsn: "t-choice-ok" });
+    fake.db.hm_members.push({ user_id: "t-choice-ok-mate", guild_id: "g1", rsn: "t-choice-ok-mate" });
+    nextSnapshot = { skills: { mining: { experience: 20000 } }, bosses: {} };
+
+    const result = await createPartyQuestWithChoiceToken({
+      guildId: "g1", members: ["t-choice-ok", "t-choice-ok-mate"], tree: "gathering", size: "duo",
+      difficulty: "easy", picks: ["mining", "fishing"], tokenConsumed: true, userId: "t-choice-ok",
+    });
+    assert.strictEqual(result.ok, true, result.error);
+    assert.strictEqual(result.refunded, false);
+    assert.ok(!fake.db.hm_inventory.some((i) => i.user_id === "t-choice-ok" && i.tree === "quest_choice_token"));
+
+    const row = fake.db.hm_party_quests.find((r) => r.members.includes("t-choice-ok"));
+    assert.deepStrictEqual(
+      Object.keys(row.targets.skills).sort(), ["fishing", "mining"],
+      "both hand-picked targets were used, matching the duo's base count of 2 exactly"
+    );
+  });
+
+  await check("a rejected open-listing post refunds a consumed Choice Token", async () => {
+    fake.db.hm_members.push({ user_id: "t-lfg-choice", guild_id: "g1", rsn: "t-lfg-choice" });
+    // Already has an open listing — createOpenTeam rejects before a quest
+    // even exists, which is exactly when this token is spent.
+    fake.db.hm_lfg_posts.push({
+      id: 500, guild_id: "g1", poster_id: "t-lfg-choice", team_size: "duo",
+      categories: ["boss"], members: ["t-lfg-choice"], picks: null,
+      created_at: new Date().toISOString(),
+    });
+
+    const result = await createOpenTeamWithChoiceToken({
+      guildId: "g1", posterId: "t-lfg-choice", size: "trio", tree: "boss",
+      picks: ["zulrah"], tokenConsumed: true,
+    });
+    assert.ok(result.error);
+    assert.strictEqual(result.refunded, true);
+    const inv = fake.db.hm_inventory.find((i) => i.user_id === "t-lfg-choice" && i.tree === "quest_choice_token");
+    assert.strictEqual(inv?.quantity, 1);
+  });
+
+  await check("a successful open-listing post with a consumed token stores the picks for everyone to see", async () => {
+    fake.db.hm_members.push({ user_id: "t-lfg-ok", guild_id: "g1", rsn: "t-lfg-ok" });
+
+    const result = await createOpenTeamWithChoiceToken({
+      guildId: "g1", posterId: "t-lfg-ok", size: "trio", tree: "boss",
+      picks: ["zulrah"], tokenConsumed: true,
+    });
+    assert.strictEqual(result.ok, true, result.error);
+    assert.strictEqual(result.refunded, false);
+
+    const post = fake.db.hm_lfg_posts.find((p) => p.poster_id === "t-lfg-ok");
+    assert.deepStrictEqual(post.picks, ["zulrah"], "picks are stored on the listing row itself, not just in memory");
   });
 
   console.log("\n[consumables — grant/consume are real inventory operations]");
