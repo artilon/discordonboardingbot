@@ -111,6 +111,11 @@ const WEEKLY_EVENTS_ANCHOR_DATE      = { year: 2026, month: 10, day: 23 }; // Fr
 const WEEKLY_EVENTS_ANCHOR_ISO       = "2026-10-23T00:00:00-05:00"; // First SOTW starts Friday, Oct 23, 2026 at 00:00 Central
 const FRACTURED_ARCHIVES_UNLOCK_DATE = "2027-04-21"; // 6-month restriction from 2026-10-21
 
+// Weekly HiScores Snapshot & Recap (posted every Sunday at 5:00 PM Central)
+const WEEKLY_RECAP_CHANNEL_ID   = "1546413698979995678";
+const WEEKLY_RECAP_HOUR         = 17; // 5:00 PM, 24h clock, America/Chicago
+const WEEKLY_RECAP_ANCHOR_DATE  = { year: 2026, month: 11, day: 1 }; // First recap posts Sunday, Nov 1, 2026 at 17:00 Central
+
 const OSRS_SKILLS = [
   { name: "Attack",       hiscoreNames: ["Attack"] },
   { name: "Strength",     hiscoreNames: ["Strength"] },
@@ -200,6 +205,24 @@ const OSRS_BOSSES = [
   { name: "TzKal-Zuk",                          hiscoreNames: ["TzKal-Zuk"] },
   { name: "Sol Heredit",                        hiscoreNames: ["Sol Heredit"] },
 ];
+
+// ---- Weekly Recap boss/activity pools ----
+// Raids get their own leaderboard category instead of being lumped in with regular PvM.
+const RAID_NAMES = ["Chambers of Xeric", "Theatre of Blood", "Tombs of Amascut", "The Fractured Archives"];
+const RAID_BOSS_ENTRIES = OSRS_BOSSES.filter((b) => RAID_NAMES.includes(b.name));
+
+// The clan only tracks these three minigames for the "most popular minigame" category.
+const OSRS_MINIGAMES = [
+  { name: "Wintertodt",             hiscoreNames: ["Wintertodt"] },
+  { name: "Guardians of the Rift",  hiscoreNames: ["Rifts closed", "Guardians of the Rift"] },
+  { name: "Tempoross",              hiscoreNames: ["Tempoross"] },
+];
+const MINIGAME_NAMES = OSRS_MINIGAMES.map((m) => m.name);
+
+// Regular PvM pool = every OSRS_BOSSES entry that isn't a raid or one of the tracked minigames.
+const PVM_BOSS_ENTRIES = OSRS_BOSSES.filter(
+  (b) => !RAID_NAMES.includes(b.name) && !MINIGAME_NAMES.includes(b.name)
+);
 
 const VOICE_CATEGORIES = [
   {
@@ -394,6 +417,7 @@ const getOnboardingChannel = () => getChannelById(ONBOARDING_CHANNEL_ID, "Onboar
 const getStaffAlertChannel = () => getChannelById(STAFF_ALERT_CHANNEL_ID, "StaffAlert");
 const getRankListChannel   = () => getChannelById(RANK_LIST_CHANNEL_ID, "RankList");
 const getRankLogChannel    = () => getChannelById(RANK_LOG_CHANNEL_ID, "RankLog");
+const getWeeklyRecapChannel = () => getChannelById(WEEKLY_RECAP_CHANNEL_ID, "WeeklyRecap");
 
 // Collect up to `pages` x 100 recent messages (newest first).
 async function fetchRecentMessages(channel, pages) {
@@ -1326,6 +1350,389 @@ function extractHiscoreMetric(hiscoreData, eventType, targetName) {
     }
   }
   return totalKills;
+}
+
+// ================= WEEKLY HISCORES SNAPSHOT & RECAP =================
+// Every Sunday at 5:00 PM Central, Heimdall snapshots every active member's OSRS
+// hiscores (skills + bosses/raids/minigames) plus their current Rank XP, diffs
+// that snapshot against the one taken the previous Sunday, and posts a recap
+// embed summarizing the week's top performers to WEEKLY_RECAP_CHANNEL_ID.
+
+function getRecapWindowByIndex(weekIndex) {
+  const endCal = addCalendarDays(
+    WEEKLY_RECAP_ANCHOR_DATE.year,
+    WEEKLY_RECAP_ANCHOR_DATE.month,
+    WEEKLY_RECAP_ANCHOR_DATE.day,
+    weekIndex * 7
+  );
+  const startCal = addCalendarDays(
+    WEEKLY_RECAP_ANCHOR_DATE.year,
+    WEEKLY_RECAP_ANCHOR_DATE.month,
+    WEEKLY_RECAP_ANCHOR_DATE.day,
+    weekIndex * 7 - 7
+  );
+
+  const startsAtMs = centralTimeToUtcMs(startCal.year, startCal.month, startCal.day, WEEKLY_RECAP_HOUR, 0, 0);
+  const endsAtMs = centralTimeToUtcMs(endCal.year, endCal.month, endCal.day, WEEKLY_RECAP_HOUR, 0, 0);
+
+  return {
+    weekIndex,
+    weekKey: endCal.isoDate, // the Sunday this recap covers, e.g. "2026-11-01"
+    startsAtMs,
+    endsAtMs,
+    startsAtIso: new Date(startsAtMs).toISOString(),
+    endsAtIso: new Date(endsAtMs).toISOString(),
+  };
+}
+
+// Finds the most recently completed recap window (the latest Sunday 5pm Central
+// boundary that has already passed, relative to `asOfDate`), or null if the very
+// first recap window hasn't happened yet.
+function findMostRecentCompletedRecapWindow(asOfDate = new Date()) {
+  const nowMs = (asOfDate instanceof Date ? asOfDate : new Date(asOfDate)).getTime();
+  const week0 = getRecapWindowByIndex(0);
+  if (nowMs < week0.endsAtMs) return null;
+
+  const approxWeekMs = 7 * 24 * 60 * 60 * 1000;
+  let idx = Math.max(0, Math.floor((nowMs - week0.endsAtMs) / approxWeekMs));
+  while (getRecapWindowByIndex(idx + 1).endsAtMs <= nowMs) idx++;
+  while (idx > 0 && getRecapWindowByIndex(idx).endsAtMs > nowMs) idx--;
+  return getRecapWindowByIndex(idx);
+}
+
+function extractMemberHiscoreSnapshot(hiscoreData) {
+  const skills = {};
+  const activities = {};
+  if (hiscoreData && typeof hiscoreData === "object") {
+    for (const s of Array.isArray(hiscoreData.skills) ? hiscoreData.skills : []) {
+      if (!s || !s.name) continue;
+      const xp = Number(s.xp);
+      skills[s.name] = Number.isFinite(xp) && xp > 0 ? xp : 0;
+    }
+    for (const a of Array.isArray(hiscoreData.activities) ? hiscoreData.activities : []) {
+      if (!a || !a.name) continue;
+      const score = Number(a.score);
+      activities[a.name] = Number.isFinite(score) && score > 0 ? score : 0;
+    }
+  }
+  return { skills, activities };
+}
+
+function sumSkillGain(prevSkills, currSkills, skillName) {
+  const prevXp = Number(prevSkills?.[skillName]) || 0;
+  const currXp = Number(currSkills?.[skillName]) || 0;
+  return Math.max(0, currXp - prevXp);
+}
+
+// Sums the gain across every raw hiscores entry that matches `hiscoreNames`
+// (handles grouped bosses like "Dagannoth Kings" that span multiple hiscores rows).
+function sumActivityGain(prevActivities, currActivities, hiscoreNames) {
+  const matchNames = new Set((hiscoreNames || []).map(normalizeHiscoreName));
+  const rawNames = new Set([
+    ...Object.keys(prevActivities || {}),
+    ...Object.keys(currActivities || {}),
+  ]);
+  let gained = 0;
+  for (const rawName of rawNames) {
+    if (!matchNames.has(normalizeHiscoreName(rawName))) continue;
+    const prevVal = Number(prevActivities?.[rawName]) || 0;
+    const currVal = Number(currActivities?.[rawName]) || 0;
+    gained += Math.max(0, currVal - prevVal);
+  }
+  return gained;
+}
+
+function topN(entries, n = 5) {
+  return entries
+    .filter((e) => e.amount > 0)
+    .sort((a, b) => (b.amount !== a.amount ? b.amount - a.amount : a.name.localeCompare(b.name)))
+    .slice(0, n);
+}
+
+function formatLeaderboardLines(entries, unitLabel) {
+  if (!entries || entries.length === 0) {
+    return `*No clan members gained ${unitLabel} this week.*`;
+  }
+  const medals = ["🥇", "🥈", "🥉"];
+  return entries
+    .map((e, idx) => {
+      const prefix = idx < 3 ? `${medals[idx]} ` : `\`#${idx + 1}\` `;
+      return `${prefix}**${e.name}** — **+${e.amount.toLocaleString()} ${unitLabel}**`;
+    })
+    .join("\n");
+}
+
+async function loadPreviousRecapSnapshots(supabase, beforeWeekKey) {
+  const byRsn = new Map();
+  if (!supabase) return byRsn;
+  try {
+    const { data, error } = await supabase
+      .from("weekly_recap_snapshots")
+      .select("*")
+      .lt("week_key", beforeWeekKey)
+      .order("week_key", { ascending: false })
+      .limit(2000);
+    if (error || !data || data.length === 0) return byRsn;
+
+    const latestWeekKey = data[0].week_key;
+    for (const row of data) {
+      if (row.week_key !== latestWeekKey) continue;
+      byRsn.set(String(row.rsn).trim().toLowerCase(), row);
+    }
+  } catch (e) {
+    console.error("[WeeklyRecap] Could not load previous snapshots:", e.message);
+  }
+  return byRsn;
+}
+
+async function saveRecapSnapshots(supabase, rows) {
+  if (!supabase || !rows || rows.length === 0) return;
+  try {
+    await supabase.from("weekly_recap_snapshots").upsert(rows, { onConflict: "week_key,rsn" });
+  } catch (e) {
+    console.error("[WeeklyRecap] Could not save snapshots:", e.message);
+  }
+}
+
+// Top 5 Honour Marks earned this week, read straight from the Honour Marks
+// ledger (`hm_transactions`) and resolved to a display name via `hm_members`.
+async function computeHonourMarksLeaderboard(supabase, window) {
+  if (!supabase) return [];
+  try {
+    const { data: txRows, error: txErr } = await supabase
+      .from("hm_transactions")
+      .select("user_id, delta")
+      .gte("created_at", window.startsAtIso)
+      .lt("created_at", window.endsAtIso)
+      .gt("delta", 0);
+    if (txErr || !txRows || txRows.length === 0) return [];
+
+    const totals = new Map();
+    for (const row of txRows) {
+      const uid = String(row.user_id);
+      totals.set(uid, (totals.get(uid) || 0) + (Number(row.delta) || 0));
+    }
+
+    const userIds = [...totals.keys()];
+    const { data: memberRows } = await supabase
+      .from("hm_members")
+      .select("user_id, rsn, display_name")
+      .in("user_id", userIds);
+    const nameByUserId = new Map((memberRows || []).map((m) => [String(m.user_id), m]));
+
+    const entries = userIds.map((uid) => {
+      const m = nameByUserId.get(uid);
+      const name = (m && (m.display_name || m.rsn)) || `User ${uid}`;
+      return { name, amount: totals.get(uid) };
+    });
+
+    return topN(entries, 5);
+  } catch (e) {
+    console.error("[WeeklyRecap] Could not compute Honour Marks leaderboard:", e.message);
+    return [];
+  }
+}
+
+function buildWeeklyRecapEmbed(window, data) {
+  const dateLabel = window.weekKey;
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("📊 Weekly Clan Recap")
+    .setDescription(`Highlights from the week ending **${dateLabel}** (Sunday 5:00 PM Central).`)
+    .addFields(
+      { name: "🏆 Top 5 XP Gainers", value: formatLeaderboardLines(data.xpGainers, "XP"), inline: false },
+      { name: "⚔️ Top 5 PvMers", value: formatLeaderboardLines(data.pvmers, "Kills"), inline: false },
+      { name: "🛡️ Top 5 Raiders", value: formatLeaderboardLines(data.raiders, "Completions"), inline: false },
+      { name: "📈 Top 5 Rank XP Earners", value: formatLeaderboardLines(data.rankXpEarners, "Rank XP"), inline: false },
+      { name: "🪙 Top 5 Honour Marks Earners", value: formatLeaderboardLines(data.hmEarners, "Honour Marks"), inline: false },
+      {
+        name: "💪 Most Trained Skill",
+        value: data.mostTrainedSkill
+          ? `**${data.mostTrainedSkill.name}** — +${data.mostTrainedSkill.amount.toLocaleString()} XP clan-wide`
+          : "*No skill XP was gained this week.*",
+        inline: true,
+      },
+      {
+        name: "💀 Most Killed Boss",
+        value: data.mostKilledBoss
+          ? `**${data.mostKilledBoss.name}** — +${data.mostKilledBoss.amount.toLocaleString()} KC clan-wide`
+          : "*No boss kills were recorded this week.*",
+        inline: true,
+      },
+      {
+        name: "🗿 Most Popular Raid",
+        value: data.mostPopularRaid
+          ? `**${data.mostPopularRaid.name}** — +${data.mostPopularRaid.amount.toLocaleString()} completions clan-wide`
+          : "*No raids were completed this week.*",
+        inline: true,
+      },
+      {
+        name: "🎮 Most Popular Minigame",
+        value: data.mostPopularMinigame
+          ? `**${data.mostPopularMinigame.name}** — +${data.mostPopularMinigame.amount.toLocaleString()} completions clan-wide`
+          : "*No minigames were completed this week.*",
+        inline: true,
+      }
+    )
+    .setFooter({ text: "Odinheim Heimdall — Weekly Recap" })
+    .setTimestamp(new Date());
+
+  return { embeds: [embed] };
+}
+
+async function runWeeklyRecap(window, now = new Date()) {
+  const supabase = getSupabase();
+  if (!supabase) return null;
+
+  // Idempotency guard: if this week's snapshot already exists, it was already
+  // processed (e.g. the bot restarted right after posting). Don't post twice.
+  try {
+    const { data: already } = await supabase
+      .from("weekly_recap_snapshots")
+      .select("rsn")
+      .eq("week_key", window.weekKey)
+      .limit(1);
+    if (already && already.length > 0) return null;
+  } catch (e) {
+    console.error("[WeeklyRecap] Idempotency check failed:", e.message);
+  }
+
+  const { data: memberRows, error } = await supabase
+    .from("clan_members")
+    .select("*")
+    .eq("active", true);
+  if (error) {
+    console.error("[WeeklyRecap] Could not read clan_members:", error.message);
+    return null;
+  }
+  const members = (memberRows || []).filter((m) => m && String(m.rsn || "").trim());
+  if (members.length === 0) return null;
+
+  const prevByRsn = await loadPreviousRecapSnapshots(supabase, window.weekKey);
+  const isFirstRun = prevByRsn.size === 0;
+
+  const nowIso = (now instanceof Date ? now : new Date(now)).toISOString();
+  const snapshotRows = [];
+
+  const xpGainers = [];
+  const pvmers = [];
+  const raiders = [];
+  const rankXpEarners = [];
+  const skillTotals = new Map(OSRS_SKILLS.map((s) => [s.name, 0]));
+  const bossTotals = new Map(PVM_BOSS_ENTRIES.map((b) => [b.name, 0]));
+  const raidTotals = new Map(RAID_BOSS_ENTRIES.map((b) => [b.name, 0]));
+  const minigameTotals = new Map(OSRS_MINIGAMES.map((m) => [m.name, 0]));
+
+  for (const member of members) {
+    const rsn = String(member.rsn).trim();
+    const key = rsn.toLowerCase();
+    const hiscoreData = await fetchPlayerHiscores(rsn);
+    const snapshot = extractMemberHiscoreSnapshot(hiscoreData);
+
+    snapshotRows.push({
+      week_key: window.weekKey,
+      rsn,
+      skills: snapshot.skills,
+      activities: snapshot.activities,
+      rank_xp: Number(member.xp) || 0,
+      captured_at: nowIso,
+    });
+
+    const prev = prevByRsn.get(key);
+    if (!prev) continue; // no baseline yet for this member; it'll start counting next week
+
+    const prevSkills = prev.skills || {};
+    const prevActivities = prev.activities || {};
+
+    let memberXpGained = 0;
+    for (const s of OSRS_SKILLS) {
+      const gained = sumSkillGain(prevSkills, snapshot.skills, s.name);
+      memberXpGained += gained;
+      if (gained > 0) skillTotals.set(s.name, (skillTotals.get(s.name) || 0) + gained);
+    }
+    if (memberXpGained > 0) xpGainers.push({ name: rsn, amount: memberXpGained });
+
+    let memberPvmGained = 0;
+    for (const b of PVM_BOSS_ENTRIES) {
+      const gained = sumActivityGain(prevActivities, snapshot.activities, b.hiscoreNames);
+      memberPvmGained += gained;
+      if (gained > 0) bossTotals.set(b.name, (bossTotals.get(b.name) || 0) + gained);
+    }
+    if (memberPvmGained > 0) pvmers.push({ name: rsn, amount: memberPvmGained });
+
+    let memberRaidGained = 0;
+    for (const r of RAID_BOSS_ENTRIES) {
+      const gained = sumActivityGain(prevActivities, snapshot.activities, r.hiscoreNames);
+      memberRaidGained += gained;
+      if (gained > 0) raidTotals.set(r.name, (raidTotals.get(r.name) || 0) + gained);
+    }
+    if (memberRaidGained > 0) raiders.push({ name: rsn, amount: memberRaidGained });
+
+    for (const mg of OSRS_MINIGAMES) {
+      const gained = sumActivityGain(prevActivities, snapshot.activities, mg.hiscoreNames);
+      if (gained > 0) minigameTotals.set(mg.name, (minigameTotals.get(mg.name) || 0) + gained);
+    }
+
+    const prevRankXp = Number(prev.rank_xp) || 0;
+    const currRankXp = Number(member.xp) || 0;
+    const rankXpGained = Math.max(0, currRankXp - prevRankXp);
+    if (rankXpGained > 0) rankXpEarners.push({ name: rsn, amount: rankXpGained });
+  }
+
+  await saveRecapSnapshots(supabase, snapshotRows);
+
+  if (isFirstRun) {
+    console.log(`[WeeklyRecap] Baseline captured for week ${window.weekKey}; first full recap will post next week.`);
+    return null;
+  }
+
+  const hmEarners = await computeHonourMarksLeaderboard(supabase, window);
+
+  const toEntryList = (map) => [...map.entries()].map(([name, amount]) => ({ name, amount }));
+  const pickTop1 = (map) => topN(toEntryList(map), 1)[0] || null;
+
+  const data = {
+    xpGainers: topN(xpGainers, 5),
+    pvmers: topN(pvmers, 5),
+    raiders: topN(raiders, 5),
+    rankXpEarners: topN(rankXpEarners, 5),
+    hmEarners,
+    mostTrainedSkill: pickTop1(skillTotals),
+    mostKilledBoss: pickTop1(bossTotals),
+    mostPopularRaid: pickTop1(raidTotals),
+    mostPopularMinigame: pickTop1(minigameTotals),
+  };
+
+  const payload = buildWeeklyRecapEmbed(window, data);
+  const channel = await getWeeklyRecapChannel();
+  if (channel) {
+    await channel.send(payload).catch((e) => console.error("[WeeklyRecap] Failed to post recap:", e.message));
+  }
+
+  return { window, data };
+}
+
+let weeklyRecapTimer = null;
+let lastFiredRecapWeekKey = null;
+
+function startWeeklyRecapLoop() {
+  if (weeklyRecapTimer) clearInterval(weeklyRecapTimer);
+
+  // Check every 60 seconds for whether the most recently completed Sunday
+  // 5:00 PM Central recap window has changed since the last time we posted.
+  weeklyRecapTimer = setInterval(async () => {
+    try {
+      const now = new Date();
+      const window = findMostRecentCompletedRecapWindow(now);
+      if (!window || window.weekKey === lastFiredRecapWeekKey) return;
+      lastFiredRecapWeekKey = window.weekKey;
+      await runWeeklyRecap(window, now);
+    } catch (err) {
+      console.error("[WeeklyRecap] Loop error:", err.message);
+    }
+  }, 60 * 1000);
+
+  if (typeof weeklyRecapTimer.unref === "function") weeklyRecapTimer.unref();
 }
 
 async function loadWeeklyEventState(supabase, weekInfo) {
@@ -4258,6 +4665,16 @@ client.once(Events.ClientReady, async () => {
   } catch (err) {
     console.error("[WeeklyEvents] Initial sync failed:", err.message);
   }
+  try {
+    const initialRecapWindow = findMostRecentCompletedRecapWindow(new Date());
+    if (initialRecapWindow) {
+      lastFiredRecapWeekKey = initialRecapWindow.weekKey;
+      await runWeeklyRecap(initialRecapWindow, new Date());
+    }
+    startWeeklyRecapLoop();
+  } catch (err) {
+    console.error("[WeeklyRecap] Initial check failed:", err.message);
+  }
 });
 
 client.on(Events.GuildMemberAdd, (member) => {
@@ -4410,4 +4827,21 @@ module.exports = {
   ensureWeeklyEventsMessages,
   syncWeeklyEvents,
   startWeeklyEventsLoop,
+  // Weekly Recap exports
+  WEEKLY_RECAP_CHANNEL_ID,
+  WEEKLY_RECAP_HOUR,
+  WEEKLY_RECAP_ANCHOR_DATE,
+  RAID_NAMES,
+  RAID_BOSS_ENTRIES,
+  OSRS_MINIGAMES,
+  PVM_BOSS_ENTRIES,
+  getRecapWindowByIndex,
+  findMostRecentCompletedRecapWindow,
+  extractMemberHiscoreSnapshot,
+  sumSkillGain,
+  sumActivityGain,
+  computeHonourMarksLeaderboard,
+  buildWeeklyRecapEmbed,
+  runWeeklyRecap,
+  startWeeklyRecapLoop,
 };
