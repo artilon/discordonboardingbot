@@ -10,7 +10,7 @@ const path = require("path");
 const { RANK_TIERS, formatRankProgress, getRankForXp } = require("../src/ranks");
 const { diffProgress, cleanRsn } = require("../src/jagex");
 const q = require("../src/quests");
-const { chunkLines, DESC_BUDGET } = require("../src/panels");
+const { chunkLines, DESC_BUDGET, renderGuide } = require("../src/panels");
 
 let passed = 0;
 function check(name, fn) {
@@ -245,6 +245,42 @@ check("chunking respects the description budget", () => {
 check("empty input still yields one page", () => {
   const chunks = chunkLines([], "HEADER\n\n");
   assert.strictEqual(chunks.length, 1);
+});
+
+console.log("\n[guide]");
+check("every guide page fits the description budget and has a footer", () => {
+  const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+  assert.ok(pages.length >= 10, "guide should be a full multi-page manual, not a short blurb");
+  pages.forEach((p, i) => {
+    const desc = p.embed.data.description || "";
+    assert.ok(desc.length > 0, `page ${i + 1} has no description`);
+    assert.ok(desc.length <= DESC_BUDGET, `page ${i + 1} description of ${desc.length} exceeds budget ${DESC_BUDGET}`);
+    assert.ok(p.embed.data.title, `page ${i + 1} has no title`);
+    const footer = p.embed.data.footer?.text || "";
+    assert.ok(
+      footer.includes(`Page ${i + 1}/${pages.length}`),
+      `page ${i + 1} footer "${footer}" doesn't match its real position out of ${pages.length}`
+    );
+  });
+});
+
+check("renderGuide still works with no setup/channels passed at all", () => {
+  const pages = renderGuide();
+  assert.ok(pages.length >= 10);
+  assert.ok(pages.every((p) => (p.embed.data.description || "").length > 0));
+});
+
+check("guide doesn't mention a tutorial reward or a team-quest difficulty choice", () => {
+  const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+  const all = pages.map((p) => `${p.embed.data.title} ${p.embed.data.description}`).join("\n").toLowerCase();
+  assert.ok(!all.includes("tutorial"), "there is no tutorial-reward feature in the code");
+
+  const teamPage = pages.find((p) => p.embed.data.title.includes("Team Quests"));
+  assert.ok(teamPage, "team quests page should exist");
+  assert.ok(
+    !/difficulty/i.test(teamPage.embed.data.description),
+    "team quests only ever run at easy difficulty in the actual UI (hard mode is unreachable dead code)"
+  );
 });
 
 console.log(`\n${passed} checks passed.\n`);

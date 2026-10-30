@@ -80,8 +80,11 @@ const config = {
   panelRefreshDebounceMs: 8000,
   expirySweepMs: 5 * 60 * 1000,
 
-  // ── Reset boundaries (UTC, fixed to match the original bot) ───────────────
-  timezoneLabel: "UTC",
+  // ── Reset boundaries ────────────────────────────────────────────────────
+  // Daily/weekly/monthly reset timing itself is computed in src/quests.js
+  // against America/Chicago wall-clock time (not UTC) — this label is just
+  // informational for anything that wants to display it.
+  timezoneLabel: "America/Chicago",
 };
 
 /** Throws with a readable message instead of failing later at the first API call. */
