@@ -185,6 +185,24 @@ create table if not exists public.weekly_events (
   updated_at timestamptz not null default now()
 );
 
+-- 6. Weekly HiScores Snapshot & Recap — one row per clan member per recap week
+--    (week_key = the Sunday the snapshot was taken, e.g. '2026-11-01'). Stores
+--    the full skills/activities hiscores plus Rank XP at snapshot time so the
+--    bot can diff this week's row against the previous week's to build the
+--    Sunday 5pm Central recap embed (top XP gainers, PvMers, raiders, etc.).
+create table if not exists public.weekly_recap_snapshots (
+  id          bigserial primary key,
+  week_key    text not null,
+  rsn         text not null,
+  skills      jsonb not null default '{}'::jsonb,     -- { "Attack": 12345, ... } xp per skill
+  activities  jsonb not null default '{}'::jsonb,     -- { "Zulrah": 120, "Chambers of Xeric": 45, ... } kc/score per activity
+  rank_xp     integer not null default 0,              -- clan_members.xp at snapshot time
+  captured_at timestamptz not null default now(),
+  unique (week_key, rsn)
+);
+
+create index if not exists idx_weekly_recap_snapshots_week on public.weekly_recap_snapshots (week_key);
+
 -- Disable RLS so the bot can read/write freely
 alter table public.clan_members disable row level security;
 alter table public.roster_upload disable row level security;
@@ -192,6 +210,7 @@ alter table public.xp_rank_logs disable row level security;
 alter table public.clan_growth_history disable row level security;
 alter table public.weekly_events disable row level security;
 alter table public.pending_rank_xp disable row level security;
+alter table public.weekly_recap_snapshots disable row level security;
 
 -- 5. Enable Realtime on clan_members, roster_upload, and clan_growth_history
 do $$
