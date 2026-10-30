@@ -353,6 +353,78 @@ async function registerMember(userId, rsn) {
     assert.strictEqual(Object.keys(row.targets.skills).length, 5, "base 2 + highest-owned tier 3 = 5, NOT summed across the team");
   });
 
+  console.log("\n[team hand-pick — a Quest Choice Token's pick locks the team's target before the roster/Items are known]");
+  await check("partyTargetPool matches the un-expanded base requirement for every kind", () => {
+    assert.deepStrictEqual(q.partyTargetPool("gathering", "duo"), { kind: "skill", count: 2, value: 135000, pool: q.SKILLS_BY_TREE.gathering });
+    assert.strictEqual(q.partyTargetPool("boss", "trio").count, 2);
+    assert.strictEqual(q.partyTargetPool("raids", "quad").count, 1);
+    assert.strictEqual(q.partyTargetPool("minigames", "quad").count, 3);
+  });
+
+  await check("a hand-picked team skill target is honoured even when a member owns Quest Expansion", async () => {
+    await registerMember("p1-pick", "Pick1");
+    await registerMember("p2-pick", "Pick2");
+    const snap = snapshotWithLevels({ mining: 50, fishing: 50, woodcutting: 50, farming: 50, hunter: 50 });
+    snapshots["Pick1"] = snap;
+    snapshots["Pick2"] = snap;
+    // Tier 3 Expansion would normally add +3 targets (2 -> 5) if this were a
+    // random roll — the hand-pick must lock the count back to the base 2.
+    fake.db.hm_items.push({ user_id: "p1-pick", guild_id: "g1", tree: "gathering", slot: q.ITEM_SLOT.EXPANSION, tier: 3 });
+
+    const result = await q.createPartyQuest({
+      guildId: "g1", members: ["p1-pick", "p2-pick"], tree: "gathering", size: "duo", difficulty: "easy",
+      picks: ["mining", "fishing"],
+    });
+    assert.strictEqual(result.ok, true, result.error);
+
+    const row = fake.db.hm_party_quests.find((r) => r.members.includes("p1-pick"));
+    assert.deepStrictEqual(
+      Object.keys(row.targets.skills).sort(), ["fishing", "mining"],
+      "exactly the 2 hand-picked skills, Expansion's extra targets must not apply on top of a hand-pick"
+    );
+    assert.strictEqual(row.hm_reward, q.partyHmReward("duo", "easy"), "reward must not be scaled up as if 5 targets existed");
+  });
+
+  await check("a hand-picked team boss target skips the safety-check filter entirely", async () => {
+    await registerMember("p1-safe", "Safe1");
+    await registerMember("p2-safe", "Safe2");
+    // Fresh, low-level snapshots that would fail the safety check for almost
+    // every demanding boss — proving the hand-pick bypasses it completely.
+    const weak = snapshotWithLevels({ hitpoints: 10, defence: 1, prayer: 1, attack: 1, strength: 1, ranged: 1, magic: 1 });
+    snapshots["Safe1"] = weak;
+    snapshots["Safe2"] = weak;
+
+    const result = await q.createPartyQuest({
+      guildId: "g1", members: ["p1-safe", "p2-safe"], tree: "boss", size: "duo", difficulty: "easy",
+      picks: ["zulrah"],
+    });
+    assert.strictEqual(result.ok, true, result.error);
+
+    const row = fake.db.hm_party_quests.find((r) => r.members.includes("p1-safe"));
+    assert.deepStrictEqual(Object.keys(row.targets.bosses), ["zulrah"], "hand-picked boss used as-is, never safety-filtered away");
+    assert.strictEqual(row.targets.bosses.zulrah, 150, "base duo boss kc (150), untouched by the safety fallback's KC scaling");
+  });
+
+  await check("an invalid/missing pick is topped up at random from the same pool, never left empty", async () => {
+    await registerMember("p1-topup", "Topup1");
+    await registerMember("p2-topup", "Topup2");
+    const snap = snapshotWithLevels({ mining: 50, fishing: 50, woodcutting: 50, farming: 50, hunter: 50 });
+    snapshots["Topup1"] = snap;
+    snapshots["Topup2"] = snap;
+
+    const result = await q.createPartyQuest({
+      guildId: "g1", members: ["p1-topup", "p2-topup"], tree: "gathering", size: "duo", difficulty: "easy",
+      picks: ["mining", "not-a-real-skill"],
+    });
+    assert.strictEqual(result.ok, true, result.error);
+
+    const row = fake.db.hm_party_quests.find((r) => r.members.includes("p1-topup"));
+    const skills = Object.keys(row.targets.skills);
+    assert.strictEqual(skills.length, 2, "still exactly 2 targets total");
+    assert.ok(skills.includes("mining"), "the one valid pick is kept");
+    assert.ok(!skills.includes("not-a-real-skill"), "the invalid pick never makes it into the targets");
+  });
+
   console.log(`\n${passed} checks passed.`);
 })().catch((e) => {
   console.error("FAILED:", e);

@@ -5,7 +5,13 @@ const {
 } = require("discord.js");
 const { getSupabase, getConfigValue, setConfigValue } = require("./db");
 const { getRankForXp, formatRankProgress, RANK_TIERS } = require("./ranks");
-const { TREES, TREE_BY_KEY, PARTY_SIZES, LFG_EXPIRY_HOURS } = require("./quests");
+const { TREES, TREE_BY_KEY, PARTY_SIZES, LFG_EXPIRY_HOURS, treeKind } = require("./quests");
+const { SKILL_LABELS, bossLabel } = require("./jagex");
+
+/** Pretty label for a hand-picked target key (skill or boss/raid/minigame). */
+function pickLabel(tree, key) {
+  return treeKind(tree) === "skill" ? (SKILL_LABELS[key] || key) : bossLabel(key);
+}
 
 const COLOR = {
   main: 0xb8860b,
@@ -245,8 +251,11 @@ async function renderOpenTeams(guildId) {
       const expected = PARTY_SIZES[p.team_size] || p.members.length;
       const need = Math.max(expected - p.members.length, 0);
       const expiresAt = Math.floor(new Date(p.created_at).getTime() / 1000) + LFG_EXPIRY_HOURS * 3600;
+      const pickedTargets = Array.isArray(p.picks) && p.picks.length
+        ? ` — 🎯 **${p.picks.map((k) => pickLabel(p.categories?.[0], k)).join(", ")}**`
+        : "";
       lines.push(
-        `• **${p.team_size}** ${tree ? `${tree.emoji} ${tree.label}` : p.categories?.[0] || "?"} — ` +
+        `• **${p.team_size}** ${tree ? `${tree.emoji} ${tree.label}` : p.categories?.[0] || "?"}${pickedTargets} — ` +
         `${p.members.map((m) => `<@${m}>`).join(", ")} ` +
         `(needs **${need}** more) — expires <t:${expiresAt}:R>`
       );
@@ -549,6 +558,12 @@ function renderGuide(setup = {}) {
         `2. Pick a size: **Duo** (2 people total), **Trio** (3 people total), or **Quad** (4 people total). You ` +
         `count as the first member either way.\n` +
         `3. Pick a category — the same seven choices as solo quests.\n` +
+        `3b. **If you (the person creating the team) own a 🎯 Quest Choice Token**, you're offered a choice ` +
+        `right here, before anyone else is involved: spend it to hand-pick the team's exact shared target, or ` +
+        `skip it and let the bot roll one at random (the token stays in your inventory either way if you ` +
+        `skip it). This is the ONLY point a hand-pick can happen — teammates and later joiners never get this ` +
+        `choice, and it's locked in before the team is finalized specifically so that anyone browsing the ` +
+        `**Looking For Group** board can see the chosen target before deciding whether to join (Page 5).\n` +
         `4. Choose how to fill the rest of the team:\n` +
         `　• **Pick Teammates** — a member picker opens where you select the exact number of other people ` +
         `needed (1 for Duo, 2 for Trio, 3 for Quad). Everyone picked must already be registered with ` +
@@ -575,9 +590,13 @@ function renderGuide(setup = {}) {
       title: "🔍 Step 5: Looking For Group, Step By Step",
       body:
         `The **Looking For Group** board is a second panel posted right under the quest board. It lists every ` +
-        `team quest that's currently recruiting, with the category, size, and who's already joined.\n\n` +
+        `team quest that's currently recruiting, with the category, size, who's already joined, and — if the ` +
+        `poster hand-picked one with a 🎯 Quest Choice Token — the exact target, so you always know what ` +
+        `you're signing up for before you join.\n\n` +
         `**Posting a listing, step by step:**\n` +
-        `1. Press **👥 Start a Team Quest** → pick a size → pick a category, exactly like a normal team quest.\n` +
+        `1. Press **👥 Start a Team Quest** → pick a size → pick a category, exactly like a normal team quest. ` +
+        `If you own a Quest Choice Token, this is also where you'd hand-pick the team's target (Page 4) — do ` +
+        `it here, before posting, and it'll show on the board for everyone.\n` +
         `2. On the "how do you want to fill it" screen, press **📋 Post Open Listing** instead of Pick Teammates.\n` +
         `3. You're now the first member of an open listing, and it appears on the LFG board immediately.\n` +
         `4. You can only have **one** open listing — or be a member of one — at a time, whether posting or ` +
@@ -785,6 +804,13 @@ function renderGuide(setup = {}) {
         `6. If the quest fails to create for any reason after you've spent the token (you already had one of ` +
         `that type, you'd already used that slot this period, a hiscores read failed, etc.), the token is ` +
         `**automatically refunded** and the error message confirms it.\n\n` +
+        `**Team quests work too — creator only.** Whoever creates a team quest and picks its category can ` +
+        `spend a Quest Choice Token on the team's shared target the same way, right after picking the ` +
+        `category and before the team is finalized (Page 4). Teammates and anyone who later joins from the ` +
+        `Looking For Group board never get this choice — only the creator — and for an open listing the pick ` +
+        `is locked in and shown on the board (Page 5) before anyone joins. The refund rule is identical: if ` +
+        `the team or listing fails to come together for any reason after the token is spent, it's ` +
+        `automatically refunded to the creator.\n\n` +
         `Both tokens stack — you can own several of either at once.`,
     },
     {

@@ -1,7 +1,7 @@
 "use strict";
 const { getSupabase } = require("./db");
 const {
-  TREES, TREE_BY_KEY, createSoloQuest,
+  TREES, TREE_BY_KEY, createSoloQuest, createPartyQuest, createOpenTeam,
   getPerks, getPerkTier, getItems, getItemTier, ITEM_SLOT, ITEM_PCT_BY_TIER, itemPercentForTier,
 } = require("./quests");
 
@@ -471,6 +471,44 @@ async function createSoloQuestWithChoiceToken({ guildId, member, tree, questType
   return { ...result, tokenConsumed, refunded: false };
 }
 
+/**
+ * Team-quest equivalent of `createSoloQuestWithChoiceToken`. The token here
+ * is spent by the team's CREATOR the moment they confirm their picks —
+ * before teammates are even chosen or a listing exists — so it can just as
+ * easily go to waste on a later, unrelated failure (someone already on a
+ * team quest, a hiscores read failure, a DB hiccup). Refunded on any such
+ * failure, same rule as the solo flow. `userId`/`refundGuildId` identify
+ * who gets the refund, which is always the creator regardless of who else
+ * ends up on the roster.
+ */
+async function createPartyQuestWithChoiceToken({ guildId, members, tree, size, difficulty, picks, tokenConsumed, userId }) {
+  const result = await createPartyQuest({ guildId, members, tree, size, difficulty, picks: tokenConsumed ? picks : null });
+
+  if (result.error && tokenConsumed) {
+    const refunded = await grantConsumable(userId, guildId, "quest_choice_token");
+    return { ...result, tokenConsumed, refunded };
+  }
+  return { ...result, tokenConsumed, refunded: false };
+}
+
+/**
+ * Open-listing equivalent: the creator's hand-pick has to be LOCKED IN AND
+ * VISIBLE the moment the listing posts (so anyone browsing the Looking For
+ * Group board can see the target before deciding to join), so the token is
+ * spent here, at post time, rather than waiting for the listing to actually
+ * fill. Refunded if posting itself fails for any reason — the quest hasn't
+ * even been created yet at that point, so there's nothing else to undo.
+ */
+async function createOpenTeamWithChoiceToken({ guildId, posterId, size, tree, picks, tokenConsumed }) {
+  const result = await createOpenTeam({ guildId, posterId, size, tree, picks: tokenConsumed ? picks : null });
+
+  if (result.error && tokenConsumed) {
+    const refunded = await grantConsumable(posterId, guildId, "quest_choice_token");
+    return { ...result, tokenConsumed, refunded };
+  }
+  return { ...result, tokenConsumed, refunded: false };
+}
+
 async function activateBoost({ guildId, userId, tree, tier }) {
   const supabase = getSupabase();
   const spec = BOOST_TIERS.find((t) => t.tier === Number(tier));
@@ -509,6 +547,6 @@ module.exports = {
   getBalance, getPerks, getPerkTier, getItems, getItemTier, getItemTiers,
   getInventory, getActiveBoosts, getBoostMultiplier,
   tryDebit, buyPerk, buyItem, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
-  createSoloQuestWithChoiceToken,
+  createSoloQuestWithChoiceToken, createPartyQuestWithChoiceToken, createOpenTeamWithChoiceToken,
   TREES,
 };
