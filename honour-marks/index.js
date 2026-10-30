@@ -129,6 +129,175 @@ function takePendingTeamPick(guildId, userId, size, tree) {
   return { picks: entry.picks, tokenConsumed: entry.tokenConsumed };
 }
 
+// ── Multi-page target picker ────────────────────────────────────────────────
+// Discord's StringSelectMenu hard-caps a single dropdown at 25 options, but
+// some pools (the full boss pool is 45 entries) are bigger than that, and a
+// hand-pick can require selecting more than one target (Quest Expansion on a
+// solo quest, or a Trio/Quad team quest). So instead of one dropdown showing
+// only the first 25 options with no way to reach the rest (e.g. Vorkath),
+// picks are made one dropdown-page at a time and accumulated here until the
+// quest's required count is reached, then the pick is finalized automatically.
+// Keyed by `${guildId}:${userId}` — only one picker can be open per member.
+const pendingPickSessions = new Map();
+const PICK_SESSION_TTL_MS = 15 * 60 * 1000;
+const PICK_PAGE_SIZE = 25;
+
+function pickSessionKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+/** Starts (or restarts) a picker session. `mode` identifies which finalize
+ *  step to call once enough picks are collected: "solo_target" | "solo_raid"
+ *  | "team_target" | "team_raid". */
+function startPickSession(guildId, userId, { mode, questType, tree, size, spec }) {
+  pendingPickSessions.set(pickSessionKey(guildId, userId), {
+    mode, questType, tree, size, spec, page: 0, picks: [], ts: Date.now(),
+  });
+}
+
+function getPickSession(guildId, userId) {
+  const key = pickSessionKey(guildId, userId);
+  const session = pendingPickSessions.get(key);
+  if (!session) return null;
+  if (Date.now() - session.ts > PICK_SESSION_TTL_MS) {
+    pendingPickSessions.delete(key);
+    return null;
+  }
+  return session;
+}
+
+function clearPickSession(guildId, userId) {
+  pendingPickSessions.delete(pickSessionKey(guildId, userId));
+}
+
+const PICK_SESSION_TITLES = {
+  solo_target: "🎯 Pick Your Target",
+  solo_raid: "⚔️ Pick Your Raid",
+  team_target: "🎯 Pick The Team's Target",
+  team_raid: "⚔️ Pick The Team's Raid",
+};
+
+/** Renders the current page of a picker session: the dropdown (only showing
+ *  targets not already picked, so a page can never offer a duplicate), plus
+ *  Prev/Next pagination and a Clear button once more than one pick exists. */
+function renderPickSession(session) {
+  const { spec, page, picks, mode } = session;
+  const available = spec.pool.filter((key) => !picks.includes(key));
+  const totalPages = Math.max(1, Math.ceil(available.length / PICK_PAGE_SIZE));
+  const clampedPage = Math.max(0, Math.min(page, totalPages - 1));
+  session.page = clampedPage;
+  const pageItems = available.slice(clampedPage * PICK_PAGE_SIZE, clampedPage * PICK_PAGE_SIZE + PICK_PAGE_SIZE);
+  const remaining = spec.count - picks.length;
+  const maxSelectable = Math.max(1, Math.min(remaining, pageItems.length));
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("hm_pick_session_select")
+    .setPlaceholder(remaining === 1 ? "Pick one…" : `Pick up to ${maxSelectable} more…`)
+    .setMinValues(1)
+    .setMaxValues(maxSelectable)
+    .addOptions(
+      pageItems.map((key) =>
+        new StringSelectMenuOptionBuilder().setLabel(targetLabel(spec.kind, key)).setValue(key)
+      )
+    );
+
+  const rows = [new ActionRowBuilder().addComponents(menu)];
+
+  const navButtons = [];
+  if (totalPages > 1) {
+    navButtons.push(
+      new ButtonBuilder().setCustomId("hm_pick_session_prev").setLabel("◀ Prev Page").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage === 0),
+      new ButtonBuilder().setCustomId("hm_pick_session_next").setLabel("Next Page ▶").setStyle(ButtonStyle.Secondary).setDisabled(clampedPage >= totalPages - 1)
+    );
+  }
+  if (picks.length > 0) {
+    navButtons.push(
+      new ButtonBuilder().setCustomId("hm_pick_session_clear").setLabel("↺ Clear Picks").setStyle(ButtonStyle.Danger)
+    );
+  }
+  if (navButtons.length > 0) {
+    rows.push(new ActionRowBuilder().addComponents(navButtons));
+  }
+
+  const pickedLine = picks.length
+    ? `**Picked so far:** ${picks.map((key) => targetLabel(spec.kind, key)).join(", ")}\n`
+    : "";
+  const pageLine = totalPages > 1
+    ? `Page ${clampedPage + 1} of ${totalPages} (${spec.pool.length} total options).\n`
+    : "";
+  const introText = mode === "solo_raid" || mode === "team_raid"
+    ? `Raids are always picked, never rolled at random — select exactly ${spec.count === 1 ? "one" : spec.count}.`
+    : `Select exactly ${spec.count}.`;
+  const remainingLine = remaining > 1
+    ? `Pick ${remaining} more to finish — browse pages for anything not shown yet.`
+    : "Pick your last target to finish.";
+
+  return {
+    embeds: [emptyPage(PICK_SESSION_TITLES[mode], `${introText}\n\n${pickedLine}${pageLine}${remainingLine}`).embed],
+    components: rows,
+  };
+}
+
+/** Finalizes a completed picker session by routing to the same creation
+ *  logic the old single-dropdown flow used — nothing about how a pick gets
+ *  applied changes, only how it's collected. */
+async function finalizePickSession(interaction, session) {
+  const { mode, questType, tree, size, picks } = session;
+  clearPickSession(interaction.guildId, interaction.user.id);
+
+  if (mode === "solo_target") return handlePickTarget(interaction, questType, tree, picks);
+  if (mode === "solo_raid") return handleCreateSolo(interaction, questType, tree, picks, false);
+  if (mode === "team_target") return handleTeamPickTarget(interaction, size, tree, picks);
+  if (mode === "team_raid") return handleTeamRaidPickTarget(interaction, size, tree, picks);
+  return interaction.update({ embeds: [emptyPage("Something went wrong", "That picker session is no longer valid — please start over.").embed], components: [] });
+}
+
+async function handlePickSessionSelect(interaction) {
+  const session = getPickSession(interaction.guildId, interaction.user.id);
+  if (!session) {
+    return interaction.update({
+      embeds: [emptyPage("This picker expired", "Please re-open the menu and pick again.").embed],
+      components: [],
+    });
+  }
+
+  session.picks.push(...interaction.values);
+  session.ts = Date.now();
+
+  if (session.picks.length >= session.spec.count) {
+    return finalizePickSession(interaction, session);
+  }
+
+  return interaction.update(renderPickSession(session));
+}
+
+async function handlePickSessionPage(interaction, direction) {
+  const session = getPickSession(interaction.guildId, interaction.user.id);
+  if (!session) {
+    return interaction.update({
+      embeds: [emptyPage("This picker expired", "Please re-open the menu and pick again.").embed],
+      components: [],
+    });
+  }
+  session.page += direction;
+  session.ts = Date.now();
+  return interaction.update(renderPickSession(session));
+}
+
+async function handlePickSessionClear(interaction) {
+  const session = getPickSession(interaction.guildId, interaction.user.id);
+  if (!session) {
+    return interaction.update({
+      embeds: [emptyPage("This picker expired", "Please re-open the menu and pick again.").embed],
+      components: [],
+    });
+  }
+  session.picks = [];
+  session.page = 0;
+  session.ts = Date.now();
+  return interaction.update(renderPickSession(session));
+}
+
 // ── Panel refresh ────────────────────────────────────────────────────────────
 let refreshTimer = null;
 const pendingRefresh = new Set();
@@ -601,26 +770,8 @@ async function handleTreeChosen(interaction, questType, tree) {
  */
 async function handleRaidPick(interaction, questType, tree) {
   const spec = soloTargetPool(tree, questType);
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`hm_pick_raid:${questType}:${tree}`)
-    .setPlaceholder(`Pick ${spec.count === 1 ? "your raid" : `${spec.count} raids`}…`)
-    .setMinValues(spec.count)
-    .setMaxValues(spec.count)
-    .addOptions(
-      spec.pool.map((key) =>
-        new StringSelectMenuOptionBuilder().setLabel(targetLabel(spec.kind, key)).setValue(key)
-      )
-    );
-
-  return interaction.update({
-    embeds: [
-      emptyPage(
-        "⚔️ Pick Your Raid",
-        `Raids are always picked, never rolled at random — select exactly ${spec.count === 1 ? "one" : spec.count}.`
-      ).embed,
-    ],
-    components: [new ActionRowBuilder().addComponents(menu)],
-  });
+  startPickSession(interaction.guildId, interaction.user.id, { mode: "solo_raid", questType, tree, spec });
+  return interaction.update(renderPickSession(getPickSession(interaction.guildId, interaction.user.id)));
 }
 
 /** Shows the pool for this category so the member can pick their own target(s). */
@@ -636,28 +787,8 @@ async function handleQuestChoose(interaction, questType, tree) {
     return handleCreateSolo(interaction, questType, tree);
   }
 
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`hm_pick_target:${questType}:${tree}`)
-    .setPlaceholder(`Pick ${spec.count === 1 ? "your target" : `${spec.count} targets`}…`)
-    .setMinValues(spec.count)
-    .setMaxValues(spec.count)
-    .addOptions(
-      spec.pool.slice(0, 25).map((key) =>
-        new StringSelectMenuOptionBuilder().setLabel(targetLabel(spec.kind, key)).setValue(key)
-      )
-    );
-
-  return interaction.update({
-    embeds: [
-      emptyPage(
-        "🎯 Pick Your Target",
-        spec.pool.length > 25
-          ? `Showing the first 25 of ${spec.pool.length} options.`
-          : `Select exactly ${spec.count}.`
-      ).embed,
-    ],
-    components: [new ActionRowBuilder().addComponents(menu)],
-  });
+  startPickSession(interaction.guildId, interaction.user.id, { mode: "solo_target", questType, tree, spec });
+  return interaction.update(renderPickSession(getPickSession(interaction.guildId, interaction.user.id)));
 }
 
 async function handlePickTarget(interaction, questType, tree, picks) {
@@ -905,30 +1036,8 @@ async function handleTeamChoose(interaction, size, tree, { free = false } = {}) 
     return handleTeamMode(interaction, size, tree);
   }
 
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`${free ? "hm_team_pick_raid" : "hm_team_pick_target"}:${size}:${tree}`)
-    .setPlaceholder(`Pick ${spec.count === 1 ? (free ? "your raid" : "the target") : `${spec.count} targets`}…`)
-    .setMinValues(spec.count)
-    .setMaxValues(spec.count)
-    .addOptions(
-      spec.pool.slice(0, 25).map((key) =>
-        new StringSelectMenuOptionBuilder().setLabel(targetLabel(spec.kind, key)).setValue(key)
-      )
-    );
-
-  return interaction.update({
-    embeds: [
-      emptyPage(
-        free ? "⚔️ Pick The Team's Raid" : "🎯 Pick The Team's Target",
-        spec.pool.length > 25
-          ? `Showing the first 25 of ${spec.pool.length} options.`
-          : free
-            ? `Raids are always picked, never rolled at random — select exactly ${spec.count === 1 ? "one" : spec.count}.`
-            : `Select exactly ${spec.count}.`
-      ).embed,
-    ],
-    components: [new ActionRowBuilder().addComponents(menu)],
-  });
+  startPickSession(interaction.guildId, interaction.user.id, { mode: free ? "team_raid" : "team_target", size, tree, spec });
+  return interaction.update(renderPickSession(getPickSession(interaction.guildId, interaction.user.id)));
 }
 
 /** The creator skipped the hand-pick — keep the token, go straight to the random flow. */
@@ -1672,6 +1781,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       switch (interaction.customId) {
+        case "hm_pick_session_prev": return await handlePickSessionPage(interaction, -1);
+        case "hm_pick_session_next": return await handlePickSessionPage(interaction, 1);
+        case "hm_pick_session_clear": return await handlePickSessionClear(interaction);
         case "hm_quest_start": return await handleQuestStart(interaction);
         case "hm_team_start": return await handleTeamStart(interaction);
         case "hm_check": return await handleCheck(interaction);
@@ -1705,16 +1817,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const questType = id.split(":")[1];
         return await handleTreeChosen(interaction, questType, interaction.values[0]);
       }
-      if (id.startsWith("hm_pick_target:")) {
-        const [, questType, tree] = id.split(":");
-        return await handlePickTarget(interaction, questType, tree, interaction.values);
-      }
-      if (id.startsWith("hm_pick_raid:")) {
-        const [, questType, tree] = id.split(":");
-        // No token involved — picking a raid is mandatory, not a paid
-        // extra, so this goes straight to creation with tokenConsumed: false
-        // and nothing to ever refund.
-        return await handleCreateSolo(interaction, questType, tree, interaction.values, false);
+      if (id === "hm_pick_session_select") {
+        return await handlePickSessionSelect(interaction);
       }
       if (id === "hm_buy_perk") {
         return await handleBuyPerk(interaction, interaction.values[0]);
@@ -1737,14 +1841,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (id.startsWith("hm_pick_team_tree:")) {
         const size = id.split(":")[1];
         return await handleTeamTreeChosen(interaction, size, interaction.values[0]);
-      }
-      if (id.startsWith("hm_team_pick_target:")) {
-        const [, size, tree] = id.split(":");
-        return await handleTeamPickTarget(interaction, size, tree, interaction.values);
-      }
-      if (id.startsWith("hm_team_pick_raid:")) {
-        const [, size, tree] = id.split(":");
-        return await handleTeamRaidPickTarget(interaction, size, tree, interaction.values);
       }
       if (id === "hm_lfg_join") {
         return await handleLfgJoin(interaction, interaction.values[0]);
