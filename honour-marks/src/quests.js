@@ -109,6 +109,11 @@ const PARTY_REQUIREMENTS = {
 const QUEST_DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30 };
 const PARTY_DURATION_DAYS = 14;
 const RESET_PERIOD = { daily: 1, weekly: 7, monthly: 30 };
+const PARTY_SIZES = { duo: 2, trio: 3, quad: 4 };
+
+// Open (recruiting) team listings posted to the Looking For Group board.
+// Unfilled listings are swept away after this many hours.
+const LFG_EXPIRY_HOURS = 24;
 
 function pickRandom(arr, n) {
   const pool = [...arr];
@@ -200,20 +205,39 @@ function partyHmReward(size, difficulty) {
 }
 
 // ── Reset helpers ────────────────────────────────────────────────────────────
+// Reset boundaries run on the CLAN's local wall-clock time, not UTC and not an
+// individual member's own timezone — "resets at midnight" means one midnight
+// for everyone, the same moment regardless of where a member is playing from.
+// This only governs how often someone can COMPLETE a daily/weekly/monthly
+// quest; an already-started quest still runs its full rolling window
+// (QUEST_DURATION_DAYS) from whenever it was created, untouched by this.
+const RESET_TZ = "America/Chicago";
+const localDateFormat = new Intl.DateTimeFormat("en-CA", {
+  timeZone: RESET_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+/** The clan's local calendar date for an instant, as "YYYY-MM-DD" (DST-aware). */
+function localDateStamp(d = new Date()) {
+  return localDateFormat.format(d); // en-CA formats as YYYY-MM-DD directly.
+}
+
 function dayStamp(d = new Date()) {
-  return d.toISOString().slice(0, 10);
+  return localDateStamp(d);
 }
 
 function weekStamp(d = new Date()) {
-  // ISO week start (Monday), UTC.
-  const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  const day = date.getUTCDay() || 7;
-  date.setUTCDate(date.getUTCDate() - (day - 1));
+  // ISO week start (Monday), computed on the clan's local calendar date.
+  // Weekday only depends on the date itself, so once we have the correct
+  // local YYYY-MM-DD there's no further timezone math needed.
+  const [y, m, day] = localDateStamp(d).split("-").map(Number);
+  const date = new Date(Date.UTC(y, m - 1, day));
+  const dow = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() - (dow - 1));
   return date.toISOString().slice(0, 10);
 }
 
 function monthStamp(d = new Date()) {
-  return d.toISOString().slice(0, 7) + "-01";
+  return localDateStamp(d).slice(0, 7) + "-01";
 }
 
 function resetStampFor(questType, d = new Date()) {
@@ -426,6 +450,157 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty }) {
   return { ok: true };
 }
 
+// ── Looking For Group (open team listings) ─────────────────────────────────
+/**
+ * The closed-group team flow above needs everyone picked up front. This is
+ * the alternative: post an open listing that anyone can join. It lives in
+ * `hm_lfg_posts` — separate from `hm_party_quests` — because it isn't a real
+ * quest yet, just a recruiting post with a partial member list. The moment a
+ * join fills the last slot it's converted into a real party quest via
+ * `createPartyQuest` and the listing row is deleted.
+ */
+
+/** All open listings for a guild, oldest first. Expired ones are swept out by
+ *  `sweepExpiredOpenTeams`, but we also filter defensively here in case the
+ *  sweep hasn't run yet. */
+async function getOpenTeams(guildId) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const cutoff = new Date(Date.now() - LFG_EXPIRY_HOURS * 3600000).toISOString();
+  const { data } = await supabase
+    .from("hm_lfg_posts")
+    .select("*")
+    .eq("guild_id", guildId)
+    .gte("created_at", cutoff)
+    .order("created_at", { ascending: true });
+  return data || [];
+}
+
+/** The open listing a user is posting or has already joined, if any — a
+ *  member can only be part of one open listing at a time. */
+async function getOpenTeamForUser(guildId, userId) {
+  const supabase = getSupabase();
+  if (!supabase) return null;
+  const { data } = await supabase
+    .from("hm_lfg_posts")
+    .select("*")
+    .eq("guild_id", guildId)
+    .contains("members", [userId])
+    .maybeSingle();
+  return data || null;
+}
+
+async function createOpenTeam({ guildId, posterId, size, tree }) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+  if (!PARTY_SIZES[size]) return { error: "Unknown team size." };
+  if (!TREE_BY_KEY[tree]) return { error: "Unknown category." };
+
+  const member = await getMember(posterId);
+  if (!member?.rsn) return { error: "Register your RuneScape name first with `/register`." };
+
+  const activeParty = await getActivePartyQuestForUser(posterId);
+  if (activeParty) return { error: "You're already on a team quest." };
+
+  const existingOpen = await getOpenTeamForUser(guildId, posterId);
+  if (existingOpen) return { error: "You already have an open listing. Cancel it first if you want to post a new one." };
+
+  const { error } = await supabase.from("hm_lfg_posts").insert({
+    guild_id: guildId,
+    poster_id: posterId,
+    team_size: size,
+    categories: [tree],
+    members: [posterId],
+  });
+
+  if (error) {
+    if (error.code === "23505") return { error: "You already have an open listing. Cancel it first if you want to post a new one." };
+    console.error("[Quests] createOpenTeam:", error.message);
+    return { error: "Couldn't post that listing. Try again in a moment." };
+  }
+  return { ok: true };
+}
+
+/** The poster cancels their own open listing early. Anyone who had already
+ *  joined is simply released — no quest was ever created, so there's nothing
+ *  to refund or penalize. */
+async function cancelOpenTeam(guildId, posterId) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+  const { data, error } = await supabase
+    .from("hm_lfg_posts")
+    .delete()
+    .eq("guild_id", guildId)
+    .eq("poster_id", posterId)
+    .select("id");
+
+  if (error || !data?.length) return { error: "You don't have an open listing to cancel." };
+  return { ok: true };
+}
+
+/**
+ * Joins an open listing. If this fills the last slot it immediately converts
+ * into a real party quest with the same rules as the closed-group flow
+ * (same rewards, same duration, `difficulty: "easy"`), and the listing is
+ * deleted. If the conversion itself fails (e.g. someone grabbed an active
+ * team quest slot in the meantime), the listing is left untouched so the
+ * failed joiner can simply try again or someone else can fill it instead.
+ */
+async function joinOpenTeam({ guildId, postId, userId }) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+
+  const member = await getMember(userId);
+  if (!member?.rsn) return { error: "Register your RuneScape name first with `/register`." };
+
+  const activeParty = await getActivePartyQuestForUser(userId);
+  if (activeParty) return { error: "You're already on a team quest." };
+
+  const { data: post } = await supabase
+    .from("hm_lfg_posts")
+    .select("*")
+    .eq("id", postId)
+    .eq("guild_id", guildId)
+    .maybeSingle();
+  if (!post) return { error: "That listing isn't open anymore — someone may have already filled or cancelled it." };
+
+  if (post.members.includes(userId)) return { error: "You're already in that listing." };
+
+  const existingOpen = await getOpenTeamForUser(guildId, userId);
+  if (existingOpen) return { error: "You're already in another open listing. Cancel it first if you want to join a different one." };
+
+  const tree = post.categories?.[0];
+  const expected = PARTY_SIZES[post.team_size];
+  const nextMembers = [...post.members, userId];
+
+  if (nextMembers.length >= expected) {
+    const result = await createPartyQuest({ guildId, members: nextMembers, tree, size: post.team_size, difficulty: "easy" });
+    if (result.error) return result;
+
+    await supabase.from("hm_lfg_posts").delete().eq("id", postId).eq("guild_id", guildId);
+    return { ok: true, started: true, members: nextMembers, size: post.team_size, tree };
+  }
+
+  const { error } = await supabase
+    .from("hm_lfg_posts")
+    .update({ members: nextMembers })
+    .eq("id", postId)
+    .eq("guild_id", guildId);
+  if (error) return { error: "Couldn't join that listing. Try again in a moment." };
+
+  return { ok: true, started: false, members: nextMembers, size: post.team_size, tree, needed: expected - nextMembers.length };
+}
+
+/** Deletes open listings that never filled within LFG_EXPIRY_HOURS. Runs on
+ *  the same timer as the quest expiry sweep. */
+async function sweepExpiredOpenTeams() {
+  const supabase = getSupabase();
+  if (!supabase) return 0;
+  const cutoff = new Date(Date.now() - LFG_EXPIRY_HOURS * 3600000).toISOString();
+  const { data } = await supabase.from("hm_lfg_posts").delete().lt("created_at", cutoff).select("id");
+  return data?.length || 0;
+}
+
 /** Adds HM to a balance and writes the ledger row in one place. */
 async function creditHm({ guildId, userId, amount, kind, reason, idempotencyKey, refId }) {
   const supabase = getSupabase();
@@ -516,13 +691,14 @@ async function bumpCounts({ guildId, userId, questType, size }) {
 module.exports = {
   TREES, TREE_BY_KEY, QUEST_TREES, SKILL_TREE, SKILLS_BY_TREE,
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
-  SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY_MULT,
+  SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY_MULT, PARTY_SIZES, LFG_EXPIRY_HOURS,
   QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD,
   buildSoloTargets, buildPartyTargets, soloTargetPool, soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestForUser,
   createSoloQuest, cancelSoloQuest, createPartyQuest, creditHm, bumpCounts,
+  getOpenTeams, getOpenTeamForUser, createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
   awardRankXp,
   diffProgress, fetchHiscores, cleanRsn,
 };

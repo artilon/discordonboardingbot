@@ -1,10 +1,11 @@
 "use strict";
 const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
 } = require("discord.js");
 const { getSupabase, getConfigValue, setConfigValue } = require("./db");
 const { getRankForXp, formatRankProgress } = require("./ranks");
-const { TREES } = require("./quests");
+const { TREES, TREE_BY_KEY, PARTY_SIZES, LFG_EXPIRY_HOURS } = require("./quests");
 
 const COLOR = {
   main: 0xb8860b,
@@ -62,18 +63,14 @@ function buildPanelComponents(panelKey, pageIndex, pageCount) {
   const rows = [];
 
   if (panelKey === "quest_board" && pageIndex === 0) {
+    // Shop & Inventory now lives only in the dedicated shop channel, and
+    // Looking For Group has been replaced by the permanent open-teams panel
+    // below the board — so this is down to one row of four.
     rows.push(
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("hm_quest_start").setLabel("📋 Start a Solo Quest").setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId("hm_team_start").setLabel("👥 Start a Team Quest").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("hm_check").setLabel("✅ Check Quests & Collect").setStyle(ButtonStyle.Success)
-      )
-    );
-    rows.push(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("hm_shop_open").setLabel("🛒 Shop & Inventory").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("hm_lfg_open").setLabel("🔍 Looking For Group").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("hm_my_quests").setLabel("📜 My Quests").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("hm_check").setLabel("✅ Check Quests & Collect").setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId("hm_guide_open").setLabel("📖 How This Works").setStyle(ButtonStyle.Secondary)
       )
     );
@@ -217,6 +214,90 @@ async function renderQuestBoard(guildId, setup = {}) {
     .setTimestamp();
 
   return [{ embed, components: buildPanelComponents("quest_board", 0, 1) }];
+}
+
+// ── Looking For Group ────────────────────────────────────────────────────────
+/**
+ * The real, permanent replacement for the old "not live yet" LFG button.
+ * Every open (recruiting) team listing is shown here with who's already in
+ * it and how many slots are left. The dropdown joins one; joining the last
+ * slot converts it into a real team quest automatically (see
+ * `joinOpenTeam` in src/quests.js) and it drops off this list.
+ */
+async function renderOpenTeams(guildId) {
+  const supabase = getSupabase();
+  if (!supabase) return [emptyPage("🔍 Looking For Group", "Database unavailable.")];
+
+  const cutoff = new Date(Date.now() - LFG_EXPIRY_HOURS * 3600000).toISOString();
+  const { data } = await supabase
+    .from("hm_lfg_posts")
+    .select("*")
+    .eq("guild_id", guildId)
+    .gte("created_at", cutoff)
+    .order("created_at", { ascending: true });
+
+  const open = (data || []).slice(0, 25);
+  const lines = [];
+
+  if (open.length) {
+    for (const p of open) {
+      const tree = TREE_BY_KEY[p.categories?.[0]];
+      const expected = PARTY_SIZES[p.team_size] || p.members.length;
+      const need = Math.max(expected - p.members.length, 0);
+      const expiresAt = Math.floor(new Date(p.created_at).getTime() / 1000) + LFG_EXPIRY_HOURS * 3600;
+      lines.push(
+        `• **${p.team_size}** ${tree ? `${tree.emoji} ${tree.label}` : p.categories?.[0] || "?"} — ` +
+        `${p.members.map((m) => `<@${m}>`).join(", ")} ` +
+        `(needs **${need}** more) — expires <t:${expiresAt}:R>`
+      );
+    }
+  } else {
+    lines.push(
+      "_No open teams right now._ On the quest board, press **Start a Team Quest** and choose " +
+      "**Post an Open Listing** to recruit here instead of picking everyone yourself."
+    );
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("🔍 Looking For Group")
+    .setDescription(
+      "Open team listings below are still recruiting. Pick one from the dropdown to join — " +
+      "the moment a listing fills every slot it starts for real, automatically, with the same " +
+      `rewards as any other team quest. An unfilled listing expires after ${LFG_EXPIRY_HOURS} hours.\n\n` +
+      lines.join("\n").slice(0, DESC_BUDGET)
+    )
+    .setFooter({ text: "Odinheim • Honour Marks" })
+    .setTimestamp();
+
+  const components = [];
+  if (open.length) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("hm_lfg_join")
+          .setPlaceholder("Join an open team…")
+          .addOptions(
+            open.map((p) => {
+              const tree = TREE_BY_KEY[p.categories?.[0]];
+              const expected = PARTY_SIZES[p.team_size] || p.members.length;
+              return new StringSelectMenuOptionBuilder()
+                .setLabel(`${p.team_size} • ${tree?.label || p.categories?.[0]} (${p.members.length}/${expected})`)
+                .setDescription(`${expected - p.members.length} slot(s) open`)
+                .setValue(String(p.id))
+                .setEmoji(tree?.emoji || "🔍");
+            })
+          )
+      )
+    );
+  }
+  components.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("hm_lfg_cancel_mine").setLabel("❌ Cancel My Listing").setStyle(ButtonStyle.Danger)
+    )
+  );
+
+  return [{ embed, components }];
 }
 
 // ── Role self-service ────────────────────────────────────────────────────────
@@ -372,9 +453,11 @@ function renderGuide(setup = {}) {
       `**Solo quests** — you can hold one Daily, one Weekly and one Monthly at the same time, each in whatever ` +
       `category you pick (Gathering, Production, Combat, Utility, Boss PvM, Raids, Minigames). A Daily must be ` +
       `finished within 1 day, a Weekly within 7 days, a Monthly within 30 days.\n\n` +
-      `**Team quests (duo/trio/quad)** — press **👥 Start a Team Quest** and bring 1-3 others. The whole group ` +
-      `shares one target and everyone's progress adds together, so it finishes faster with more people pulling ` +
-      `their weight. A team quest runs for 14 days. Every member must already be registered with \`/register\`.\n\n` +
+      `**Team quests (duo/trio/quad)** — press **👥 Start a Team Quest**. The whole group shares one target and ` +
+      `everyone's progress adds together, so it finishes faster with more people pulling their weight. A team ` +
+      `quest runs for 14 days. Every member must already be registered with \`/register\`. You can either pick ` +
+      `your own teammates up front, or post an open listing instead — it shows up on the **Looking For Group** ` +
+      `board right under the quest board, and the quest starts automatically for everyone the instant it fills.\n\n` +
       `**What happens if time runs out?** The quest is cancelled automatically — there's no penalty beyond that. ` +
       `You still get paid ${HM_EMOJI} HM for the percentage of the target you actually reached (e.g. 40% done = ` +
       `40% of the HM reward), but you get **zero Rank XP** for an unfinished quest. Rank XP only pays out for a ` +
@@ -388,9 +471,8 @@ function renderGuide(setup = {}) {
     .setColor(COLOR.gold)
     .setTitle("🛒 Where Your HM Goes")
     .setDescription(
-      `Every quest also pays ${HM_EMOJI} Honour Marks — that's the currency you spend in ${shopCh}, also reachable ` +
-      `any time from the 🛒 **Shop & Inventory** button on the quest board. Three kinds of things to buy, and the ` +
-      `Shop panel explains every single tier of each one in detail when you open it:\n\n` +
+      `Every quest also pays ${HM_EMOJI} Honour Marks — that's the currency you spend in ${shopCh}. The Shop panel ` +
+      `there explains every single tier of each one in detail when you open it:\n\n` +
       `**🎖️ Perks** — permanent. Each one you buy makes future quests in that category pay more HM, forever.\n\n` +
       `**⚡ Boosts** — temporary. While active, they multiply the **Rank XP** a finished quest in that category ` +
       `pays — not the HM. Buy one, then switch it on from **Inventory** whenever you're ready to start the clock.\n\n` +
@@ -516,7 +598,7 @@ module.exports = {
   COLOR, HM_EMOJI, DESC_BUDGET,
   chunkLines, buildPanelComponents,
   renderClaimPanel, renderGuide,
-  renderDatabase, renderQuestBoard, renderShop, emptyPage,
+  renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, emptyPage,
   getPanelLedger, syncPanel,
   getRankForXp, formatRankProgress,
   getConfigValue, setConfigValue,

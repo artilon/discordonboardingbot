@@ -204,10 +204,30 @@ check("rank XP is flat and small enough to protect the tenure curve", () => {
 
 console.log("\n[resets]");
 check("day/week/month stamps", () => {
-  const d = new Date("2026-10-28T12:00:00Z"); // Wednesday
+  const d = new Date("2026-10-28T12:00:00Z"); // Wednesday, safely midday in Chicago too
   assert.strictEqual(q.dayStamp(d), "2026-10-28");
   assert.strictEqual(q.weekStamp(d), "2026-10-26"); // Monday
   assert.strictEqual(q.monthStamp(d), "2026-10-01");
+});
+
+check("reset stamps use America/Chicago, not UTC, across the UTC day boundary", () => {
+  // 04:00 UTC on the 29th is still 23:00 on the 28th in Chicago (CDT, UTC-5).
+  // A UTC-based stamp would wrongly call this the 29th.
+  const lateNightUTC = new Date("2026-10-29T04:00:00Z");
+  assert.strictEqual(q.dayStamp(lateNightUTC), "2026-10-28", "should use Chicago's calendar day, not UTC's");
+  assert.strictEqual(q.weekStamp(lateNightUTC), "2026-10-26", "still the same Chicago week (Wednesday)");
+});
+
+check("reset stamps stay correct across the DST transition", () => {
+  // DST 2026 falls back at 2:00 AM local on Nov 1 (clocks become 1:00 AM CST).
+  // 06:30 UTC is 01:30 AM CDT (UTC-5) — just before the fallback, still Nov 1.
+  assert.strictEqual(q.dayStamp(new Date("2026-11-01T06:30:00Z")), "2026-11-01");
+  // 08:30 UTC is 02:30 AM CST (UTC-6) — just after the fallback, still Nov 1.
+  assert.strictEqual(q.dayStamp(new Date("2026-11-01T08:30:00Z")), "2026-11-01");
+  // A full day later, safely into CST: 2026-11-02T06:30:00Z is 00:30 AM CST,
+  // the start of Nov 2 local — proves the -6 offset is actually being used
+  // post-transition, not a stale -5.
+  assert.strictEqual(q.dayStamp(new Date("2026-11-02T06:30:00Z")), "2026-11-02");
 });
 
 console.log("\n[panel pagination]");

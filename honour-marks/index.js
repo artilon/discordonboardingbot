@@ -18,10 +18,11 @@ const { config, assertConfig } = require("./src/config");
 const { getSupabase } = require("./src/db");
 const { getRankForXp, formatRankProgress } = require("./src/ranks");
 const {
-  TREES, TREE_BY_KEY, QUEST_TREES,
+  TREES, TREE_BY_KEY, QUEST_TREES, PARTY_SIZES,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActivePartyQuestForUser,
-  createSoloQuest, cancelSoloQuest, createPartyQuest, creditHm,
+  cancelSoloQuest, createPartyQuest, creditHm,
+  createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
   diffProgress, fetchHiscores, cleanRsn, soloHmReward, partyHmReward,
   soloTargetPool,
 } = require("./src/quests");
@@ -31,11 +32,12 @@ const {
   PERK_TIERS, BOOST_TIERS, CONSUMABLES, perkBonusPercent, boostBonusLabel,
   getBalance, getPerks, getPerkTier, getInventory, getActiveBoosts,
   buyPerk, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
+  createSoloQuestWithChoiceToken,
 } = require("./src/shop");
 const {
   COLOR, HM_EMOJI,
   renderClaimPanel, renderGuide,
-  renderDatabase, renderQuestBoard, renderShop, syncPanel, emptyPage,
+  renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, syncPanel, emptyPage,
 } = require("./src/panels");
 const {
   readSetup, bindGuild, createStructure, verifyBindings, seedDefaults,
@@ -138,6 +140,9 @@ async function refreshPanels(guildId) {
   }
   if (questsCh) {
     await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId, setup));
+    // The permanent open-teams board lives right under the quest board, in
+    // the same channel, as its own synced panel.
+    await syncPanel(guildId, questsCh, "open_teams", await renderOpenTeams(guildId));
   }
   if (shopCh) {
     await syncPanel(guildId, shopCh, "shop", await renderShop(guildId));
@@ -572,22 +577,33 @@ async function handlePickTarget(interaction, questType, tree, picks) {
   // If the token is somehow already gone (e.g. spent in another tab a moment
   // ago), fall back to a random target rather than leaving the member with
   // nothing — the picks they made simply don't get honoured without payment.
-  return handleCreateSolo(interaction, questType, tree, used ? picks : null);
+  return handleCreateSolo(interaction, questType, tree, used ? picks : null, used);
 }
 
-async function handleCreateSolo(interaction, questType, tree, picks = null) {
+async function handleCreateSolo(interaction, questType, tree, picks = null, tokenConsumed = false) {
   if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
   const member = await getMember(interaction.user.id);
-  const result = await createSoloQuest({
+  // createSoloQuestWithChoiceToken (src/shop.js) refunds the Quest Choice
+  // Token on ANY rejection reason when tokenConsumed is true — not just the
+  // common "already active" case — the same way the Skip Token already
+  // refunds itself on a failed cancel.
+  const result = await createSoloQuestWithChoiceToken({
     guildId: interaction.guildId,
     member,
     tree,
     questType,
     picks,
+    tokenConsumed,
   });
 
   if (result.error) {
-    return interaction.editReply({ embeds: [emptyPage("Couldn't start that quest", result.error).embed], components: [] });
+    const refundNote = result.refunded
+      ? "\n\n_Your Quest Choice Token was not spent — it's back in your inventory._"
+      : "";
+    return interaction.editReply({
+      embeds: [emptyPage("Couldn't start that quest", result.error + refundNote).embed],
+      components: [],
+    });
   }
 
   const quests = await getActiveSoloQuests(interaction.user.id);
@@ -600,7 +616,7 @@ async function handleCreateSolo(interaction, questType, tree, picks = null) {
     embeds: [questProgressEmbed(quest, progress)],
     components: [
       new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("hm_check").setLabel("✅ Check Progress").setStyle(ButtonStyle.Success)
+        new ButtonBuilder().setCustomId("hm_check").setLabel("✅ Check Quests & Collect").setStyle(ButtonStyle.Success)
       ),
     ],
   });
@@ -677,7 +693,28 @@ async function handleCheck(interaction) {
 
   if (result.completed > 0) scheduleRefresh(interaction.guildId);
 
-  return interaction.editReply({ embeds: embeds.slice(0, 10) });
+  // "Check Progress" and "My Quests" used to be two separate buttons that both
+  // just showed quest status — now merged into this one press, which checks
+  // hiscores, pays out finished quests, and offers Skip Token cancel buttons.
+  const components = [];
+  if (active.length) {
+    const inv = await getInventory(interaction.user.id);
+    const skipTokens = inv.find((i) => i.tree === "quest_skip_token" && i.boost_tier === 0)?.quantity || 0;
+    if (skipTokens > 0) {
+      components.push(
+        new ActionRowBuilder().addComponents(
+          active.slice(0, 5).map((q) =>
+            new ButtonBuilder()
+              .setCustomId(`hm_cancel_quest:${q.id}`)
+              .setLabel(`❌ Cancel ${q.quest_type}`)
+              .setStyle(ButtonStyle.Danger)
+          )
+        )
+      );
+    }
+  }
+
+  return interaction.editReply({ embeds: embeds.slice(0, 10), components });
 }
 
 async function handleTeamStart(interaction) {
@@ -696,8 +733,6 @@ async function handleTeamStart(interaction) {
     flags: MessageFlags.Ephemeral,
   });
 }
-
-const PARTY_SIZES = { duo: 2, trio: 3, quad: 4 };
 
 async function handlePickSize(interaction, size) {
   if (!PARTY_SIZES[size]) {
@@ -721,6 +756,30 @@ async function handlePickSize(interaction, size) {
   });
 }
 
+/** After the category is chosen, offer the two ways to fill a team: pick
+ *  everyone yourself right now (closed group), or post an open listing on
+ *  the Looking For Group board and let people join (see handlePostOpenTeam). */
+async function handleTeamMode(interaction, size, tree) {
+  const treeLabel = TREE_BY_KEY[tree]?.label || tree;
+  return interaction.update({
+    embeds: [
+      emptyPage(
+        "👥 Pick Your Team Or Post It Publicly",
+        `**${size} • ${treeLabel}** — how do you want to fill it?\n\n` +
+        "**Pick Teammates** — choose everyone yourself and start right away.\n" +
+        "**Post Open Listing** — recruit on the **Looking For Group** board instead; " +
+        "the quest starts automatically the moment it fills."
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`hm_team_pick_members:${size}:${tree}`).setLabel("Pick Teammates").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`hm_team_post_open:${size}:${tree}`).setLabel("📋 Post Open Listing").setStyle(ButtonStyle.Success)
+      ),
+    ],
+  });
+}
+
 async function handlePickTeamMembers(interaction, size, tree) {
   const needed = PARTY_SIZES[size] - 1; // you count as the first member
   const picker = new UserSelectMenuBuilder()
@@ -738,6 +797,29 @@ async function handlePickTeamMembers(interaction, size, tree) {
       ).embed,
     ],
     components: [new ActionRowBuilder().addComponents(picker)],
+  });
+}
+
+/** Posts an open listing instead of picking members directly. */
+async function handlePostOpenTeam(interaction, size, tree) {
+  await interaction.deferUpdate();
+  const result = await createOpenTeam({ guildId: interaction.guildId, posterId: interaction.user.id, size, tree });
+
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Couldn't post that listing", result.error).embed], components: [] });
+  }
+
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        "📋 Listing posted",
+        `**${size} • ${TREE_BY_KEY[tree].label}** is now open on the **Looking For Group** board, under the quest board.\n\n` +
+        `Needs ${PARTY_SIZES[size] - 1} more. It starts automatically the moment it fills, ` +
+        `or expires in 24 hours if it doesn't. You can cancel it early from the LFG board.`
+      ).embed,
+    ],
+    components: [],
   });
 }
 
@@ -770,6 +852,45 @@ async function handleCreateTeam(interaction, size, tree) {
     ],
     components: [],
   });
+}
+
+// ── Looking For Group ────────────────────────────────────────────────────────
+/** Joining is a select on the permanent, shared LFG panel, so it responds
+ *  ephemerally rather than editing the shared message directly — the panel
+ *  itself refreshes separately via scheduleRefresh once membership changes. */
+async function handleLfgJoin(interaction, postId) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = await joinOpenTeam({ guildId: interaction.guildId, postId: Number(postId), userId: interaction.user.id });
+
+  if (result.error) {
+    return interaction.editReply({ content: result.error });
+  }
+
+  scheduleRefresh(interaction.guildId);
+
+  if (result.started) {
+    return interaction.editReply({
+      content:
+        `👥 **Team quest started!** **${result.size} • ${TREE_BY_KEY[result.tree]?.label || result.tree}**\n\n` +
+        `${result.members.map((m) => `<@${m}>`).join(", ")}\n\n` +
+        "Progress combines from everyone. Press **Check Quests & Collect** on the quest board when you think you've hit the target.",
+    });
+  }
+  return interaction.editReply({
+    content: `✅ You joined the **${result.size} • ${TREE_BY_KEY[result.tree]?.label || result.tree}** listing. Needs **${result.needed}** more before it starts.`,
+  });
+}
+
+async function handleLfgCancelMine(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = await cancelOpenTeam(interaction.guildId, interaction.user.id);
+
+  if (result.error) {
+    return interaction.editReply({ content: "You don't have an open listing posted right now." });
+  }
+
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({ content: "✅ Your open listing has been cancelled and removed from the board." });
 }
 
 // ── Role self-service ────────────────────────────────────────────────────────
@@ -839,27 +960,6 @@ async function handleDropRole(interaction) {
       `✅ **Honour Marks role removed.**\n\n` +
       `Your progress, Honour Marks and quest history are all kept — the role only controls access. ` +
       `Claim it again any time at <#${setup.channels.claim}>.`,
-  });
-}
-
-async function handleShopOpen(interaction) {
-  const bal = await getBalance(interaction.user.id);
-  return interaction.reply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(COLOR.gold)
-        .setTitle(`${HM_EMOJI} Shop`)
-        .setDescription(`You hold **${bal.balance.toLocaleString()}** Honour Marks.\n\nChoose a section.`)
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("hm_shop_perks").setLabel("🎖️ Perks").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("hm_shop_boosts").setLabel("⚡ Boosts").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("hm_shop_consumables").setLabel("🎫 Consumables").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("hm_inventory").setLabel("🎒 Inventory").setStyle(ButtonStyle.Secondary)
-      ),
-    ],
-    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -1072,23 +1172,6 @@ async function handleGuideOpen(interaction) {
   });
 }
 
-async function handleLfgOpen(interaction) {
-  // Honest placeholder rather than a dead button: the board needs a join/leave
-  // flow that isn't built yet, and a button that silently fails is worse than
-  // one that explains itself.
-  return interaction.reply({
-    embeds: [
-      emptyPage(
-        "🔍 Looking For Group",
-        "The public board isn't live yet. For now, start a team quest with **Start a Team Quest** " +
-        "on the quest board and invite your members directly.\n\n" +
-        "_An open LFG board is on the list._"
-      ).embed,
-    ],
-    flags: MessageFlags.Ephemeral,
-  });
-}
-
 async function handleInventory(interaction) {
   const bal = await getBalance(interaction.user.id);
   const inv = await getInventory(interaction.user.id);
@@ -1171,60 +1254,6 @@ async function handleActivateBoost(interaction, value) {
   });
 }
 
-async function handleMyQuests(interaction) {
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const member = await getMember(interaction.user.id);
-  if (!member?.rsn) return interaction.editReply({ content: "Run `/register` first." });
-
-  const solo = await getActiveSoloQuests(interaction.user.id);
-  const team = await getActivePartyQuestForUser(interaction.user.id);
-
-  if (!solo.length && !team) {
-    return interaction.editReply({ content: "You have no active quests. Open the quest board and press **Start a Solo Quest**." });
-  }
-
-  const snap = await fetchHiscores(member.rsn);
-  const embeds = [];
-
-  for (const q of solo) {
-    const progress = diffProgress(q.baseline, snap, q.targets);
-    embeds.push(questProgressEmbed(q, progress));
-  }
-  if (team) {
-    const evaluated = await checkPartyQuest(team);
-    if (evaluated?.progress) {
-      embeds.push(
-        new EmbedBuilder()
-          .setColor(COLOR.main)
-          .setTitle(`👥 TEAM • ${team.size} • ${team.tree}`)
-          .setDescription(
-            `**Team progress: ${evaluated.progress.totalPct}%**\n\n` +
-            evaluated.progress.parts.map((p) => `• ${formatPart(p)} — **${Math.floor(p.pct)}%**`).join("\n") +
-            `\n\nEnds <t:${Math.floor(new Date(team.expires_at).getTime() / 1000)}:R>`
-          )
-      );
-    }
-  }
-
-  const components = [];
-  const inv = await getInventory(interaction.user.id);
-  const skipTokens = inv.find((i) => i.tree === "quest_skip_token" && i.boost_tier === 0)?.quantity || 0;
-  if (skipTokens > 0 && solo.length) {
-    components.push(
-      new ActionRowBuilder().addComponents(
-        solo.slice(0, 5).map((q) =>
-          new ButtonBuilder()
-            .setCustomId(`hm_cancel_quest:${q.id}`)
-            .setLabel(`❌ Cancel ${q.quest_type}`)
-            .setStyle(ButtonStyle.Danger)
-        )
-      )
-    );
-  }
-
-  return interaction.editReply({ embeds: embeds.slice(0, 10), components });
-}
-
 async function handleCancelQuest(interaction, questId) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const used = await consumeItem(interaction.user.id, "quest_skip_token");
@@ -1242,7 +1271,7 @@ async function handleCancelQuest(interaction, questId) {
 
   scheduleRefresh(interaction.guildId);
   return interaction.editReply({
-    content: "✅ Quest cancelled — no penalty, no reward, and that slot is free again. Press **My Quests** to start a new one.",
+    content: "✅ Quest cancelled — no penalty, no reward, and that slot is free again. Open the quest board and press **Start a Solo Quest** to start a new one.",
   });
 }
 
@@ -1272,19 +1301,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const questId = btnId.split(":")[1];
         return await handleCancelQuest(interaction, questId);
       }
+      if (btnId.startsWith("hm_team_pick_members:")) {
+        const [, size, tree] = btnId.split(":");
+        return await handlePickTeamMembers(interaction, size, tree);
+      }
+      if (btnId.startsWith("hm_team_post_open:")) {
+        const [, size, tree] = btnId.split(":");
+        return await handlePostOpenTeam(interaction, size, tree);
+      }
 
       switch (interaction.customId) {
         case "hm_quest_start": return await handleQuestStart(interaction);
         case "hm_team_start": return await handleTeamStart(interaction);
         case "hm_check": return await handleCheck(interaction);
-        case "hm_my_quests": return await handleMyQuests(interaction);
         case "hm_claim_role": return await handleClaimRole(interaction);
         case "hm_drop_role": return await handleDropRole(interaction);
-        case "hm_shop_open": return await handleShopOpen(interaction);
         case "hm_shop_perks": return await handleShopPerks(interaction);
         case "hm_shop_boosts": return await handleShopBoosts(interaction);
         case "hm_shop_consumables": return await handleShopConsumables(interaction);
-        case "hm_lfg_open": return await handleLfgOpen(interaction);
+        case "hm_lfg_cancel_mine": return await handleLfgCancelMine(interaction);
         case "hm_inventory": return await handleInventory(interaction);
         case "hm_guide_open": return await handleGuideOpen(interaction);
         case "hm_db_page": // disabled label button; never fires, kept so a
@@ -1329,7 +1364,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (id.startsWith("hm_pick_team_tree:")) {
         const size = id.split(":")[1];
-        return await handlePickTeamMembers(interaction, size, interaction.values[0]);
+        return await handleTeamMode(interaction, size, interaction.values[0]);
+      }
+      if (id === "hm_lfg_join") {
+        return await handleLfgJoin(interaction, interaction.values[0]);
       }
       return;
     }
@@ -1380,6 +1418,7 @@ client.once(Events.ClientReady, async () => {
   const sweep = async () => {
     try {
       await sweepExpiredQuests();
+      await sweepExpiredOpenTeams();
     } catch (e) {
       console.error("[Honour Marks] Expiry sweep failed:", e.message);
     }

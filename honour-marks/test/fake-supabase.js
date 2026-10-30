@@ -10,6 +10,18 @@ function matchFilters(row, filters) {
     if (op === "eq") return String(cell) === String(val);
     if (op === "is") return val === null ? cell == null : cell === val;
     if (op === "lte") return String(cell) <= String(val);
+    if (op === "lt") {
+      const a = Number(cell);
+      const b = Number(val);
+      if (Number.isFinite(a) && Number.isFinite(b)) return a < b;
+      return String(cell) < String(val);
+    }
+    if (op === "gte") {
+      const a = Number(cell);
+      const b = Number(val);
+      if (Number.isFinite(a) && Number.isFinite(b)) return a >= b;
+      return String(cell) >= String(val);
+    }
     if (op === "gt") {
       // Numeric columns (quantity) compare as numbers; ISO timestamp columns
       // (expires_at) aren't numeric, so fall back to string comparison, which
@@ -53,6 +65,8 @@ function createFakeSupabase(tables = {}) {
       eq(col, val) { q.filters.push([col, "eq", val]); return api; },
       is(col, val) { q.filters.push([col, "is", val]); return api; },
       lte(col, val) { q.filters.push([col, "lte", val]); return api; },
+      lt(col, val) { q.filters.push([col, "lt", val]); return api; },
+      gte(col, val) { q.filters.push([col, "gte", val]); return api; },
       gt(col, val) { q.filters.push([col, "gt", val]); return api; },
       ilike(col, val) { q.filters.push([col, "ilike", val]); return api; },
       contains(col, val) { q.filters.push([col, "contains", val]); return api; },
