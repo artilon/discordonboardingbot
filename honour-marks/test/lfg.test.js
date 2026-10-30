@@ -200,6 +200,23 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
     assert.deepStrictEqual(Object.keys(party.targets.bosses), ["zulrah"], "the pick made at post-time is what the real quest actually targets");
   });
 
+  await check("a hand-picked Raids listing survives into the real quest — raids are never rolled at random", async () => {
+    registerMember("poster-raid");
+    registerMember("joiner-raid");
+    await createOpenTeam({ guildId: "g1", posterId: "poster-raid", size: "duo", tree: "raids", picks: ["theatre_of_blood"] });
+    const [post] = await getOpenTeams("g1");
+    assert.deepStrictEqual(post.picks, ["theatre_of_blood"]);
+
+    const result = await joinOpenTeam({ guildId: "g1", postId: post.id, userId: "joiner-raid" });
+    assert.strictEqual(result.ok, true);
+
+    const party = fake.db.hm_party_quests.find((p) =>
+      p.members.includes("poster-raid") && p.members.includes("joiner-raid")
+    );
+    assert.ok(party);
+    assert.deepStrictEqual(Object.keys(party.targets.bosses), ["theatre_of_blood"]);
+  });
+
   console.log("\n[LFG — unfilled listings expire]");
 
   await check("a listing older than the expiry window is swept away", async () => {

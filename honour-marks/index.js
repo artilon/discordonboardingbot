@@ -557,8 +557,19 @@ function targetLabel(kind, key) {
  * offered the chance to spend it hand-picking the exact target instead of
  * letting the bot roll one at random. Nothing changes for anyone who doesn't
  * own one — they go straight to a random quest, same as before.
+ *
+ * Raids are the one exception to all of this: there's no safe "random"
+ * target to roll for a Raid, since Chambers of Xeric / Theatre of Blood /
+ * Tombs of Amascut are different enough encounters that a random pick could
+ * easily assign one the member can't actually do on their own. So a Raids
+ * quest always skips straight to a mandatory pick (handleRaidPick below),
+ * for free — it never touches a Quest Choice Token at all, token or not.
  */
 async function handleTreeChosen(interaction, questType, tree) {
+  if (treeKind(tree) === "raid") {
+    return handleRaidPick(interaction, questType, tree);
+  }
+
   const inv = await getInventory(interaction.user.id);
   const hasChoiceToken = inv.some((i) => i.tree === "quest_choice_token" && i.boost_tier === 0 && i.quantity > 0);
 
@@ -580,6 +591,35 @@ async function handleTreeChosen(interaction, questType, tree) {
         new ButtonBuilder().setCustomId(`hm_quest_random:${questType}:${tree}`).setLabel("🎲 Random (keep token)").setStyle(ButtonStyle.Secondary)
       ),
     ],
+  });
+}
+
+/**
+ * Mandatory Raids target picker — always shown, free, no token involved.
+ * Picks exactly which raid(s) a Raids quest targets instead of ever rolling
+ * one at random (soloTargetPool's raid branch is always a single pick).
+ */
+async function handleRaidPick(interaction, questType, tree) {
+  const spec = soloTargetPool(tree, questType);
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`hm_pick_raid:${questType}:${tree}`)
+    .setPlaceholder(`Pick ${spec.count === 1 ? "your raid" : `${spec.count} raids`}…`)
+    .setMinValues(spec.count)
+    .setMaxValues(spec.count)
+    .addOptions(
+      spec.pool.map((key) =>
+        new StringSelectMenuOptionBuilder().setLabel(targetLabel(spec.kind, key)).setValue(key)
+      )
+    );
+
+  return interaction.update({
+    embeds: [
+      emptyPage(
+        "⚔️ Pick Your Raid",
+        `Raids are always picked, never rolled at random — select exactly ${spec.count === 1 ? "one" : spec.count}.`
+      ).embed,
+    ],
+    components: [new ActionRowBuilder().addComponents(menu)],
   });
 }
 
@@ -821,6 +861,14 @@ async function handleTeamTreeChosen(interaction, size, tree) {
   // abandoned attempt, so a stale hand-pick can never leak into this team.
   setPendingTeamPick(interaction.guildId, interaction.user.id, size, tree, null, false);
 
+  // Same exception as the solo flow: a team Raids quest is always picked by
+  // the creator, never rolled at random — a random raid could easily be one
+  // the team can't actually do together — and it never touches a Quest
+  // Choice Token, token or not. See handleTreeChosen for the full reasoning.
+  if (treeKind(tree) === "raid") {
+    return handleTeamChoose(interaction, size, tree, { free: true });
+  }
+
   const inv = await getInventory(interaction.user.id);
   const hasChoiceToken = inv.some((i) => i.tree === "quest_choice_token" && i.boost_tier === 0 && i.quantity > 0);
 
@@ -846,16 +894,20 @@ async function handleTeamTreeChosen(interaction, size, tree) {
   });
 }
 
-/** Shows the pool for this category so the creator can pick the team's own target(s). */
-async function handleTeamChoose(interaction, size, tree) {
+/** Shows the pool for this category so the creator can pick the team's own
+ *  target(s). `free` marks the mandatory, no-token Raids path (see
+ *  handleTeamTreeChosen) — it routes the resulting select menu to
+ *  handleTeamRaidPickTarget instead of the paid handleTeamPickTarget, so no
+ *  Quest Choice Token is ever touched for a Raids pick. */
+async function handleTeamChoose(interaction, size, tree, { free = false } = {}) {
   const spec = partyTargetPool(tree, size);
   if (!spec || !spec.pool.length) {
     return handleTeamMode(interaction, size, tree);
   }
 
   const menu = new StringSelectMenuBuilder()
-    .setCustomId(`hm_team_pick_target:${size}:${tree}`)
-    .setPlaceholder(`Pick ${spec.count === 1 ? "the target" : `${spec.count} targets`}…`)
+    .setCustomId(`${free ? "hm_team_pick_raid" : "hm_team_pick_target"}:${size}:${tree}`)
+    .setPlaceholder(`Pick ${spec.count === 1 ? (free ? "your raid" : "the target") : `${spec.count} targets`}…`)
     .setMinValues(spec.count)
     .setMaxValues(spec.count)
     .addOptions(
@@ -867,10 +919,12 @@ async function handleTeamChoose(interaction, size, tree) {
   return interaction.update({
     embeds: [
       emptyPage(
-        "🎯 Pick The Team's Target",
+        free ? "⚔️ Pick The Team's Raid" : "🎯 Pick The Team's Target",
         spec.pool.length > 25
           ? `Showing the first 25 of ${spec.pool.length} options.`
-          : `Select exactly ${spec.count}.`
+          : free
+            ? `Raids are always picked, never rolled at random — select exactly ${spec.count === 1 ? "one" : spec.count}.`
+            : `Select exactly ${spec.count}.`
       ).embed,
     ],
     components: [new ActionRowBuilder().addComponents(menu)],
@@ -893,6 +947,16 @@ async function handleTeamPickTarget(interaction, size, tree, picks) {
   setPendingTeamPick(interaction.guildId, interaction.user.id, size, tree, used ? picks : null, used);
   return handleTeamMode(interaction, size, tree);
 }
+
+/** The creator confirmed which raid(s) the team targets. No token is ever
+ *  involved — a Raids pick is mandatory, not a paid extra — so this just
+ *  stashes the pick with tokenConsumed: false and moves on. */
+async function handleTeamRaidPickTarget(interaction, size, tree, picks) {
+  await interaction.deferUpdate();
+  setPendingTeamPick(interaction.guildId, interaction.user.id, size, tree, picks, false);
+  return handleTeamMode(interaction, size, tree);
+}
+
 
 /** After the category is chosen, offer the two ways to fill a team: pick
  *  everyone yourself right now (closed group), or post an open listing on
@@ -1645,6 +1709,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const [, questType, tree] = id.split(":");
         return await handlePickTarget(interaction, questType, tree, interaction.values);
       }
+      if (id.startsWith("hm_pick_raid:")) {
+        const [, questType, tree] = id.split(":");
+        // No token involved — picking a raid is mandatory, not a paid
+        // extra, so this goes straight to creation with tokenConsumed: false
+        // and nothing to ever refund.
+        return await handleCreateSolo(interaction, questType, tree, interaction.values, false);
+      }
       if (id === "hm_buy_perk") {
         return await handleBuyPerk(interaction, interaction.values[0]);
       }
@@ -1670,6 +1741,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (id.startsWith("hm_team_pick_target:")) {
         const [, size, tree] = id.split(":");
         return await handleTeamPickTarget(interaction, size, tree, interaction.values);
+      }
+      if (id.startsWith("hm_team_pick_raid:")) {
+        const [, size, tree] = id.split(":");
+        return await handleTeamRaidPickTarget(interaction, size, tree, interaction.values);
       }
       if (id === "hm_lfg_join") {
         return await handleLfgJoin(interaction, interaction.values[0]);

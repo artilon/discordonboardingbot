@@ -425,6 +425,46 @@ async function registerMember(userId, rsn) {
     assert.ok(!skills.includes("not-a-real-skill"), "the invalid pick never makes it into the targets");
   });
 
+  console.log("\n[Raids are always picked, never rolled at random]");
+  await check("a solo Raids quest honours an explicit pick instead of ever rolling randomly", async () => {
+    await registerMember("u-raid-pick", "RaidPick1");
+    snapshots["RaidPick1"] = snapshotWithLevels({});
+
+    const member = await q.getMember("u-raid-pick");
+    // Run it enough times that a real random roll would almost certainly
+    // have produced a different raid at least once if picks were ignored.
+    for (let i = 0; i < 10; i++) {
+      const result = await q.createSoloQuest({
+        guildId: "g1", member, tree: "raids", questType: "daily", picks: ["theatre_of_blood"],
+      });
+      assert.strictEqual(result.ok, true, result.error);
+      const row = fake.db.hm_quests.find((r) => r.user_id === "u-raid-pick" && r.quest_type === "daily");
+      assert.deepStrictEqual(Object.keys(row.targets.bosses), ["theatre_of_blood"], "the picked raid, never a different one");
+      await q.cancelSoloQuest("u-raid-pick", row.id);
+    }
+  });
+
+  await check("a team Raids quest honours the creator's pick, including under Quest Expansion's % mechanic", async () => {
+    await registerMember("p1-raid", "Raid1");
+    await registerMember("p2-raid", "Raid2");
+    snapshots["Raid1"] = snapshotWithLevels({});
+    snapshots["Raid2"] = snapshotWithLevels({});
+    // Raids expand via a % requirement bump, never by changing WHICH raid is
+    // targeted — owning this must not disturb the hand-picked identity.
+    fake.db.hm_items.push({ user_id: "p1-raid", guild_id: "g1", tree: "raids", slot: q.ITEM_SLOT.EXPANSION, tier: 3 });
+
+    const result = await q.createPartyQuest({
+      guildId: "g1", members: ["p1-raid", "p2-raid"], tree: "raids", size: "duo", difficulty: "easy",
+      picks: ["tombs_of_amascut"],
+    });
+    assert.strictEqual(result.ok, true, result.error);
+
+    const row = fake.db.hm_party_quests.find((r) => r.members.includes("p1-raid"));
+    assert.deepStrictEqual(Object.keys(row.targets.bosses), ["tombs_of_amascut"]);
+    const [kc] = Object.values(row.targets.bosses);
+    assert.strictEqual(kc, Math.round(15 * 1.1), "the base duo raid KC (15) still gets the owned +10% Expansion bump");
+  });
+
   console.log(`\n${passed} checks passed.`);
 })().catch((e) => {
   console.error("FAILED:", e);

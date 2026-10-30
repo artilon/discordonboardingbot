@@ -462,7 +462,13 @@ async function consumeItem(userId, key) {
  * like a plain `createSoloQuest` call.
  */
 async function createSoloQuestWithChoiceToken({ guildId, member, tree, questType, picks, tokenConsumed }) {
-  const result = await createSoloQuest({ guildId, member, tree, questType, picks: tokenConsumed ? picks : null });
+  // `picks` is already null whenever nothing was actually paid for it — the
+  // caller (handlePickTarget in index.js) only ever passes real picks
+  // through alongside tokenConsumed: true. Honouring `picks` unconditionally
+  // here also lets a mandatory, no-token pick (Raids — see buildSoloTargets'
+  // docs on why raids are never randomly assigned) flow through the exact
+  // same refund-aware path with tokenConsumed: false and nothing to refund.
+  const result = await createSoloQuest({ guildId, member, tree, questType, picks });
 
   if (result.error && tokenConsumed) {
     const refunded = await grantConsumable(member.user_id, guildId, "quest_choice_token");
@@ -482,7 +488,11 @@ async function createSoloQuestWithChoiceToken({ guildId, member, tree, questType
  * ends up on the roster.
  */
 async function createPartyQuestWithChoiceToken({ guildId, members, tree, size, difficulty, picks, tokenConsumed, userId }) {
-  const result = await createPartyQuest({ guildId, members, tree, size, difficulty, picks: tokenConsumed ? picks : null });
+  // See createSoloQuestWithChoiceToken above: `picks` is honoured
+  // unconditionally because the caller already only supplies real picks
+  // alongside a true tokenConsumed (or, for a mandatory Raids pick, with
+  // tokenConsumed: false and nothing to ever refund).
+  const result = await createPartyQuest({ guildId, members, tree, size, difficulty, picks });
 
   if (result.error && tokenConsumed) {
     const refunded = await grantConsumable(userId, guildId, "quest_choice_token");
@@ -500,7 +510,9 @@ async function createPartyQuestWithChoiceToken({ guildId, members, tree, size, d
  * even been created yet at that point, so there's nothing else to undo.
  */
 async function createOpenTeamWithChoiceToken({ guildId, posterId, size, tree, picks, tokenConsumed }) {
-  const result = await createOpenTeam({ guildId, posterId, size, tree, picks: tokenConsumed ? picks : null });
+  // See createSoloQuestWithChoiceToken above for why `picks` isn't re-gated
+  // on tokenConsumed here.
+  const result = await createOpenTeam({ guildId, posterId, size, tree, picks });
 
   if (result.error && tokenConsumed) {
     const refunded = await grantConsumable(posterId, guildId, "quest_choice_token");
