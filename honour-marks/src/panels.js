@@ -651,11 +651,11 @@ function renderGuide(setup = {}) {
       body:
         `**Items** are also **permanent**, like Perks, but each one changes something different about how a ` +
         `quest actually works instead of just paying more ${HM_EMOJI} HM. Every category has all **3 slots**, ` +
-        `**3 tiers each**, bought in order, 9 purchases total per category:\\n\\n` +
+        `**3 tiers each**, bought in order, 9 purchases total per category:\n\n` +
         `**📉 Slot 1 — Quest & Threshold Reduction** — lowers the XP/KC/clears/completions a quest in that ` +
-        `category asks for: -2% at T1, -5% at T2, -10% at T3. Prices: 600 / 1,400 / 5,000 HM.\\n\\n` +
+        `category asks for: -2% at T1, -5% at T2, -10% at T3. Prices: 600 / 1,400 / 5,000 HM.\n\n` +
         `**💬 Slot 2 — Clan Chat XP Bonus** — raises the **Rank XP** (not HM — that's what Perks already do) a ` +
-        `quest in that category pays: +2% / +5% / +10%. Prices: 900 / 1,750 / 10,062 HM.\\n\\n` +
+        `quest in that category pays: +2% / +5% / +10%. Prices: 900 / 1,750 / 10,062 HM.\n\n` +
         `**📜 Slot 3 — Quest Expansion** — for Gathering, Production, Combat, Utility and Boss PvM, this adds ` +
         `extra full-requirement targets: T1 adds 1 (2 total), T2 adds 2 (3 total), T3 adds 3 (4 total) — each ` +
         `extra target needs the FULL normal requirement, same as any other target. For Raids and Minigames, ` +
@@ -663,16 +663,16 @@ function renderGuide(setup = {}) {
         `Either way, the quest's ${HM_EMOJI} HM and Rank XP pay out **exactly proportionally** more for the ` +
         `extra work — a 4-target Quest Expansion skill quest pays 4× what a normal 1-target quest of the same ` +
         `length pays, never a diminished rate. Prices: Gathering/Production/Combat/Utility/Boss PvM — ` +
-        `5,000 / 15,000 / 35,000 HM. Raids/Minigames — 2,000 / 6,000 / 18,000 HM.\\n\\n` +
+        `5,000 / 15,000 / 35,000 HM. Raids/Minigames — 2,000 / 6,000 / 18,000 HM.\n\n` +
         `**Buying one:** open ${shopCh}, press **🗃️ Items**, and pick a purchase from the dropdown — it shows ` +
         `every slot across every category you haven't maxed, with its next tier's cost and effect. It's bought ` +
-        `**immediately** if you can afford it, with no confirmation step.\\n\\n` +
+        `**immediately** if you can afford it, with no confirmation step.\n\n` +
         `**Team quests:** every Item (and Perk) you own applies automatically to any team quest you're on in ` +
         `that category too, and stacks with what your teammates own — if two of you each own +5% Clan Chat XP ` +
         `Bonus in Combat, the team quest pays +10% total. The one exception is Quest Expansion's EXTRA-TARGET ` +
         `(not percentage) effect on skill/Boss PvM categories — a team uses whichever single member owns the ` +
         `**highest** tier, not everyone's added together, so a 4-person team can't stack up to an unreasonable ` +
-        `16 required targets from one purchase each.\\n\\n` +
+        `16 required targets from one purchase each.\n\n` +
         `A Boss PvM Quest Expansion item also interacts with the boss safety check (next page) — if there ` +
         `aren't enough safe bosses to fill every extra target it asks for, you'll still get however many are ` +
         `safe, each needing proportionally more kills instead, so the total grind and reward stay the same.`,
@@ -683,22 +683,22 @@ function renderGuide(setup = {}) {
       body:
         `A random Boss PvM roll used to have zero regard for whether you could actually survive the fight — a ` +
         `brand-new account could get assigned Nex. This is the fix: the bot filters the boss pool down to ones ` +
-        `your (or your whole team's) current stats can reasonably handle before rolling.\\n\\n` +
+        `your (or your whole team's) current stats can reasonably handle before rolling.\n\n` +
         `**How a boss qualifies for the random roll.** Each boss on the list has rough, community-sourced ` +
-        `\"recommended stats\" (hitpoints, defence, prayer, and an attack style requirement). You qualify for a ` +
-        `boss if **either**:\\n` +
-        `• your current hiscores stats clear every one of its recommended numbers, **or**\\n` +
+        `"recommended stats" (hitpoints, defence, prayer, and an attack style requirement). You qualify for a ` +
+        `boss if **either**:\n` +
+        `• your current hiscores stats clear every one of its recommended numbers, **or**\n` +
         `• you already have **any prior kill count** on it at all — proof you've already done it, regardless of ` +
-        `what the recommendation says.\\n\\n` +
+        `what the recommendation says.\n\n` +
         `**Team quests** need **every single member** to individually qualify for a boss before it can be ` +
-        `assigned — one under-levelled teammate is enough to rule a boss out for the whole group.\\n\\n` +
+        `assigned — one under-levelled teammate is enough to rule a boss out for the whole group.\n\n` +
         `**If not enough bosses qualify.** Say a quest (or a Tier-3 Quest Expansion item) wants 4 Boss PvM ` +
         `targets but only 2 bosses are actually safe for everyone involved — you still get exactly those 2, ` +
         `just with the required kill count on each doubled, so the total expected grind (and the reward it ` +
         `pays) comes out the same as a full 4-target quest would have. If literally **nothing** on the whole ` +
         `list is safe yet, you still get exactly one boss — whichever has the lowest requirements overall — ` +
         `with its KC scaled up to cover the full target count by itself, rather than the quest failing to ` +
-        `generate at all.\\n\\n` +
+        `generate at all.\n\n` +
         `**This entire check is skipped for a hand-picked target.** If you spend a 🎯 Quest Choice Token to ` +
         `pick your own boss, that's an informed, intentional choice — the safety check never overrides or ` +
         `blocks it, even if your stats don't technically meet the recommendation.`,
@@ -710,19 +710,19 @@ function renderGuide(setup = {}) {
         `Random skill-quest rolls (Gathering, Production, Combat, Utility) don't pick with flat equal odds ` +
         `across every skill in the category — **lower-level skills are weighted to come up more often**, so ` +
         `the bot stops repeatedly handing you a skill you've already maxed while the one you actually still ` +
-        `need to train almost never gets rolled.\\n\\n` +
+        `need to train almost never gets rolled.\n\n` +
         `**The rough idea:** a skill's chance of being picked goes up the lower its level is. A level 1 skill ` +
         `is roughly 99 times as likely to be picked as a level 99 skill in the same category — but a maxed, ` +
         `level 99 skill still always has a small, genuinely nonzero chance of coming up. It's never fully ` +
-        `excluded, it's just rare.\\n\\n` +
+        `excluded, it's just rare.\n\n` +
         `**Quests needing more than one skill** (a Monthly quest, or a Quest Expansion item asking for extra ` +
         `targets) roll each pick without repeats, still favouring whichever skills are lowest among whatever ` +
-        `hasn't been picked yet for that quest.\\n\\n` +
+        `hasn't been picked yet for that quest.\n\n` +
         `**Team quests** weight each candidate skill by whichever team member's level in it is the **lowest** ` +
         `— so the roll favours training that's useful to the team as a whole, not just whoever's furthest ` +
-        `behind on average.\\n\\n` +
+        `behind on average.\n\n` +
         `**This weighting is skills only.** Boss PvM, Raids and Minigame rolls are unaffected — those are ` +
-        `governed by the boss safety check (previous page) and plain random choice, respectively.\\n\\n` +
+        `governed by the boss safety check (previous page) and plain random choice, respectively.\n\n` +
         `**Hand-picking with a 🎯 Quest Choice Token completely bypasses this** — once you're choosing your own ` +
         `target, there's nothing left to weight; every valid option in the category is shown and selectable.`,
     },
