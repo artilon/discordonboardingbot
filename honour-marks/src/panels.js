@@ -362,11 +362,11 @@ async function renderOpenTeams(guildId) {
       )
     );
   }
-  components.push(
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("hm_lfg_cancel_mine").setLabel("❌ Cancel My Listing").setStyle(ButtonStyle.Danger)
-    )
-  );
+  // "Cancel My Listing" used to live here, but this panel is one shared
+  // message for the whole server — every viewer sees the same buttons, so it
+  // had to stay visible even for someone with no listing to cancel. It now
+  // lives on the (personal, ephemeral) Inventory view instead, where it only
+  // shows up for a member who actually has one open.
 
   return [{ embed, components }];
 }
@@ -689,8 +689,8 @@ function renderGuide(setup = {}) {
         `stays open for others to join.\n\n` +
         `**Expiry.** An open listing that never fills disappears after **24 hours**. Nothing is lost — whoever ` +
         `posted it can simply post again.\n\n` +
-        `**Cancelling early.** Press **❌ Cancel My Listing** on the LFG board any time before it fills. This ` +
-        `only cancels a listing YOU personally posted.\n\n` +
+        `**Cancelling early.** Open **🎒 Inventory** — if you currently have a listing open, a **🗑️ Cancel My ` +
+        `Open Listing** button appears there. This only cancels a listing YOU personally posted.\n\n` +
         `Once a listing converts into a real quest, it behaves exactly like any other team quest from Page 4 — ` +
         `same rewards, same 14-day duration, checked and collected the exact same way.`,
     },
@@ -862,9 +862,11 @@ function renderGuide(setup = {}) {
         `it disappears and that slot is immediately free for a new quest. Doesn't work on team quests.\n` +
         `Step by step:\n` +
         `1. Buy it from **🎫 Consumables** in ${shopCh}.\n` +
-        `2. Go to the quest board and press **✅ Check Quests & Collect**.\n` +
-        `3. A red **❌ Cancel [type]** button appears under the results for each active solo quest, as long as ` +
-        `you own at least one token.\n` +
+        `2. Easiest: press **🎒 Inventory**, then **⏭️ Use Quest Skip Token** — that button only shows up when ` +
+        `you own one, and takes you straight to the quest list below. You can also get there manually by going ` +
+        `to the quest board and pressing **✅ Check Quests & Collect**.\n` +
+        `3. A red **⏭️ Use Skip Token: [type]** button appears under the results for each active solo quest, as ` +
+        `long as you own at least one token.\n` +
         `4. Press it to cancel that specific quest. If the cancel attempt itself somehow fails (the quest ` +
         `already finished or expired a moment earlier), your token is **automatically refunded** — you never ` +
         `lose one for nothing.\n\n` +
@@ -872,7 +874,9 @@ function renderGuide(setup = {}) {
         `instead of letting the bot roll one at random.\n` +
         `Step by step:\n` +
         `1. Buy it from **🎫 Consumables**.\n` +
-        `2. Start a new solo quest as normal (Start a Solo Quest → pick length → pick category).\n` +
+        `2. Easiest: press **🎒 Inventory**, then **🎯 Use Quest Choice Token** — that button only shows up when ` +
+        `you own one, and jumps straight to starting a quest. You can also start one manually as normal (Start ` +
+        `a Solo Quest → pick length → pick category).\n` +
         `3. Because you own a token, you'll be shown a choice: **🎯 Hand-pick (uses token)** or ` +
         `**🎲 Random (keep token)**.\n` +
         `4. Hand-pick opens a dropdown of every valid skill/boss for that category and length — select exactly ` +
@@ -895,14 +899,22 @@ function renderGuide(setup = {}) {
       short: "Your Inventory",
       title: "🎒 Step 10: Your Inventory, Step By Step",
       body:
-        `Press **🎒 Inventory** (in ${shopCh}) any time to see everything you currently hold, split into four ` +
+        `Press **🎒 Inventory** (in ${shopCh}) any time to see everything you currently hold, split into five ` +
         `sections:\n` +
         `• **Perks** — your current tier in every category you own one in.\n` +
+        `• **Items** — your current tier (and slot) in every category you own one in.\n` +
         `• **Boosts owned** — boosts you've bought but not yet activated, sitting ready to go.\n` +
         `• **Consumables** — how many Skip Tokens and Choice Tokens you currently have.\n` +
         `• **Active boosts** — any boost currently running, and exactly when it expires.\n\n` +
-        `If you own at least one un-activated boost, a dropdown appears at the bottom labelled **"Activate a ` +
-        `boost…"** — pick one to start its timer (see Page 9 for exactly what that does).\n\n` +
+        `Below those, buttons only appear when they're actually useful to you:\n` +
+        `• If you own at least one un-activated boost, a dropdown labelled **"Activate a boost…"** lets you ` +
+        `start its timer (see Page 9 for exactly what that does).\n` +
+        `• If you own a Quest Skip Token, **⏭️ Use Quest Skip Token** jumps straight to cancelling an active ` +
+        `solo quest (Page 9).\n` +
+        `• If you own a Quest Choice Token, **🎯 Use Quest Choice Token** jumps straight to starting a quest so ` +
+        `you can hand-pick its target (Page 9).\n` +
+        `• If you currently have an open Looking For Group listing posted, **🗑️ Cancel My Open Listing** cancels ` +
+        `it (Page 6) — this button only shows up for the member who actually has one open.\n\n` +
         `Your balance (${HM_EMOJI} HM) is shown at the top of this same screen. You can also check it any time ` +
         `with \`/hm balance\` without opening Inventory at all.`,
     },

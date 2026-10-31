@@ -23,7 +23,7 @@ const {
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActivePartyQuestForUser,
   cancelSoloQuest, createPartyQuest, creditHm,
-  createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
+  createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams, getOpenTeamForUser,
   diffProgress, fetchHiscores, cleanRsn, soloHmReward, partyHmReward,
   soloTargetPool, partyTargetPool, treeKind,
 } = require("./src/quests");
@@ -973,7 +973,7 @@ async function handleCheck(interaction) {
           active.slice(0, 5).map((q) =>
             new ButtonBuilder()
               .setCustomId(`hm_cancel_quest:${q.id}`)
-              .setLabel(`❌ Cancel ${q.quest_type}`)
+              .setLabel(`⏭️ Use Skip Token: ${q.quest_type}`)
               .setStyle(ButtonStyle.Danger)
           )
         )
@@ -1721,6 +1721,43 @@ async function handleInventory(interaction) {
     );
   }
 
+  // Quest Skip Tokens and Quest Choice Tokens are only ever spent from deep
+  // inside other flows (the per-quest Cancel button on the Check Quests
+  // reply, or the hand-pick prompt after choosing a quest category) — easy
+  // to own one and never notice where to actually use it. These buttons
+  // jump straight there, only shown when the member actually owns one.
+  const skipTokenQty = inv.find((i) => i.tree === "quest_skip_token" && i.boost_tier === 0)?.quantity || 0;
+  const choiceTokenQty = inv.find((i) => i.tree === "quest_choice_token" && i.boost_tier === 0)?.quantity || 0;
+
+  if (skipTokenQty > 0 || choiceTokenQty > 0) {
+    const tokenButtons = [];
+    if (skipTokenQty > 0) {
+      tokenButtons.push(
+        new ButtonBuilder().setCustomId("hm_inv_use_skip_token").setLabel("⏭️ Use Quest Skip Token").setStyle(ButtonStyle.Danger)
+      );
+    }
+    if (choiceTokenQty > 0) {
+      tokenButtons.push(
+        new ButtonBuilder().setCustomId("hm_inv_use_choice_token").setLabel("🎯 Use Quest Choice Token").setStyle(ButtonStyle.Success)
+      );
+    }
+    rows.push(new ActionRowBuilder().addComponents(tokenButtons));
+  }
+
+  // The LFG board's "Cancel My Listing" button is shared by the whole server
+  // (one message, every viewer sees the same buttons) so it can't tell who's
+  // clicking — it has to always be there even for members with no listing.
+  // Inventory is personal and ephemeral, so here it can actually be shown
+  // only to someone who has one open right now.
+  const myOpenListing = await getOpenTeamForUser(interaction.guildId, interaction.user.id);
+  if (myOpenListing) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("hm_lfg_cancel_mine").setLabel("🗑️ Cancel My Open Listing").setStyle(ButtonStyle.Danger)
+      )
+    );
+  }
+
   return interaction.reply({
     embeds: [
       new EmbedBuilder()
@@ -1760,6 +1797,43 @@ async function handleActivateBoost(interaction, value) {
       ).embed,
     ],
     components: [],
+  });
+}
+
+/**
+ * Shortcut from the Inventory's "⏭️ Use Quest Skip Token" button. A Skip
+ * Token can only actually be spent from the per-quest button offered on the
+ * Check Quests reply — this just runs that same check so the member lands
+ * straight on it instead of having to know to press Check Quests first.
+ */
+async function handleInventoryUseSkipToken(interaction) {
+  return handleCheck(interaction);
+}
+
+/**
+ * Shortcut from the Inventory's "🎯 Use Quest Choice Token" button. A Choice
+ * Token is only ever offered once a quest category is chosen while starting
+ * a NEW quest — there's nothing to "activate" ahead of time. This just jumps
+ * straight to "pick a quest type" so the hand-pick prompt comes up in its
+ * usual spot a couple of steps later.
+ */
+async function handleInventoryUseChoiceToken(interaction) {
+  return interaction.reply({
+    embeds: [
+      emptyPage(
+        "🎯 Use Your Quest Choice Token",
+        "Your Quest Choice Token lets you hand-pick a quest's exact target instead of letting the bot roll one at " +
+        "random. Start a quest below and you'll be offered the hand-pick option once you choose a category — for " +
+        "a team quest, only whoever creates the team gets the offer."
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("hm_quest_start").setLabel("📋 Start a Solo Quest").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("hm_team_start").setLabel("👥 Start a Team Quest").setStyle(ButtonStyle.Primary)
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -1843,6 +1917,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "hm_shop_consumables": return await handleShopConsumables(interaction);
         case "hm_lfg_cancel_mine": return await handleLfgCancelMine(interaction);
         case "hm_inventory": return await handleInventory(interaction);
+        case "hm_inv_use_skip_token": return await handleInventoryUseSkipToken(interaction);
+        case "hm_inv_use_choice_token": return await handleInventoryUseChoiceToken(interaction);
         case "hm_guide_open": return await handleGuideOpen(interaction);
         case "hm_db_page": // disabled label button; never fires, kept so a
                            // stray click can never leave an unacked interaction
