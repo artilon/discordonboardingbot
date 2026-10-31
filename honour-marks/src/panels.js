@@ -336,6 +336,9 @@ function renderClaimPanel(setup = {}) {
       `**Claim Role** — unlocks ${unlocked || "the Honour Marks channels"} so you can start earning Honour Marks ` +
       `from quests.\n\n` +
       `**Drop Role** — removes the role again. You can come back here and claim it whenever you like.\n\n` +
+      `**Register RuneScape Name** — links your RuneScape name to your Discord account so the bot knows whose ` +
+      `hiscores to check. Required before you can start a quest. Pressing it opens a small popup asking for your ` +
+      `exact in-game name — no slash commands needed.\n\n` +
       `_These channels are read-only. Everything you do happens through buttons on their panels._`
     )
     .setFooter({ text: "Odinheim • Honour Marks" });
@@ -350,7 +353,12 @@ function renderClaimPanel(setup = {}) {
       .setCustomId("hm_drop_role")
       .setLabel("Drop Role")
       .setEmoji("✅")
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("hm_register_open")
+      .setLabel("Register RuneScape Name")
+      .setEmoji("📝")
+      .setStyle(ButtonStyle.Primary)
   );
 
   return [{ embed, components: [row] }];
@@ -463,11 +471,12 @@ function renderGuide(setup = {}) {
         `${questsCh} (the quest board), ${shopCh} (the shop) and ${dbCh} (everyone's stats) — you can't see or ` +
         `use any of them beforehand. Changed your mind later? Press **✅ Drop Role** in that same channel any ` +
         `time; nothing you've earned is ever lost, it just hides the channels again until you claim it back.\n\n` +
-        `**Step 2 — Link your RuneScape account.** Type \`/register\` anywhere in the server and fill in your ` +
-        `exact in-game name. This is required and deliberately separate from your Discord nickname — nicknames ` +
-        `can be changed, denied, or shared with someone else, so the bot needs your real RSN to know whose ` +
-        `hiscores to check. \`/register\` immediately looks your name up on the real OSRS hiscores before saving ` +
-        `it, so:\n` +
+        `**Step 2 — Link your RuneScape account.** In ${claimCh}, press **📝 Register RuneScape Name** and type ` +
+        `your exact in-game name into the popup (or type \`/register\` anywhere in the server if you prefer slash ` +
+        `commands — both do the exact same thing). This is required and deliberately separate from your Discord ` +
+        `nickname — nicknames can be changed, denied, or shared with someone else, so the bot needs your real RSN ` +
+        `to know whose hiscores to check. It immediately looks your name up on the real OSRS hiscores before ` +
+        `saving it, so:\n` +
         `• Spell it **exactly** right — capitalization doesn't matter, but spacing and special characters do.\n` +
         `• Your hiscores profile must **not** be set to private, or the lookup fails and registration is refused.\n` +
         `• One RuneScape account per Discord account.\n\n` +
@@ -862,7 +871,8 @@ function renderGuide(setup = {}) {
       title: "🗒️ Step 11: Commands & Where To Look Things Up",
       body:
         `**\`/register <rsn>\`** — links your RuneScape name to your Discord account. Required before you can do ` +
-        `anything else. Staff can register someone else on their behalf with the optional \`member\` option.\n\n` +
+        `anything else. Staff can register someone else on their behalf with the optional \`member\` option. Don't ` +
+        `like slash commands? Press **📝 Register RuneScape Name** in ${claimCh} instead — same thing, as a popup.\n\n` +
         `**\`/hm balance [member]\`** — shows your own ${HM_EMOJI} HM balance, or someone else's if you give the ` +
         `optional \`member\` option.\n\n` +
         `**\`/hm give\` and \`/hm take\`** — staff-only, used to manually adjust a member's HM balance with a ` +
