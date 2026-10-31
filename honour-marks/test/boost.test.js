@@ -331,7 +331,7 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
 
     const result = await createPartyQuestWithChoiceToken({
       guildId: "g1", members: ["t-choice-ok", "t-choice-ok-mate"], tree: "gathering", size: "duo",
-      difficulty: "easy", picks: ["mining", "fishing"], tokenConsumed: true, userId: "t-choice-ok",
+      difficulty: "medium", picks: ["mining", "fishing"], tokenConsumed: true, userId: "t-choice-ok",
     });
     assert.strictEqual(result.ok, true, result.error);
     assert.strictEqual(result.refunded, false);
@@ -340,7 +340,7 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
     const row = fake.db.hm_party_quests.find((r) => r.members.includes("t-choice-ok"));
     assert.deepStrictEqual(
       Object.keys(row.targets.skills).sort(), ["fishing", "mining"],
-      "both hand-picked targets were used, matching the duo's base count of 2 exactly"
+      "both hand-picked targets were used, matching Medium difficulty's target count of 2 exactly"
     );
   });
 

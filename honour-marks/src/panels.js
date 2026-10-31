@@ -5,7 +5,7 @@ const {
 } = require("discord.js");
 const { getSupabase, getConfigValue, setConfigValue } = require("./db");
 const { getRankForXp, formatRankProgress, RANK_TIERS } = require("./ranks");
-const { TREES, TREE_BY_KEY, PARTY_SIZES, LFG_EXPIRY_HOURS, treeKind, getMember } = require("./quests");
+const { TREES, TREE_BY_KEY, PARTY_SIZES, PARTY_DIFFICULTY, LFG_EXPIRY_HOURS, treeKind, getMember } = require("./quests");
 const { SKILL_LABELS, bossLabel, fetchHiscores, diffProgress } = require("./jagex");
 const { checkPartyQuest } = require("./progress");
 
@@ -310,6 +310,7 @@ async function renderOpenTeams(guildId) {
   if (open.length) {
     for (const p of open) {
       const tree = TREE_BY_KEY[p.categories?.[0]];
+      const diff = PARTY_DIFFICULTY[p.difficulty] || PARTY_DIFFICULTY.easy;
       const expected = PARTY_SIZES[p.team_size] || p.members.length;
       const need = Math.max(expected - p.members.length, 0);
       const expiresAt = Math.floor(new Date(p.created_at).getTime() / 1000) + LFG_EXPIRY_HOURS * 3600;
@@ -317,7 +318,7 @@ async function renderOpenTeams(guildId) {
         ? ` — 🎯 **${p.picks.map((k) => pickLabel(p.categories?.[0], k)).join(", ")}**`
         : "";
       lines.push(
-        `• **${p.team_size}** ${tree ? `${tree.emoji} ${tree.label}` : p.categories?.[0] || "?"}${pickedTargets} — ` +
+        `• **${p.team_size} • ${diff.emoji} ${diff.label}** ${tree ? `${tree.emoji} ${tree.label}` : p.categories?.[0] || "?"}${pickedTargets} — ` +
         `${p.members.map((m) => `<@${m}>`).join(", ")} ` +
         `(needs **${need}** more) — expires <t:${expiresAt}:R>`
       );
@@ -351,9 +352,10 @@ async function renderOpenTeams(guildId) {
           .addOptions(
             open.map((p) => {
               const tree = TREE_BY_KEY[p.categories?.[0]];
+              const diff = PARTY_DIFFICULTY[p.difficulty] || PARTY_DIFFICULTY.easy;
               const expected = PARTY_SIZES[p.team_size] || p.members.length;
               return new StringSelectMenuOptionBuilder()
-                .setLabel(`${p.team_size} • ${tree?.label || p.categories?.[0]} (${p.members.length}/${expected})`)
+                .setLabel(`${p.team_size} • ${diff.label} • ${tree?.label || p.categories?.[0]} (${p.members.length}/${expected})`)
                 .setDescription(`${expected - p.members.length} slot(s) open`)
                 .setValue(String(p.id))
                 .setEmoji(tree?.emoji || "🔍");
@@ -628,38 +630,49 @@ function renderGuide(setup = {}) {
       short: "Team Quests",
       title: "👥 Step 4: Team Quests, Step By Step",
       body:
-        `A team quest (Duo, Trio, or Quad) shares ONE target across the whole group — everyone's gains are ` +
-        `summed together, so it finishes faster the more people are pulling their weight. It always runs for ` +
-        `**14 days** regardless of size, and pays **every member the full reward**, not a split share.\n\n` +
+        `A team quest (Duo, Trio, or Quad) shares ONE or more targets across the whole group — everyone's ` +
+        `gains are summed together toward each one, so it finishes faster the more people are pulling their ` +
+        `weight. It always runs for **14 days** regardless of size, and pays **every member the full ` +
+        `reward**, not a split share.\n\n` +
         `**Starting one, step by step:**\n` +
         `1. Open ${questsCh} and press **👥 Start a Team Quest**.\n` +
         `2. Pick a size: **Duo** (2 people total), **Trio** (3 people total), or **Quad** (4 people total). You ` +
-        `count as the first member either way.\n` +
-        `3. Pick a category — the same seven choices as solo quests.\n` +
-        `3b. **If you (the person creating the team) own a 🎯 Quest Choice Token**, you're offered a choice ` +
-        `right here, before anyone else is involved: spend it to hand-pick the team's exact shared target, or ` +
-        `skip it and let the bot roll one at random (the token stays in your inventory either way if you ` +
-        `skip it). This is the ONLY point a hand-pick can happen — teammates and later joiners never get this ` +
-        `choice, and it's locked in before the team is finalized specifically so that anyone browsing the ` +
-        `**Looking For Group** board can see the chosen target before deciding whether to join (Page 6).\n` +
-        `4. Choose how to fill the rest of the team:\n` +
+        `count as the first member either way. Size sets how big EACH target is.\n` +
+        `3. Pick a difficulty: 🟢 **Easy** (1 target), 🟡 **Medium** (2 targets), or 🔴 **Hard** (3 targets). ` +
+        `Difficulty sets how MANY targets the team needs, and scales up ${HM_EMOJI} HM and Rank XP to match — ` +
+        `Medium pays double Easy's reward, Hard pays triple. Pick Easy any time the team just wants one quick, ` +
+        `simple target instead of juggling several at once.\n` +
+        `4. Pick a category — the same seven choices as solo quests.\n` +
+        `4b. **If you (the person creating the team) own a 🎯 Quest Choice Token**, you're offered a choice ` +
+        `right here, before anyone else is involved: spend it to hand-pick the team's exact shared target(s) ` +
+        `(one pick per target the chosen difficulty needs), or skip it and let the bot roll the rest at random ` +
+        `(the token stays in your inventory either way if you skip it). This is the ONLY point a hand-pick can ` +
+        `happen — teammates and later joiners never get this choice, and it's locked in before the team is ` +
+        `finalized specifically so that anyone browsing the **Looking For Group** board can see the chosen ` +
+        `target(s) before deciding whether to join (Page 6).\n` +
+        `5. Choose how to fill the rest of the team:\n` +
         `　• **Pick Teammates** — a member picker opens where you select the exact number of other people ` +
         `needed (1 for Duo, 2 for Trio, 3 for Quad). Everyone picked must already be registered with ` +
         `\`/register\`, or it fails to create. The quest starts **immediately** once confirmed.\n` +
         `　• **📋 Post Open Listing** — skips picking anyone; instead it posts a public listing to the ` +
         `**Looking For Group** board (Page 6) and starts automatically once enough other members join it.\n\n` +
-        `**Requirements**, by category and size — the team's combined gains must reach the full amount on ` +
-        `EACH target listed, same "never split or summed together across targets" rule as solo quests:\n\n` +
-        `**Skill categories** — Duo picks 2 skills (135,000 XP combined, each) • Trio picks 3 skills (200,000 ` +
-        `XP combined, each) • Quad picks 4 skills (270,000 XP combined, each).\n` +
-        `**Boss PvM** — Duo picks 1 boss (150 combined KC) • Trio picks 2 bosses (250 combined KC each) • ` +
-        `Quad picks 3 bosses (350 combined KC each).\n` +
-        `**Raids** — always 1 raid: Duo needs 15 combined clears • Trio needs 30 • Quad needs 45.\n` +
-        `**Minigames** — Duo picks 1 minigame (50 combined) • Trio picks 2 (125 combined each) • Quad picks 3 ` +
-        `(200 combined each).\n\n` +
-        `**Rewards per member** (everyone gets the full amount, it is NOT split between you):\n` +
-        `• Duo — 250 ${HM_EMOJI} + 750 Rank XP • Trio — 350 ${HM_EMOJI} + 1,200 Rank XP • ` +
-        `Quad — 450 ${HM_EMOJI} + 2,000 Rank XP\n\n` +
+        `**Per-target requirement**, by category and size — the team's combined gains must reach the full ` +
+        `amount on EACH target, same "never split or summed together across targets" rule as solo quests. ` +
+        `Difficulty only changes how many of these targets the quest has (1/2/3), never the amount per target:\n\n` +
+        `**Skill categories** — 135,000 combined XP per skill (Duo) • 200,000 (Trio) • 270,000 (Quad).\n` +
+        `**Boss PvM** — 150 combined KC per boss (Duo) • 250 (Trio) • 350 (Quad).\n` +
+        `**Raids** — 15 combined clears per raid (Duo) • 30 (Trio) • 45 (Quad). Still always hand-picked, ` +
+        `never rolled at random, free of charge regardless of difficulty or Quest Choice Token ownership — a ` +
+        `Hard raids quest means all 3 raids (Chambers of Xeric, Theatre of Blood, Tombs of Amascut).\n` +
+        `**Minigames** — 50 combined per minigame (Duo) • 125 (Trio) • 200 (Quad).\n\n` +
+        `**Rewards per member** (everyone gets the full amount, it is NOT split between you) — base amount ` +
+        `at Easy, then doubled at Medium and tripled at Hard:\n` +
+        `• **Duo** — Easy 250 ${HM_EMOJI} + 750 Rank XP • Medium 500 ${HM_EMOJI} + 1,500 Rank XP • ` +
+        `Hard 750 ${HM_EMOJI} + 2,250 Rank XP\n` +
+        `• **Trio** — Easy 350 ${HM_EMOJI} + 1,200 Rank XP • Medium 700 ${HM_EMOJI} + 2,400 Rank XP • ` +
+        `Hard 1,050 ${HM_EMOJI} + 3,600 Rank XP\n` +
+        `• **Quad** — Easy 450 ${HM_EMOJI} + 2,000 Rank XP • Medium 900 ${HM_EMOJI} + 4,000 Rank XP • ` +
+        `Hard 1,350 ${HM_EMOJI} + 6,000 Rank XP\n\n` +
         `A team quest that runs out of time is simply cancelled for everyone — unlike solo quests there is no ` +
         `partial HM payout, and no one can cancel it early themselves (a Skip Token only works on solo quests).`,
     },
@@ -668,21 +681,21 @@ function renderGuide(setup = {}) {
       title: "🔍 Step 5: Looking For Group, Step By Step",
       body:
         `The **Looking For Group** board is a second panel posted right under the quest board. It lists every ` +
-        `team quest that's currently recruiting, with the category, size, who's already joined, and — if the ` +
-        `poster hand-picked one with a 🎯 Quest Choice Token — the exact target, so you always know what ` +
-        `you're signing up for before you join.\n\n` +
+        `team quest that's currently recruiting, with the category, size, difficulty, who's already joined, ` +
+        `and — if the poster hand-picked one with a 🎯 Quest Choice Token — the exact target(s), so you always ` +
+        `know what you're signing up for before you join.\n\n` +
         `**Posting a listing, step by step:**\n` +
-        `1. Press **👥 Start a Team Quest** → pick a size → pick a category, exactly like a normal team quest. ` +
-        `If you own a Quest Choice Token, this is also where you'd hand-pick the team's target (Page 5) — do ` +
-        `it here, before posting, and it'll show on the board for everyone.\n` +
+        `1. Press **👥 Start a Team Quest** → pick a size → pick a difficulty → pick a category, exactly like ` +
+        `a normal team quest (Page 5). If you own a Quest Choice Token, this is also where you'd hand-pick the ` +
+        `team's target(s) — do it here, before posting, and it'll show on the board for everyone.\n` +
         `2. On the "how do you want to fill it" screen, press **📋 Post Open Listing** instead of Pick Teammates.\n` +
         `3. You're now the first member of an open listing, and it appears on the LFG board immediately.\n` +
         `4. You can only have **one** open listing — or be a member of one — at a time, whether posting or ` +
         `joining. Cancel or complete one before starting or joining another.\n\n` +
         `**Joining a listing, step by step:**\n` +
         `1. Open the LFG board and use the **"Join an open team…"** dropdown.\n` +
-        `2. Pick the listing you want — each option shows the category, size, and how many of its slots are ` +
-        `already filled.\n` +
+        `2. Pick the listing you want — each option shows the category, size, difficulty, and how many of its ` +
+        `slots are already filled.\n` +
         `3. You're added immediately. If that was the last empty slot, the quest **starts automatically for ` +
         `every member right then** — no extra confirmation step, and everyone gets a private confirmation ` +
         `message. If it still needs more people, you'll just see how many more are needed and the listing ` +

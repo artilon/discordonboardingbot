@@ -344,21 +344,28 @@ async function registerMember(userId, rsn) {
     fake.db.hm_items.push({ user_id: "p2-exp", guild_id: "g1", tree: "gathering", slot: q.ITEM_SLOT.EXPANSION, tier: 3 });
 
     const result = await q.createPartyQuest({
-      guildId: "g1", members: ["p1-exp", "p2-exp"], tree: "gathering", size: "duo", difficulty: "easy",
+      guildId: "g1", members: ["p1-exp", "p2-exp"], tree: "gathering", size: "duo", difficulty: "medium",
     });
     assert.strictEqual(result.ok, true, result.error);
 
     const row = fake.db.hm_party_quests.find((r) => r.members.includes("p1-exp"));
-    // duo gathering base count = 2; highest tier on the team = 3 (not 2+3=5) -> 2+3=5 total targets
+    // Medium's base count = 2; highest tier on the team = 3 (not 2+3=5) -> 2+3=5 total targets
     assert.strictEqual(Object.keys(row.targets.skills).length, 5, "base 2 + highest-owned tier 3 = 5, NOT summed across the team");
   });
 
   console.log("\n[team hand-pick — a Quest Choice Token's pick locks the team's target before the roster/Items are known]");
-  await check("partyTargetPool matches the un-expanded base requirement for every kind", () => {
-    assert.deepStrictEqual(q.partyTargetPool("gathering", "duo"), { kind: "skill", count: 2, value: 135000, pool: q.SKILLS_BY_TREE.gathering });
-    assert.strictEqual(q.partyTargetPool("boss", "trio").count, 2);
-    assert.strictEqual(q.partyTargetPool("raids", "quad").count, 1);
-    assert.strictEqual(q.partyTargetPool("minigames", "quad").count, 3);
+  await check("partyTargetPool's count comes from difficulty, not size; value still comes from size", () => {
+    assert.deepStrictEqual(
+      q.partyTargetPool("gathering", "duo", "medium"),
+      { kind: "skill", count: 2, value: 135000, pool: q.SKILLS_BY_TREE.gathering }
+    );
+    assert.strictEqual(q.partyTargetPool("boss", "trio", "easy").count, 1);
+    assert.strictEqual(q.partyTargetPool("raids", "quad", "easy").count, 1);
+    assert.strictEqual(q.partyTargetPool("raids", "quad", "hard").count, 3);
+    assert.strictEqual(q.partyTargetPool("minigames", "quad", "hard").count, 3);
+    // No difficulty passed at all falls back to Easy's count of 1, same
+    // fallback createPartyQuest/createOpenTeam use for an unknown value.
+    assert.strictEqual(q.partyTargetPool("gathering", "duo").count, 1);
   });
 
   await check("a hand-picked team skill target is honoured even when a member owns Quest Expansion", async () => {
@@ -372,7 +379,7 @@ async function registerMember(userId, rsn) {
     fake.db.hm_items.push({ user_id: "p1-pick", guild_id: "g1", tree: "gathering", slot: q.ITEM_SLOT.EXPANSION, tier: 3 });
 
     const result = await q.createPartyQuest({
-      guildId: "g1", members: ["p1-pick", "p2-pick"], tree: "gathering", size: "duo", difficulty: "easy",
+      guildId: "g1", members: ["p1-pick", "p2-pick"], tree: "gathering", size: "duo", difficulty: "medium",
       picks: ["mining", "fishing"],
     });
     assert.strictEqual(result.ok, true, result.error);
@@ -382,7 +389,7 @@ async function registerMember(userId, rsn) {
       Object.keys(row.targets.skills).sort(), ["fishing", "mining"],
       "exactly the 2 hand-picked skills, Expansion's extra targets must not apply on top of a hand-pick"
     );
-    assert.strictEqual(row.hm_reward, q.partyHmReward("duo", "easy"), "reward must not be scaled up as if 5 targets existed");
+    assert.strictEqual(row.hm_reward, q.partyHmReward("duo", "medium"), "reward must not be scaled up as if 5 targets existed");
   });
 
   await check("a hand-picked team boss target skips the safety-check filter entirely", async () => {
@@ -413,7 +420,7 @@ async function registerMember(userId, rsn) {
     snapshots["Topup2"] = snap;
 
     const result = await q.createPartyQuest({
-      guildId: "g1", members: ["p1-topup", "p2-topup"], tree: "gathering", size: "duo", difficulty: "easy",
+      guildId: "g1", members: ["p1-topup", "p2-topup"], tree: "gathering", size: "duo", difficulty: "medium",
       picks: ["mining", "not-a-real-skill"],
     });
     assert.strictEqual(result.ok, true, result.error);
