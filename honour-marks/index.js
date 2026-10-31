@@ -923,7 +923,6 @@ async function handleCheck(interaction) {
       );
       if (evaluated.finished) {
         await completePartyQuest(team, evaluated.progress);
-        scheduleRefresh(interaction.guildId);
       }
     }
   }
@@ -954,7 +953,12 @@ async function handleCheck(interaction) {
     );
   }
 
-  if (result.completed > 0) scheduleRefresh(interaction.guildId);
+  // Always refresh the public Quest Board after a check — not just when a
+  // quest finishes. checkSoloQuests()/checkPartyQuest() above just did a
+  // fresh hiscores fetch, so the board's displayed percentage should pick up
+  // that same progress instead of sitting stale until something completes
+  // or the 30-minute sweep runs.
+  scheduleRefresh(interaction.guildId);
 
   // "Check Progress" and "My Quests" used to be two separate buttons that both
   // just showed quest status — now merged into this one press, which checks
