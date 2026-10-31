@@ -1670,7 +1670,12 @@ async function handleGuideOpen(interaction) {
     if (i === 0) {
       await interaction.reply({ embeds: batch, flags: MessageFlags.Ephemeral });
     } else {
-      await interaction.followUp({ embeds: batch, flags: MessageFlags.Ephemeral });
+      // scheduleEphemeralAutoDelete (called by the router after this handler
+      // returns) only knows how to clean up the PRIMARY reply via
+      // interaction.deleteReply() — a follow-up is its own separate message,
+      // so each one has to be scheduled here directly.
+      const followUp = await interaction.followUp({ embeds: batch, flags: MessageFlags.Ephemeral });
+      setTimeout(() => followUp.delete().catch(() => {}), EPHEMERAL_AUTO_DELETE_MS).unref?.();
     }
   }
 }
@@ -1859,7 +1864,39 @@ async function handleCancelQuest(interaction, questId) {
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
-client.on(Events.InteractionCreate, async (interaction) => {
+// Ephemeral replies only ever show up in the one channel they're triggered
+// from, to the one member who triggered them — but a member who checks
+// quests/inventory often can still end up scrolling past a long trail of
+// them in their own view. Auto-deleting a few minutes later keeps that tidy
+// without the member having to dismiss each one by hand.
+const EPHEMERAL_AUTO_DELETE_MS = 5 * 60 * 1000;
+
+/**
+ * True if this interaction's current response is ephemeral. `.reply()` and
+ * `.deferReply()` set `interaction.ephemeral` directly, but `.update()`
+ * never does — it can't change a message's ephemeral flag, so discord.js
+ * leaves it `null` on that path. Every multi-step flow in this bot only
+ * ever `.update()`s a message that started out as an ephemeral `.reply()`,
+ * so falling back to the flag already on that message covers it.
+ */
+function isEphemeralResponse(interaction) {
+  if (typeof interaction.ephemeral === "boolean") return interaction.ephemeral;
+  return Boolean(interaction.message?.flags?.has?.(MessageFlags.Ephemeral));
+}
+
+/** Schedules the reply this interaction just produced to delete itself in a
+ *  few minutes. No-ops for anything that isn't ephemeral (the persistent
+ *  public panels are never touched by this — they're edited by syncPanel,
+ *  not replied to) and silently swallows a delete failure (already
+ *  dismissed by the member, superseded by a later step, etc.). */
+function scheduleEphemeralAutoDelete(interaction) {
+  if (!isEphemeralResponse(interaction)) return;
+  setTimeout(() => {
+    interaction.deleteReply().catch(() => {});
+  }, EPHEMERAL_AUTO_DELETE_MS).unref?.();
+}
+
+async function routeInteraction(interaction) {
   try {
     if (interaction.isChatInputCommand()) {
       switch (interaction.commandName) {
@@ -1993,6 +2030,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.deferred || interaction.replied) await interaction.editReply(payload).catch(() => {});
     else await interaction.reply(payload).catch(() => {});
   }
+}
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  await routeInteraction(interaction);
+  scheduleEphemeralAutoDelete(interaction);
 });
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
