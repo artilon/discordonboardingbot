@@ -5,8 +5,9 @@ const {
 } = require("discord.js");
 const { getSupabase, getConfigValue, setConfigValue } = require("./db");
 const { getRankForXp, formatRankProgress, RANK_TIERS } = require("./ranks");
-const { TREES, TREE_BY_KEY, PARTY_SIZES, LFG_EXPIRY_HOURS, treeKind } = require("./quests");
-const { SKILL_LABELS, bossLabel } = require("./jagex");
+const { TREES, TREE_BY_KEY, PARTY_SIZES, LFG_EXPIRY_HOURS, treeKind, getMember } = require("./quests");
+const { SKILL_LABELS, bossLabel, fetchHiscores, diffProgress } = require("./jagex");
+const { checkPartyQuest } = require("./progress");
 
 /** Pretty label for a hand-picked target key (skill or boss/raid/minigame). */
 function pickLabel(tree, key) {
@@ -163,6 +164,68 @@ async function renderDatabase(guildId) {
 }
 
 // ── Quest board ──────────────────────────────────────────────────────────────
+/** Target key -> pretty label, read straight off a quest's `targets` column. */
+function targetLabelsFromTargets(targets) {
+  const labels = [];
+  for (const key of Object.keys(targets?.skills || {})) labels.push(SKILL_LABELS[key] || key);
+  for (const key of Object.keys(targets?.bosses || {})) labels.push(bossLabel(key));
+  return labels;
+}
+
+/** Renders `diffProgress(...).parts` as a compact "label: gained/needed unit (pct%)" line. */
+function formatProgressParts(parts) {
+  if (!parts?.length) return "no targets set";
+  return parts
+    .map((p) => {
+      const unit = p.kind === "skill" ? "XP" : "KC";
+      return `${p.label}: \`${Math.floor(p.gained).toLocaleString()}/${p.needed.toLocaleString()}\` ${unit} (${Math.floor(p.pct)}%)`;
+    })
+    .join(" • ");
+}
+
+/**
+ * Builds the two-line board entry for one solo quest: target(s) up top, live
+ * progress underneath. Progress is computed with the same pure
+ * `fetchHiscores` + `diffProgress` primitives the "Check Quests & Collect"
+ * button uses — deliberately NOT `checkSoloQuests`, which also deletes and
+ * pays out finished quests. The board only ever displays; collecting still
+ * requires a manual check, per the documented design.
+ */
+async function formatSoloQuestLine(q) {
+  const targetLabels = targetLabelsFromTargets(q.targets).join(", ") || "?";
+  const expiresAt = `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`;
+  const head = `• <@${q.user_id}> — ${q.quest_type} • ${q.tree} • 🎯 **${targetLabels}**`;
+
+  const member = await getMember(q.user_id).catch(() => null);
+  if (!member?.rsn) return `${head}\n   ┗ _not registered — progress unavailable_ • ends ${expiresAt}`;
+
+  const snap = await fetchHiscores(member.rsn).catch(() => null);
+  if (!snap) return `${head}\n   ┗ _progress unavailable right now_ • ends ${expiresAt}`;
+
+  const progress = diffProgress(q.baseline, snap, q.targets);
+  return `${head}\n   ┗ ${formatProgressParts(progress.parts)} — **${Math.floor(progress.totalPct)}%** • ends ${expiresAt}`;
+}
+
+/**
+ * Same as above but for a team quest. `checkPartyQuest` itself has no side
+ * effects — it only sums each member's gains and returns the progress; the
+ * caller decides separately whether to call `completePartyQuest` to pay out.
+ * The board never does that, so reusing it here is still display-only.
+ */
+async function formatTeamQuestLine(q) {
+  const targetLabels = targetLabelsFromTargets(q.targets).join(", ") || "?";
+  const expiresAt = `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`;
+  const membersMention = q.members.map((m) => `<@${m}>`).join(", ");
+  const head = `• **${q.size}** • ${q.tree} • 🎯 **${targetLabels}** — ${membersMention}`;
+
+  const evaluated = await checkPartyQuest(q).catch(() => null);
+  if (!evaluated || evaluated.error || !evaluated.progress) {
+    return `${head}\n   ┗ _progress unavailable right now_ • ends ${expiresAt}`;
+  }
+  const { progress } = evaluated;
+  return `${head}\n   ┗ Team progress: ${formatProgressParts(progress.parts)} — **${Math.floor(progress.totalPct)}%** • ends ${expiresAt}`;
+}
+
 async function renderQuestBoard(guildId, setup = {}) {
   const supabase = getSupabase();
   if (!supabase) return [emptyPage("📜 Quest Board", "Database unavailable.")];
@@ -185,9 +248,7 @@ async function renderQuestBoard(guildId, setup = {}) {
   if (activeQuests?.length) {
     lines.push("**Solo Quests In Progress**");
     for (const q of activeQuests.slice(0, 25)) {
-      lines.push(
-        `• <@${q.user_id}> — ${q.quest_type} • ${q.tree} • <t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`
-      );
+      lines.push(await formatSoloQuestLine(q));
     }
     if (activeQuests.length > 25) lines.push(`_…and ${activeQuests.length - 25} more_`);
     lines.push("");
@@ -196,11 +257,9 @@ async function renderQuestBoard(guildId, setup = {}) {
   if (activeTeams?.length) {
     lines.push("**Team Quests In Progress**");
     for (const q of activeTeams.slice(0, 15)) {
-      lines.push(
-        `• ${q.size} • ${q.tree} • ${q.members.map((m) => `<@${m}>`).join(", ")} • ` +
-        `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`
-      );
+      lines.push(await formatTeamQuestLine(q));
     }
+    if (activeTeams.length > 15) lines.push(`_…and ${activeTeams.length - 15} more_`);
     lines.push("");
   }
 
@@ -208,18 +267,21 @@ async function renderQuestBoard(guildId, setup = {}) {
     lines.push("_No quests in progress right now._ Press **Start a Solo Quest** to begin.");
   }
 
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.main)
-    .setTitle("📜 Quest Board")
-    .setDescription(
-      `Earn ${HM_EMOJI} **Honour Marks** by completing tasks, then spend them in ${shopCh}.\n` +
-      `Every completed quest also awards a small amount of **Rank XP**.\n\n` +
-      lines.join("\n").slice(0, DESC_BUDGET)
-    )
-    .setFooter({ text: "Odinheim • Honour Marks" })
-    .setTimestamp();
+  const header =
+    `Earn ${HM_EMOJI} **Honour Marks** by completing tasks, then spend them in ${shopCh}.\n` +
+    `Every completed quest also awards a small amount of **Rank XP**.\n\n`;
 
-  return [{ embed, components: buildPanelComponents("quest_board", 0, 1) }];
+  const chunks = chunkLines(lines, header);
+
+  return chunks.map((chunk, i) => {
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.main)
+      .setTitle(i === 0 ? "📜 Quest Board" : "📜 Quest Board (cont'd)")
+      .setDescription((i === 0 ? header : "") + chunk.join("\n"))
+      .setFooter({ text: `Odinheim • Honour Marks${chunks.length > 1 ? ` • Part ${i + 1}/${chunks.length}` : ""}` })
+      .setTimestamp();
+    return { embed, components: buildPanelComponents("quest_board", i, chunks.length) };
+  });
 }
 
 // ── Looking For Group ────────────────────────────────────────────────────────
