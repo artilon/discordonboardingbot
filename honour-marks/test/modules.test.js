@@ -188,7 +188,8 @@ check("HM scales by size and difficulty", () => {
   assert.strictEqual(q.soloHmReward("daily"), 50);
   assert.strictEqual(q.soloHmReward("monthly"), 400);
   assert.strictEqual(q.partyHmReward("quad", "easy"), 450);
-  assert.strictEqual(q.partyHmReward("quad", "hard"), 720);
+  assert.strictEqual(q.partyHmReward("quad", "medium"), 900);
+  assert.strictEqual(q.partyHmReward("quad", "hard"), 1350);
 });
 
 check("rank XP is flat and small enough to protect the tenure curve", () => {
@@ -270,7 +271,7 @@ check("renderGuide still works with no setup/channels passed at all", () => {
   assert.ok(pages.every((p) => (p.embed.data.description || "").length > 0));
 });
 
-check("guide doesn't mention a tutorial reward or a team-quest difficulty choice", () => {
+check("guide doesn't mention a tutorial reward, and does document the team-quest difficulty choice", () => {
   const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
   const all = pages.map((p) => `${p.embed.data.title} ${p.embed.data.description}`).join("\n").toLowerCase();
   assert.ok(!all.includes("tutorial"), "there is no tutorial-reward feature in the code");
@@ -278,8 +279,9 @@ check("guide doesn't mention a tutorial reward or a team-quest difficulty choice
   const teamPage = pages.find((p) => p.embed.data.title.includes("Team Quests"));
   assert.ok(teamPage, "team quests page should exist");
   assert.ok(
-    !/difficulty/i.test(teamPage.embed.data.description),
-    "team quests only ever run at easy difficulty in the actual UI (hard mode is unreachable dead code)"
+    /difficulty/i.test(teamPage.embed.data.description) && /easy/i.test(teamPage.embed.data.description) &&
+    /medium/i.test(teamPage.embed.data.description) && /hard/i.test(teamPage.embed.data.description),
+    "team quests now have a real Easy/Medium/Hard difficulty picker and the guide should document it"
   );
 });
 

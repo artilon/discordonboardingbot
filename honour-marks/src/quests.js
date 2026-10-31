@@ -123,16 +123,35 @@ const SOLO_REQUIREMENTS = {
 // a single shared total — whoever did the most work doesn't change the reward.
 const SOLO_HM = { daily: 50, weekly: 150, monthly: 400 };
 const PARTY_HM_BY_SIZE = { duo: 250, trio: 350, quad: 450 };
-const PARTY_DIFFICULTY_MULT = { easy: 1, hard: 1.6 };
+
+// A team's DIFFICULTY picks how many shared targets the quest asks for —
+// Easy just one, Medium two, Hard three — not the team's SIZE, which only
+// still controls how big each individual target is (see PARTY_REQUIREMENTS
+// below). This used to be the other way around: size alone decided count,
+// so a Trio/Quad was always stuck with multiple targets and had no way to
+// ask for just one easy one. `mult` scales HM and Rank XP to match — it's
+// kept exactly equal to `count` so the payout stays proportional to the
+// extra work a harder pick actually demands, the same principle an Item's
+// extra-target effect already uses elsewhere in this file.
+const PARTY_DIFFICULTY = {
+  easy:   { label: "Easy",   emoji: "🟢", count: 1, mult: 1 },
+  medium: { label: "Medium", emoji: "🟡", count: 2, mult: 2 },
+  hard:   { label: "Hard",   emoji: "🔴", count: 3, mult: 3 },
+};
+const PARTY_DIFFICULTIES = Object.keys(PARTY_DIFFICULTY); // ["easy", "medium", "hard"], in that order
 
 const PARTY_REQUIREMENTS = {
-  skill:    { duo: { count: 2, xp: 135000 }, trio: { count: 3, xp: 200000 }, quad: { count: 4, xp: 270000 } },
-  boss:     { duo: { count: 1, kc: 150 },    trio: { count: 2, kc: 250 },     quad: { count: 3, kc: 350 } },
-  raid:     { duo: { kc: 15 },               trio: { kc: 30 },                quad: { kc: 45 } },
-  minigame: { duo: { count: 1, kc: 50 },     trio: { count: 2, kc: 125 },     quad: { count: 3, kc: 200 } },
+  skill:    { duo: { xp: 135000 }, trio: { xp: 200000 }, quad: { xp: 270000 } },
+  boss:     { duo: { kc: 150 },    trio: { kc: 250 },     quad: { kc: 350 } },
+  raid:     { duo: { kc: 15 },     trio: { kc: 30 },      quad: { kc: 45 } },
+  minigame: { duo: { kc: 50 },     trio: { kc: 125 },     quad: { kc: 200 } },
 };
 
 const QUEST_DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30 };
+// A member can be on up to this many team quests at once — previously just
+// 1, which meant someone already on a Duo couldn't also join/start a Trio
+// elsewhere even though team quests are independent of each other.
+const MAX_ACTIVE_PARTY_QUESTS = 3;
 const PARTY_DURATION_DAYS = 14;
 const RESET_PERIOD = { daily: 1, weekly: 7, monthly: 30 };
 const PARTY_SIZES = { duo: 2, trio: 3, quad: 4 };
@@ -352,10 +371,9 @@ function buildSoloTargets(tree, questType, picks = null, baseline = null, effect
  * more targets than were actually set.
  */
 function buildPartyTargets(tree, size, difficulty, baselines = null, effects = null, picks = null) {
-  const spec = partyTargetPool(tree, size);
+  const spec = partyTargetPool(tree, size, difficulty);
   if (!spec) return { skills: {}, bosses: {} };
   const { kind, pool } = spec;
-  const mult = PARTY_DIFFICULTY_MULT[difficulty] || 1;
   const targets = { skills: {}, bosses: {} };
   const snapshots = baselines ? Object.values(baselines) : null;
 
@@ -363,16 +381,15 @@ function buildPartyTargets(tree, size, difficulty, baselines = null, effects = n
   const { count, value } = effects
     ? applyItemEffects(kind, spec.count, spec.value, effects, pool.length, { locked: hasPicks })
     : spec;
-  const scaledValue = Math.round(value * mult);
 
   let chosen = hasPicks ? [...new Set(picks)].filter((p) => pool.includes(p)).slice(0, count) : [];
   const need = count - chosen.length;
 
   if (kind === "boss") {
-    for (const key of chosen) targets.bosses[key] = scaledValue; // hand-picked: never safety-filtered
+    for (const key of chosen) targets.bosses[key] = value; // hand-picked: never safety-filtered
     if (need > 0) {
       const fillPool = pool.filter((p) => !chosen.includes(p));
-      Object.assign(targets.bosses, pickBossTargets(fillPool, need, scaledValue, snapshots));
+      Object.assign(targets.bosses, pickBossTargets(fillPool, need, value, snapshots));
     }
     return targets;
   }
@@ -388,7 +405,7 @@ function buildPartyTargets(tree, size, difficulty, baselines = null, effects = n
   }
 
   const bucket = kind === "skill" ? targets.skills : targets.bosses;
-  for (const key of chosen) bucket[key] = scaledValue;
+  for (const key of chosen) bucket[key] = value;
   return targets;
 }
 
@@ -398,7 +415,8 @@ function soloHmReward(questType) {
 
 function partyHmReward(size, difficulty) {
   const base = PARTY_HM_BY_SIZE[size] || 0;
-  return Math.round(base * (PARTY_DIFFICULTY_MULT[difficulty] || 1));
+  const mult = PARTY_DIFFICULTY[difficulty]?.mult || PARTY_DIFFICULTY.easy.mult;
+  return Math.round(base * mult);
 }
 
 // ── Reset helpers ────────────────────────────────────────────────────────────
@@ -598,15 +616,16 @@ function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength =
  * `locked` option is what actually enforces that the hand-picked count stays
  * authoritative once the roster (and its Items) are finally resolved.
  */
-function partyTargetPool(tree, size) {
+function partyTargetPool(tree, size, difficulty) {
   const kind = treeKind(tree);
   const req = PARTY_REQUIREMENTS[kind]?.[size];
   if (!req) return null;
+  const count = PARTY_DIFFICULTY[difficulty]?.count || PARTY_DIFFICULTY.easy.count;
 
-  if (kind === "skill") return { kind, count: req.count || 1, value: req.xp, pool: SKILLS_BY_TREE[tree] || [] };
-  if (kind === "boss") return { kind, count: req.count || 1, value: req.kc, pool: BOSS_POOL };
-  if (kind === "raid") return { kind, count: 1, value: req.kc, pool: SOLO_RAID_POOL };
-  return { kind, count: req.count || 1, value: req.kc, pool: MINIGAME_BOSSES };
+  if (kind === "skill") return { kind, count, value: req.xp, pool: SKILLS_BY_TREE[tree] || [] };
+  if (kind === "boss") return { kind, count, value: req.kc, pool: BOSS_POOL };
+  if (kind === "raid") return { kind, count, value: req.kc, pool: SOLO_RAID_POOL };
+  return { kind, count, value: req.kc, pool: MINIGAME_BOSSES };
 }
 
 async function getMemberByRsn(guildId, rsn) {
@@ -657,15 +676,18 @@ async function getActiveSoloQuest(userId, questType) {
   return all.find((q) => q.quest_type === questType) || null;
 }
 
-async function getActivePartyQuestForUser(userId) {
+/** Every team quest `userId` is currently a member of — up to
+ *  MAX_ACTIVE_PARTY_QUESTS of them can be active for the same person at
+ *  once, so (unlike the old single-quest version of this) this always
+ *  returns an array, same shape as getActiveSoloQuests. */
+async function getActivePartyQuestsForUser(userId) {
   const supabase = getSupabase();
-  if (!supabase) return null;
+  if (!supabase) return [];
   const { data } = await supabase
     .from("hm_party_quests")
     .select("*")
-    .contains("members", [userId])
-    .maybeSingle();
-  return data || null;
+    .contains("members", [userId]);
+  return data || [];
 }
 
 /**
@@ -769,6 +791,11 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
   const expected = { duo: 2, trio: 3, quad: 4 }[size];
   if (!expected) return { error: "Unknown team size." };
 
+  // Falls back to "easy" (one target, the base reward) rather than erroring —
+  // difficulty is a newer, optional dimension layered on top of size/tree,
+  // and this keeps any caller that predates the picker working unchanged.
+  if (!PARTY_DIFFICULTY[difficulty]) difficulty = "easy";
+
   const unique = [...new Set(members)].filter(Boolean);
   if (unique.length !== expected) {
     return { error: `A ${size} needs exactly ${expected} members (got ${unique.length}).` };
@@ -782,10 +809,12 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
     roster.push(m);
   }
 
-  // One active team quest per member, matching the original rule.
+  // Up to MAX_ACTIVE_PARTY_QUESTS team quests per member at once.
   for (const m of roster) {
-    const active = await getActivePartyQuestForUser(m.user_id);
-    if (active) return { error: `<@${m.user_id}> is already on a team quest.` };
+    const activeCount = (await getActivePartyQuestsForUser(m.user_id)).length;
+    if (activeCount >= MAX_ACTIVE_PARTY_QUESTS) {
+      return { error: `<@${m.user_id}> is already on ${MAX_ACTIVE_PARTY_QUESTS} team quests — the most allowed at once.` };
+    }
   }
 
   const baselines = {};
@@ -808,14 +837,18 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
   // reward-scale math here has to use the exact same `{ locked }` flag or the
   // payout could imply more targets than the quest actually has.
   const hasPicks = Array.isArray(picks) && picks.length > 0;
-  const spec = partyTargetPool(tree, size);
+  const spec = partyTargetPool(tree, size, difficulty);
   const { rewardScale } = applyItemEffects(
     spec.kind, spec.count, spec.value, effects, spec.pool.length, { locked: hasPicks }
   );
 
+  // Both rewards scale with difficulty on top of everything else — HM via
+  // partyHmReward (which already applies PARTY_DIFFICULTY[difficulty].mult),
+  // Rank XP here directly, since config.rankXp only has a flat per-size base.
+  const diffMult = PARTY_DIFFICULTY[difficulty].mult;
   const hmReward = Math.round(partyHmReward(size, difficulty) * rewardScale * (1 + effects.perkPct / 100));
   const rankXpReward = Math.round(
-    (config.rankXp[`quest_party_${size}`] || 0) * rewardScale * (1 + effects.clanChatPct / 100)
+    (config.rankXp[`quest_party_${size}`] || 0) * diffMult * rewardScale * (1 + effects.clanChatPct / 100)
   );
 
   const now = new Date();
@@ -890,17 +923,20 @@ async function getOpenTeamForUser(guildId, userId) {
  * It's stored as-is on the listing row and only turned into real quest
  * targets later, by `joinOpenTeam`, once the roster is actually complete.
  */
-async function createOpenTeam({ guildId, posterId, size, tree, picks = null }) {
+async function createOpenTeam({ guildId, posterId, size, tree, difficulty, picks = null }) {
   const supabase = getSupabase();
   if (!supabase) return { error: "Database unavailable." };
   if (!PARTY_SIZES[size]) return { error: "Unknown team size." };
   if (!TREE_BY_KEY[tree]) return { error: "Unknown category." };
+  if (!PARTY_DIFFICULTY[difficulty]) difficulty = "easy"; // see createPartyQuest for why this falls back instead of erroring
 
   const member = await getMember(posterId);
   if (!member?.rsn) return { error: "Register your RuneScape name first with `/register`." };
 
-  const activeParty = await getActivePartyQuestForUser(posterId);
-  if (activeParty) return { error: "You're already on a team quest." };
+  const activeParty = await getActivePartyQuestsForUser(posterId);
+  if (activeParty.length >= MAX_ACTIVE_PARTY_QUESTS) {
+    return { error: `You're already on ${MAX_ACTIVE_PARTY_QUESTS} team quests — the most allowed at once.` };
+  }
 
   const existingOpen = await getOpenTeamForUser(guildId, posterId);
   if (existingOpen) return { error: "You already have an open listing. Cancel it first if you want to post a new one." };
@@ -909,6 +945,7 @@ async function createOpenTeam({ guildId, posterId, size, tree, picks = null }) {
     guild_id: guildId,
     poster_id: posterId,
     team_size: size,
+    difficulty,
     categories: [tree],
     members: [posterId],
     picks: Array.isArray(picks) && picks.length ? picks : null,
@@ -942,10 +979,11 @@ async function cancelOpenTeam(guildId, posterId) {
 /**
  * Joins an open listing. If this fills the last slot it immediately converts
  * into a real party quest with the same rules as the closed-group flow
- * (same rewards, same duration, `difficulty: "easy"`), and the listing is
- * deleted. If the conversion itself fails (e.g. someone grabbed an active
- * team quest slot in the meantime), the listing is left untouched so the
- * failed joiner can simply try again or someone else can fill it instead.
+ * (same rewards, same duration, same difficulty the poster picked when they
+ * put the listing up), and the listing is deleted. If the conversion itself
+ * fails (e.g. someone grabbed an active team quest slot in the meantime),
+ * the listing is left untouched so the failed joiner can simply try again
+ * or someone else can fill it instead.
  */
 async function joinOpenTeam({ guildId, postId, userId }) {
   const supabase = getSupabase();
@@ -954,8 +992,10 @@ async function joinOpenTeam({ guildId, postId, userId }) {
   const member = await getMember(userId);
   if (!member?.rsn) return { error: "Register your RuneScape name first with `/register`." };
 
-  const activeParty = await getActivePartyQuestForUser(userId);
-  if (activeParty) return { error: "You're already on a team quest." };
+  const activeParty = await getActivePartyQuestsForUser(userId);
+  if (activeParty.length >= MAX_ACTIVE_PARTY_QUESTS) {
+    return { error: `You're already on ${MAX_ACTIVE_PARTY_QUESTS} team quests — the most allowed at once.` };
+  }
 
   const { data: post } = await supabase
     .from("hm_lfg_posts")
@@ -976,7 +1016,7 @@ async function joinOpenTeam({ guildId, postId, userId }) {
 
   if (nextMembers.length >= expected) {
     const result = await createPartyQuest({
-      guildId, members: nextMembers, tree, size: post.team_size, difficulty: "easy", picks: post.picks,
+      guildId, members: nextMembers, tree, size: post.team_size, difficulty: post.difficulty || "easy", picks: post.picks,
     });
     if (result.error) return result;
 
@@ -1094,13 +1134,13 @@ async function bumpCounts({ guildId, userId, questType, size }) {
 module.exports = {
   TREES, TREE_BY_KEY, QUEST_TREES, SKILL_TREE, SKILLS_BY_TREE,
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
-  SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY_MULT, PARTY_SIZES, LFG_EXPIRY_HOURS,
+  SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY, PARTY_DIFFICULTIES, PARTY_SIZES, LFG_EXPIRY_HOURS,
   QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD,
   buildSoloTargets, buildPartyTargets, soloTargetPool, partyTargetPool, treeKind,
   soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,
   getMember, getMemberByRsn, getCounts,
-  getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestForUser,
+  getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestsForUser, MAX_ACTIVE_PARTY_QUESTS,
   createSoloQuest, cancelSoloQuest, createPartyQuest, creditHm, bumpCounts,
   getOpenTeams, getOpenTeamForUser, createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
   awardRankXp,
