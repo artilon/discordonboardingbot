@@ -11,6 +11,7 @@ const {
   Client, GatewayIntentBits, Events, REST, Routes,
   SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, StringSelectMenuOptionBuilder, UserSelectMenuBuilder,
+  ModalBuilder, TextInputBuilder, TextInputStyle,
   MessageFlags, PermissionFlagsBits,
 } = require("discord.js");
 
@@ -526,6 +527,19 @@ async function handleRegister(interaction) {
   if (target.id !== interaction.user.id && !(await isStaff(interaction))) {
     return interaction.editReply({ content: "Only staff can register another member." });
   }
+
+  return performRegistration(interaction, target, rsn);
+}
+
+/**
+ * The actual registration logic shared by `/register` and the "📝 Register"
+ * button's popup form — looks up/validates the RSN, links it to `target` in
+ * `hm_members` + `hm_balances`, and replies on the already-deferred
+ * `interaction`. Callers are responsible for any permission check (the
+ * button form only ever registers the clicking member themselves, so it has
+ * nothing to check).
+ */
+async function performRegistration(interaction, target, rsn) {
   if (rsn.length < 1 || rsn.length > 12) {
     return interaction.editReply({ content: "That doesn't look like a RuneScape name (1–12 characters)." });
   }
@@ -575,6 +589,35 @@ async function handleRegister(interaction) {
       `✅ Linked **${rsn}** to ${target.id === interaction.user.id ? "your account" : `<@${target.id}>`}.\n\n` +
       `Open the quest board and press **Start a Solo Quest** to earn your first Honour Marks.`,
   });
+}
+
+// ── Register via button + popup form ────────────────────────────────────────
+// Some members find `/register rsn:` confusing or never discover slash
+// commands at all. This button on the claim panel does the exact same thing
+// through a Discord popup (modal) with a single text box instead — no slash
+// command required. It only ever registers the clicking member to
+// themselves; staff registering someone else still goes through `/register`.
+const REGISTER_MODAL_ID = "hm_register_modal";
+const REGISTER_MODAL_INPUT_ID = "hm_register_rsn_input";
+
+async function handleRegisterOpen(interaction) {
+  const modal = new ModalBuilder().setCustomId(REGISTER_MODAL_ID).setTitle("Register Your RuneScape Name");
+  const input = new TextInputBuilder()
+    .setCustomId(REGISTER_MODAL_INPUT_ID)
+    .setLabel("Your exact in-game username")
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(1)
+    .setMaxLength(12)
+    .setRequired(true)
+    .setPlaceholder("Type it exactly as it appears in game");
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return interaction.showModal(modal);
+}
+
+async function handleRegisterModalSubmit(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const rsn = cleanRsn(interaction.fields.getTextInputValue(REGISTER_MODAL_INPUT_ID));
+  return performRegistration(interaction, interaction.user, rsn);
 }
 
 async function handleHm(interaction) {
@@ -1789,6 +1832,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "hm_check": return await handleCheck(interaction);
         case "hm_claim_role": return await handleClaimRole(interaction);
         case "hm_drop_role": return await handleDropRole(interaction);
+        case "hm_register_open": return await handleRegisterOpen(interaction);
         case "hm_shop_perks": return await handleShopPerks(interaction);
         case "hm_shop_items": return await handleShopItems(interaction);
         case "hm_shop_boosts": return await handleShopBoosts(interaction);
@@ -1853,6 +1897,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (id.startsWith("hm_team_members:")) {
         const [, size, tree] = id.split(":");
         return await handleCreateTeam(interaction, size, tree);
+      }
+      return;
+    }
+
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === REGISTER_MODAL_ID) {
+        return await handleRegisterModalSubmit(interaction);
       }
       return;
     }
