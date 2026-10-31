@@ -5,7 +5,7 @@ const {
 } = require("discord.js");
 const { getSupabase, getConfigValue, setConfigValue } = require("./db");
 const { getRankForXp, formatRankProgress, RANK_TIERS } = require("./ranks");
-const { TREES, TREE_BY_KEY, PARTY_SIZES, PARTY_DIFFICULTY, LFG_EXPIRY_HOURS, treeKind, getMember } = require("./quests");
+const { TREES, TREE_BY_KEY, PARTY_SIZES, PARTY_DIFFICULTY, LFG_EXPIRY_HOURS, MAX_ACTIVE_PARTY_QUESTS, treeKind, getMember } = require("./quests");
 const { SKILL_LABELS, bossLabel, fetchHiscores, diffProgress } = require("./jagex");
 const { checkPartyQuest } = require("./progress");
 
@@ -633,7 +633,8 @@ function renderGuide(setup = {}) {
         `A team quest (Duo, Trio, or Quad) shares ONE or more targets across the whole group — everyone's ` +
         `gains are summed together toward each one, so it finishes faster the more people are pulling their ` +
         `weight. It always runs for **14 days** regardless of size, and pays **every member the full ` +
-        `reward**, not a split share.\n\n` +
+        `reward**, not a split share. You can be on up to **${MAX_ACTIVE_PARTY_QUESTS} team quests at once** — ` +
+        `starting or joining a 4th is blocked until one of the others finishes or expires.\n\n` +
         `**Starting one, step by step:**\n` +
         `1. Open ${questsCh} and press **👥 Start a Team Quest**.\n` +
         `2. Pick a size: **Duo** (2 people total), **Trio** (3 people total), or **Quad** (4 people total). You ` +

@@ -148,6 +148,10 @@ const PARTY_REQUIREMENTS = {
 };
 
 const QUEST_DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30 };
+// A member can be on up to this many team quests at once — previously just
+// 1, which meant someone already on a Duo couldn't also join/start a Trio
+// elsewhere even though team quests are independent of each other.
+const MAX_ACTIVE_PARTY_QUESTS = 3;
 const PARTY_DURATION_DAYS = 14;
 const RESET_PERIOD = { daily: 1, weekly: 7, monthly: 30 };
 const PARTY_SIZES = { duo: 2, trio: 3, quad: 4 };
@@ -672,15 +676,18 @@ async function getActiveSoloQuest(userId, questType) {
   return all.find((q) => q.quest_type === questType) || null;
 }
 
-async function getActivePartyQuestForUser(userId) {
+/** Every team quest `userId` is currently a member of — up to
+ *  MAX_ACTIVE_PARTY_QUESTS of them can be active for the same person at
+ *  once, so (unlike the old single-quest version of this) this always
+ *  returns an array, same shape as getActiveSoloQuests. */
+async function getActivePartyQuestsForUser(userId) {
   const supabase = getSupabase();
-  if (!supabase) return null;
+  if (!supabase) return [];
   const { data } = await supabase
     .from("hm_party_quests")
     .select("*")
-    .contains("members", [userId])
-    .maybeSingle();
-  return data || null;
+    .contains("members", [userId]);
+  return data || [];
 }
 
 /**
@@ -802,10 +809,12 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
     roster.push(m);
   }
 
-  // One active team quest per member, matching the original rule.
+  // Up to MAX_ACTIVE_PARTY_QUESTS team quests per member at once.
   for (const m of roster) {
-    const active = await getActivePartyQuestForUser(m.user_id);
-    if (active) return { error: `<@${m.user_id}> is already on a team quest.` };
+    const activeCount = (await getActivePartyQuestsForUser(m.user_id)).length;
+    if (activeCount >= MAX_ACTIVE_PARTY_QUESTS) {
+      return { error: `<@${m.user_id}> is already on ${MAX_ACTIVE_PARTY_QUESTS} team quests — the most allowed at once.` };
+    }
   }
 
   const baselines = {};
@@ -924,8 +933,10 @@ async function createOpenTeam({ guildId, posterId, size, tree, difficulty, picks
   const member = await getMember(posterId);
   if (!member?.rsn) return { error: "Register your RuneScape name first with `/register`." };
 
-  const activeParty = await getActivePartyQuestForUser(posterId);
-  if (activeParty) return { error: "You're already on a team quest." };
+  const activeParty = await getActivePartyQuestsForUser(posterId);
+  if (activeParty.length >= MAX_ACTIVE_PARTY_QUESTS) {
+    return { error: `You're already on ${MAX_ACTIVE_PARTY_QUESTS} team quests — the most allowed at once.` };
+  }
 
   const existingOpen = await getOpenTeamForUser(guildId, posterId);
   if (existingOpen) return { error: "You already have an open listing. Cancel it first if you want to post a new one." };
@@ -981,8 +992,10 @@ async function joinOpenTeam({ guildId, postId, userId }) {
   const member = await getMember(userId);
   if (!member?.rsn) return { error: "Register your RuneScape name first with `/register`." };
 
-  const activeParty = await getActivePartyQuestForUser(userId);
-  if (activeParty) return { error: "You're already on a team quest." };
+  const activeParty = await getActivePartyQuestsForUser(userId);
+  if (activeParty.length >= MAX_ACTIVE_PARTY_QUESTS) {
+    return { error: `You're already on ${MAX_ACTIVE_PARTY_QUESTS} team quests — the most allowed at once.` };
+  }
 
   const { data: post } = await supabase
     .from("hm_lfg_posts")
@@ -1127,7 +1140,7 @@ module.exports = {
   soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,
   getMember, getMemberByRsn, getCounts,
-  getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestForUser,
+  getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestsForUser, MAX_ACTIVE_PARTY_QUESTS,
   createSoloQuest, cancelSoloQuest, createPartyQuest, creditHm, bumpCounts,
   getOpenTeams, getOpenTeamForUser, createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
   awardRankXp,

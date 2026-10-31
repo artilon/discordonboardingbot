@@ -472,6 +472,56 @@ async function registerMember(userId, rsn) {
     assert.strictEqual(kc, Math.round(15 * 1.1), "the base duo raid KC (15) still gets the owned +10% Expansion bump");
   });
 
+  console.log("\n[a member can be on up to MAX_ACTIVE_PARTY_QUESTS team quests at once]");
+  await check("createPartyQuest allows a 2nd and 3rd concurrent team quest, blocks a 4th", async () => {
+    const everyone = [
+      "p1-multi", "p2-multi", "p3-multi",
+      "p-mate-0", "p-mate-1", "p-mate-2", "p-mate-3",
+      "p-mate-side-0", "p-mate-side-1",
+    ];
+    for (const id of everyone) {
+      await registerMember(id, id);
+      snapshots[id] = snapshotWithLevels({});
+    }
+
+    assert.strictEqual(q.MAX_ACTIVE_PARTY_QUESTS, 3, "this test assumes the documented cap of 3");
+
+    // p1-multi joins 3 separate team quests, one at a time, each with a
+    // fresh teammate so only p1-multi's own count is ever being tested.
+    for (let i = 0; i < 3; i++) {
+      const result = await q.createPartyQuest({
+        guildId: "g1", members: ["p1-multi", `p-mate-${i}`], tree: "raids", size: "duo", difficulty: "easy",
+        picks: ["chambers_of_xeric"],
+      });
+      assert.strictEqual(result.ok, true, `quest #${i + 1} for p1-multi should have been allowed: ${result.error}`);
+    }
+
+    const activeNow = await q.getActivePartyQuestsForUser("p1-multi");
+    assert.strictEqual(activeNow.length, 3, "p1-multi should now be on exactly 3 team quests");
+
+    // A 4th is rejected with a clear reason, naming the member who's maxed out.
+    const blocked = await q.createPartyQuest({
+      guildId: "g1", members: ["p1-multi", "p-mate-3"], tree: "raids", size: "duo", difficulty: "easy",
+      picks: ["theatre_of_blood"],
+    });
+    assert.ok(blocked.error, "a 4th concurrent team quest must be rejected");
+    assert.ok(blocked.error.includes("3 team quests"), `error should mention the cap: "${blocked.error}"`);
+
+    // Someone else who is only on 2 active team quests can still start a 3rd.
+    for (let i = 0; i < 2; i++) {
+      const result = await q.createPartyQuest({
+        guildId: "g1", members: ["p2-multi", `p-mate-side-${i}`], tree: "raids", size: "duo", difficulty: "easy",
+        picks: ["chambers_of_xeric"],
+      });
+      assert.strictEqual(result.ok, true, result.error);
+    }
+    const third = await q.createPartyQuest({
+      guildId: "g1", members: ["p2-multi", "p3-multi"], tree: "raids", size: "duo", difficulty: "easy",
+      picks: ["theatre_of_blood"],
+    });
+    assert.strictEqual(third.ok, true, "a 3rd concurrent team quest is still within the cap");
+  });
+
   console.log(`\n${passed} checks passed.`);
 })().catch((e) => {
   console.error("FAILED:", e);

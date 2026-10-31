@@ -21,7 +21,7 @@ const { getRankForXp, formatRankProgress } = require("./src/ranks");
 const {
   TREES, TREE_BY_KEY, QUEST_TREES, PARTY_SIZES, PARTY_DIFFICULTY, PARTY_DIFFICULTIES,
   getMember, getMemberByRsn, getCounts,
-  getActiveSoloQuests, getActivePartyQuestForUser,
+  getActiveSoloQuests, getActivePartyQuestsForUser,
   cancelSoloQuest, createPartyQuest, creditHm,
   createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams, getOpenTeamForUser,
   diffProgress, fetchHiscores, cleanRsn, soloHmReward, partyHmReward,
@@ -901,7 +901,7 @@ async function handleCheck(interaction) {
   if (result.error) return interaction.editReply({ content: result.error });
 
   const active = await getActiveSoloQuests(interaction.user.id);
-  const team = await getActivePartyQuestForUser(interaction.user.id);
+  const teams = await getActivePartyQuestsForUser(interaction.user.id);
 
   const embeds = [];
 
@@ -909,9 +909,14 @@ async function handleCheck(interaction) {
     embeds.push(questProgressEmbed(r.quest, r.progress));
   }
 
-  if (team) {
+  // A member can be on up to MAX_ACTIVE_PARTY_QUESTS team quests at once now
+  // (used to be capped at 1), so every one of them gets checked and shown,
+  // not just a single team.
+  let teamsShown = 0;
+  for (const team of teams) {
     const evaluated = await checkPartyQuest(team);
     if (evaluated?.progress) {
+      teamsShown += 1;
       embeds.push(
         new EmbedBuilder()
           .setColor(evaluated.finished ? COLOR.ok : COLOR.main)
@@ -943,8 +948,11 @@ async function handleCheck(interaction) {
       `+\`${result.awardedHm.toLocaleString()}\` ${HM_EMOJI} and +\`${result.awardedXp.toLocaleString()}\` Rank XP.`
     );
   }
-  if (team && !embeds.find((e) => e.data.title?.includes("Team"))) {
-    summary.push("Team quest progress shown above.");
+  if (teams.length && teamsShown < teams.length) {
+    summary.push(
+      `⚠️ ${teams.length - teamsShown} team quest${teams.length - teamsShown === 1 ? "" : "s"} couldn't be checked ` +
+      "right now — try again in a moment."
+    );
   }
 
   if (summary.length) {
