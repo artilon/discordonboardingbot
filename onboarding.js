@@ -55,6 +55,7 @@ const {
   StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
+  UserSelectMenuBuilder,
 } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -152,9 +153,21 @@ const TICKET_TYPES = {
     allowedRoleIds: [CO_OWNER_ROLE_ID, LEADER_ROLE_ID, STAFF_ROLE_ID],
     isApplication: true,
   },
+  compliment: {
+    key: "compliment",
+    label: "Give Compliment",
+    selectDescription: "Say something nice about the clan or a specific clan member",
+    instructions: null, // Built separately — see buildComplimentEmbed
+    // NOTE: unlike the other types, compliments are visible to every Clan Member,
+    // not just Leadership/Staff — see buildComplimentPermissionOverwrites, which
+    // is used instead of buildTicketPermissionOverwrites for this type.
+    allowedRoleIds: [CLAN_MEMBER_ROLE_ID],
+    isApplication: false,
+    isCompliment: true,
+  },
 };
 
-const TICKET_TYPE_ORDER = ["help", "report_member", "report_staff", "apply_staff"];
+const TICKET_TYPE_ORDER = ["help", "report_member", "report_staff", "apply_staff", "compliment"];
 
 // OSRS Voice Hub — joining this channel immediately redirects the member into
 // a brand-new temporary "OSRS Voice N" channel instead of letting them sit in the hub.
@@ -374,6 +387,14 @@ const ID = {
   TICKET_DENY_MODAL:        "ticket_deny_modal",
   TICKET_DENY_REASON_INPUT: "ticket_deny_reason_input",
   TICKET_ALERT_ACK:     "ticket_alert_ack",
+  // Give Compliment sub-flow custom IDs
+  TICKET_COMPLIMENT_TARGET:        "ticket_compliment_target",
+  TICKET_COMPLIMENT_USER_SELECT:   "ticket_compliment_user_select",
+  TICKET_COMPLIMENT_USER_CONFIRM:  "ticket_compliment_user_confirm",
+  TICKET_COMPLIMENT_USER_CANCEL:   "ticket_compliment_user_cancel",
+  TICKET_COMPLIMENT_MODAL_GENERAL: "ticket_compliment_modal_general",
+  TICKET_COMPLIMENT_MODAL_MEMBER:  "ticket_compliment_modal_member",
+  TICKET_COMPLIMENT_MESSAGE_INPUT: "ticket_compliment_message_input",
 };
 
 const COLOR = {
@@ -1120,6 +1141,12 @@ async function onTicketSelect(interaction) {
     return interaction.reply({ content: "That option isn't valid. Please try again.", flags: MessageFlags.Ephemeral });
   }
 
+  // Compliments have their own multi-step flow (who it's for, then the
+  // message) instead of the plain Confirm/Cancel used by the other types.
+  if (type.isCompliment) {
+    return onComplimentTypeSelected(interaction);
+  }
+
   const embed = new EmbedBuilder()
     .setColor(COLOR.warn)
     .setTitle("Confirm Your Ticket")
@@ -1134,6 +1161,247 @@ async function onTicketSelect(interaction) {
   );
 
   return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
+}
+
+// ---- Give Compliment sub-flow ----
+// Give Compliment -> General Clan / Specific Member -> (Specific Member only:
+// pick + confirm a member) -> a modal asking what the compliment is about ->
+// the compliment is posted in a brand-new private channel, THEN (only once
+// the message is already there) the Clan Member role (and, for a specific
+// member, that member) are pinged.
+function buildComplimentUserSelectMessage({ warning = null } = {}) {
+  const embed = new EmbedBuilder()
+    .setColor(warning ? COLOR.bad : COLOR.warn)
+    .setTitle("Pick a Member to Compliment")
+    .setDescription(
+      (warning ? `${warning}\n\n` : "") +
+      "Use the menu below to pick the member you'd like to compliment. They need to have the Clan Member role."
+    );
+
+  const select = new UserSelectMenuBuilder()
+    .setCustomId(ID.TICKET_COMPLIMENT_USER_SELECT)
+    .setPlaceholder("Select a clan member...");
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(select)] };
+}
+
+async function onComplimentTypeSelected(interaction) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle("Give a Compliment")
+    .setDescription("Who would you like to compliment?");
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${ID.TICKET_COMPLIMENT_TARGET}:general`).setLabel("General Clan").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`${ID.TICKET_COMPLIMENT_TARGET}:member`).setLabel("Specific Member").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(ID.TICKET_CANCEL).setLabel("Cancel").setStyle(ButtonStyle.Danger)
+  );
+
+  return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
+}
+
+function buildComplimentModal(kind, targetUserId = null) {
+  const customId = kind === "general" ? ID.TICKET_COMPLIMENT_MODAL_GENERAL : `${ID.TICKET_COMPLIMENT_MODAL_MEMBER}:${targetUserId}`;
+  const modal = new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle(kind === "general" ? "Compliment the Clan" : "Compliment a Member");
+
+  const input = new TextInputBuilder()
+    .setCustomId(ID.TICKET_COMPLIMENT_MESSAGE_INPUT)
+    .setLabel("What would you like to say?")
+    .setStyle(TextInputStyle.Paragraph)
+    .setMinLength(1)
+    .setMaxLength(1500)
+    .setRequired(true)
+    .setPlaceholder("Explain what the compliment is about and who it's for.");
+
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return modal;
+}
+
+async function onTicketComplimentTarget(interaction, kind) {
+  if (kind === "general") {
+    return interaction.showModal(buildComplimentModal("general"));
+  }
+  if (kind === "member") {
+    return interaction.update(buildComplimentUserSelectMessage());
+  }
+  return interaction.reply({ content: "That option isn't valid. Please try again.", flags: MessageFlags.Ephemeral });
+}
+
+async function onTicketComplimentUserSelect(interaction) {
+  const targetUserId = interaction.values?.[0];
+  if (!targetUserId) {
+    return interaction.update(buildComplimentUserSelectMessage({ warning: "Please pick a member." }));
+  }
+
+  const targetMember = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+  if (!targetMember || !memberHasRole(targetMember, CLAN_MEMBER_ROLE_ID)) {
+    return interaction.update(buildComplimentUserSelectMessage({ warning: "That member doesn't have the Clan Member role." }));
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle("Confirm Your Selection")
+    .setDescription(`You selected <@${targetUserId}>. Is this correct?`);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${ID.TICKET_COMPLIMENT_USER_CONFIRM}:${targetUserId}`).setLabel("Confirm").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(ID.TICKET_COMPLIMENT_USER_CANCEL).setLabel("Pick Someone Else").setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.update({ embeds: [embed], components: [row] });
+}
+
+async function onTicketComplimentUserCancel(interaction) {
+  return interaction.update(buildComplimentUserSelectMessage());
+}
+
+async function onTicketComplimentUserConfirm(interaction, targetUserId) {
+  return interaction.showModal(buildComplimentModal("member", targetUserId));
+}
+
+function buildComplimentChannelName(kind, user) {
+  const slug = slugifyForChannelName(user?.username || user?.tag || user?.id);
+  return `compliment-${kind}-${slug}`.slice(0, 90);
+}
+
+function buildComplimentPermissionOverwrites(guild, extraUserIds = []) {
+  const viewPerms = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.AttachFiles,
+    PermissionFlagsBits.EmbedLinks,
+  ];
+
+  const overwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }, // @everyone
+    { id: CLAN_MEMBER_ROLE_ID, allow: viewPerms }, // Visible to every Clan Member, not just staff
+  ];
+
+  for (const userId of extraUserIds) {
+    if (!overwrites.some((o) => o.id === userId)) {
+      overwrites.push({ id: userId, allow: viewPerms });
+    }
+  }
+
+  if (client.user?.id) {
+    overwrites.push({
+      id: client.user.id,
+      allow: [...viewPerms, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageMessages],
+    });
+  }
+
+  return overwrites;
+}
+
+function buildComplimentEmbed({ giverId, kind, targetId, message }) {
+  const isGeneral = kind === "general";
+  return new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle(isGeneral ? "A Compliment for the Whole Clan" : "A Compliment for a Clan Member")
+    .addFields(
+      { name: "From", value: `<@${giverId}>`, inline: true },
+      { name: "About", value: isGeneral ? "The whole clan" : `<@${targetId}>`, inline: true }
+    )
+    .addFields({ name: "Message", value: message.slice(0, 1024) })
+    .addFields({
+      name: "Thank You",
+      value: `Thank you <@${giverId}> for taking the time to share this — we appreciate you just as much!`,
+    })
+    .setFooter({ text: "Odinheim Ticket System" })
+    .setTimestamp();
+}
+
+async function createComplimentTicket(interaction, { kind, targetId, message }) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const guild = interaction.guild;
+  const extraUserIds = [interaction.user.id];
+  if (targetId) extraUserIds.push(targetId);
+
+  let channel;
+  try {
+    channel = await guild.channels.create({
+      name: buildComplimentChannelName(kind, interaction.user),
+      type: ChannelType.GuildText,
+      parent: TICKET_CATEGORY_ID,
+      topic: encodeTicketTopic({
+        type: "compliment",
+        complimentKind: kind,
+        openerId: interaction.user.id,
+        openerTag: interaction.user.tag,
+        targetId: targetId || null,
+        openedAt: Date.now(),
+      }),
+      permissionOverwrites: buildComplimentPermissionOverwrites(guild, extraUserIds),
+      reason: `Compliment ticket opened by ${interaction.user.tag}`,
+    });
+  } catch (err) {
+    console.error(`[Tickets] Could not create compliment channel for ${interaction.user.id}:`, err.message);
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("I couldn't share this")
+          .setDescription("Something went wrong creating the channel. Please try again."),
+      ],
+    });
+  }
+
+  // Post the compliment itself first — no pings yet, so the content is
+  // already there by the time anyone's notification brings them in.
+  await channel
+    .send({
+      embeds: [buildComplimentEmbed({ giverId: interaction.user.id, kind, targetId, message })],
+      components: [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(ID.TICKET_CLOSE_C1).setLabel("Close Ticket").setStyle(ButtonStyle.Danger)
+        ),
+      ],
+    })
+    .catch((e) => console.warn("[Tickets] Could not post compliment message:", e.message));
+
+  const pingContent =
+    kind === "general"
+      ? `<@&${CLAN_MEMBER_ROLE_ID}> a new compliment for the clan was just shared above!`
+      : `<@&${CLAN_MEMBER_ROLE_ID}> <@${targetId}> you just received a compliment above!`;
+  await channel.send({ content: pingContent }).catch((e) => console.warn("[Tickets] Could not send compliment ping:", e.message));
+
+  await interaction.editReply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR.ok)
+        .setTitle("Compliment Shared")
+        .setDescription(`Thank you for sharing that — it's posted here: ${channel}`),
+    ],
+  });
+}
+
+async function onTicketComplimentModalGeneral(interaction) {
+  const message = interaction.fields.getTextInputValue(ID.TICKET_COMPLIMENT_MESSAGE_INPUT);
+  await createComplimentTicket(interaction, { kind: "general", targetId: null, message });
+}
+
+async function onTicketComplimentModalMember(interaction, targetUserId) {
+  const message = interaction.fields.getTextInputValue(ID.TICKET_COMPLIMENT_MESSAGE_INPUT);
+
+  // Re-check at submit time in case the role changed between confirming and submitting.
+  const targetMember = await interaction.guild.members.fetch(targetUserId).catch(() => null);
+  if (!targetMember || !memberHasRole(targetMember, CLAN_MEMBER_ROLE_ID)) {
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Couldn't Create Compliment")
+          .setDescription("That member no longer has the Clan Member role. Please start over from the ticket panel."),
+      ],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  await createComplimentTicket(interaction, { kind: "member", targetId: targetUserId, message });
 }
 
 async function onTicketCancel(interaction) {
@@ -5190,6 +5458,9 @@ async function handleInteraction(interaction) {
       case ID.TICKET_DENY_C2:       return onTicketDenyC2(interaction);
       case ID.TICKET_DENY_CANCEL:   return onTicketDenyCancel(interaction);
       case ID.TICKET_ALERT_ACK:     return onTicketAlertAck(interaction);
+      case ID.TICKET_COMPLIMENT_TARGET:        return onTicketComplimentTarget(interaction, payload);
+      case ID.TICKET_COMPLIMENT_USER_CONFIRM:  return onTicketComplimentUserConfirm(interaction, payload);
+      case ID.TICKET_COMPLIMENT_USER_CANCEL:   return onTicketComplimentUserCancel(interaction);
       default:                      return;
     }
   }
@@ -5199,10 +5470,18 @@ async function handleInteraction(interaction) {
     return;
   }
 
+  if (interaction.isUserSelectMenu?.()) {
+    if (interaction.customId === ID.TICKET_COMPLIMENT_USER_SELECT) return onTicketComplimentUserSelect(interaction);
+    return;
+  }
+
   if (interaction.isModalSubmit()) {
+    const [modalBase, modalPayload] = interaction.customId.split(":");
     if (interaction.customId === ID.MODAL) return onModalSubmit(interaction);
     if (interaction.customId === ID.ROSTER_MODAL) return onRosterModalSubmit(interaction);
     if (interaction.customId === ID.TICKET_DENY_MODAL) return onTicketDenyModalSubmit(interaction);
+    if (modalBase === ID.TICKET_COMPLIMENT_MODAL_GENERAL) return onTicketComplimentModalGeneral(interaction);
+    if (modalBase === ID.TICKET_COMPLIMENT_MODAL_MEMBER) return onTicketComplimentModalMember(interaction, modalPayload);
   }
 }
 
@@ -5369,6 +5648,19 @@ module.exports = {
   onTicketDenyCancel,
   onTicketDenyModalSubmit,
   onTicketAlertAck,
+  // Give Compliment sub-flow exports
+  onComplimentTypeSelected,
+  buildComplimentModal,
+  onTicketComplimentTarget,
+  onTicketComplimentUserSelect,
+  onTicketComplimentUserCancel,
+  onTicketComplimentUserConfirm,
+  onTicketComplimentModalGeneral,
+  onTicketComplimentModalMember,
+  buildComplimentChannelName,
+  buildComplimentPermissionOverwrites,
+  buildComplimentEmbed,
+  createComplimentTicket,
   // Ranking system exports
   CLAN_CREATION_DATE,
   RANK_TIERS,
