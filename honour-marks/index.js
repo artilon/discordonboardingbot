@@ -48,6 +48,7 @@ const {
   COLOR, HM_EMOJI,
   renderClaimPanel, renderGuide,
   renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, renderClanPool, syncPanel, emptyPage,
+  getPanelLedger,
 } = require("./src/panels");
 const {
   readSetup, bindGuild, createStructure, verifyBindings, seedDefaults,
@@ -356,6 +357,53 @@ function scheduleRefresh(guildId) {
   }, config.panelRefreshDebounceMs);
 }
 
+// The order the 3 panels appear in the quests channel, top to bottom. If you
+// change this, that's the ONLY place you need to — reorderQuestsPanelsIfNeeded
+// below handles actually moving things in Discord for every guild already
+// running the bot (see its doc comment for why that's needed at all).
+const QUESTS_PANEL_ORDER = ["clan_pool", "quest_board", "open_teams"];
+const QUESTS_PANEL_ORDER_CONFIG_KEY = "quests_panel_order";
+
+/** Deletes every posted message (and ledger row) for one panel in one channel,
+ *  so the next syncPanel() call reposts it completely fresh. */
+async function deletePanelMessages(guildId, channel, panelKey) {
+  const ledger = await getPanelLedger(guildId, panelKey);
+  for (const row of ledger) {
+    const msg = await channel.messages.fetch(row.message_id).catch(() => null);
+    if (msg) await msg.delete().catch(() => {});
+  }
+  const supabase = getSupabase();
+  if (supabase) {
+    await supabase.from("hm_panels").delete().eq("guild_id", guildId).eq("panel_key", panelKey);
+  }
+}
+
+/**
+ * syncPanel() only ever EDITS an existing message in place — editing never
+ * moves a message's position in a Discord channel, so simply changing the
+ * order the syncPanel() calls run in below does nothing for a panel that's
+ * already been posted once. The only way to actually move one is to delete
+ * its old message(s) and let it repost fresh at the bottom, in whatever
+ * order the panels are (re)created in.
+ *
+ * This compares QUESTS_PANEL_ORDER above against what's on file for this
+ * guild; the first time they differ (e.g. right after this exact change
+ * ships), it wipes and reposts all 3 quests-channel panels once, then
+ * records the new order so every refresh after that is back to a normal,
+ * cheap in-place edit — this never runs again unless the order changes again.
+ */
+async function reorderQuestsPanelsIfNeeded(guildId, questsCh) {
+  if (!questsCh) return;
+  const wanted = JSON.stringify(QUESTS_PANEL_ORDER);
+  const stored = await getConfigValue(guildId, QUESTS_PANEL_ORDER_CONFIG_KEY);
+  if (stored === wanted) return;
+
+  for (const key of QUESTS_PANEL_ORDER) {
+    await deletePanelMessages(guildId, questsCh, key);
+  }
+  await setConfigValue(guildId, QUESTS_PANEL_ORDER_CONFIG_KEY, wanted);
+}
+
 async function refreshPanels(guildId) {
   const guild = await client.guilds.fetch(guildId).catch(() => null);
   if (!guild) return;
@@ -387,13 +435,13 @@ async function refreshPanels(guildId) {
     await syncPanel(guildId, guideCh, "guide", renderGuide(setup));
   }
   if (questsCh) {
-    await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId, setup));
-    // The permanent open-teams board lives right under the quest board, in
-    // the same channel, as its own synced panel.
-    await syncPanel(guildId, questsCh, "open_teams", await renderOpenTeams(guildId));
-    // The Clan Pool board (one shared monthly quest + any active clan-wide
-    // boost) lives right under the open-teams board, same channel.
+    await reorderQuestsPanelsIfNeeded(guildId, questsCh);
+    // Call order here must match QUESTS_PANEL_ORDER above: the Clan Pool
+    // board (one shared monthly quest + any active clan-wide boost) leads
+    // the channel, then the quest board, then the open-teams board.
     await syncPanel(guildId, questsCh, "clan_pool", await renderClanPool(guildId));
+    await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId, setup));
+    await syncPanel(guildId, questsCh, "open_teams", await renderOpenTeams(guildId));
   }
   if (shopCh) {
     await syncPanel(guildId, shopCh, "shop", await renderShop(guildId));
