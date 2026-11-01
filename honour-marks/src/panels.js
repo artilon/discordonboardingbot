@@ -7,7 +7,7 @@ const { getSupabase, getConfigValue, setConfigValue } = require("./db");
 const { getRankForXp, formatRankProgress, RANK_TIERS } = require("./ranks");
 const {
   TREES, TREE_BY_KEY, PARTY_SIZES, PARTY_DIFFICULTY, SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES, SOLO_SKILL_XP,
-  LFG_EXPIRY_HOURS, MAX_ACTIVE_PARTY_QUESTS, treeKind, getMember,
+  LFG_EXPIRY_HOURS, MAX_ACTIVE_PARTY_QUESTS, SOLO_QUEST_PERIOD_CAP, treeKind, getMember,
 } = require("./quests");
 const { SKILL_LABELS, bossLabel, fetchHiscores, diffProgress } = require("./jagex");
 const { checkPartyQuest } = require("./progress");
@@ -658,8 +658,12 @@ function renderGuide(setup = {}) {
       title: "📜 Step 2: Solo Quests, In Detail",
       body:
         `You can hold **one Daily, one Weekly, and one Monthly solo quest at the same time** — they don't compete ` +
-        `with each other, and each can be in a different category if you want. As soon as a slot is completed or ` +
-        `cancelled, you can immediately start a new quest of that same type.\n\n` +
+        `with each other, and each can be in a different category if you want. As soon as a slot is **cancelled**, ` +
+        `you can immediately start a new quest of that same type for free.\n\n` +
+        `**Completing** one counts against that type's limit for the current period, though: you can complete up ` +
+        `to **${SOLO_QUEST_PERIOD_CAP.daily} Daily**, **${SOLO_QUEST_PERIOD_CAP.weekly} Weekly**, or ` +
+        `**${SOLO_QUEST_PERIOD_CAP.monthly} Monthly** quests before that type locks until the next reset — once ` +
+        `you hit the limit, you'll need to wait even if you have no active quest of that type.\n\n` +
         `**Durations**, counted from the moment you start (not from any clock reset): Daily = 1 day, ` +
         `Weekly = 7 days, Monthly = 30 days.\n\n` +
         `**Picking a target.** After you choose a category, the bot normally rolls a random skill or boss from ` +
