@@ -13,7 +13,7 @@ const { SKILL_LABELS, bossLabel, fetchHiscores, diffProgress } = require("./jage
 const { checkPartyQuest } = require("./progress");
 const { PRESTIGE_COST, PRESTIGE_HM_BONUS_PCT, PRESTIGE_RANK_XP_BONUS_PCT, PRESTIGE_EMOJI, isPrestiged, getPrestigedSet } = require("./shop");
 const {
-  CLAN_QUEST_TARGETS, CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI, CLAN_BOOST_PCT, CLAN_BOOST_LABELS,
+  CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI, CLAN_BOOST_PCT, CLAN_BOOST_LABELS,
   ensureClanQuest, getActiveClanBoost,
 } = require("./clanpool");
 
@@ -1088,10 +1088,16 @@ function renderGuide(setup = {}) {
         `quests (Page 4), added together clan-wide.\n` +
         `• 📜 **Total HM Quests Completed** — combined count of finished Honour Marks quests, solo and team ` +
         `alike, by anyone in the clan.\n\n` +
-        `**Current targets** (agent-chosen defaults, tuned to be a real grind but still realistically finishable ` +
-        `within a month by a handful of active members — these can be retuned later if they turn out too easy ` +
-        `or too hard): 3,000,000 total XP • 750 total Boss KC • 300 total minigame completions • 60 total HM ` +
-        `quests completed.\n\n` +
+        `**Targets scale up as the clan grows**, so it stays about as grindy-but-achievable at 50 members as it ` +
+        `was at 20. Every quest's target is locked in fresh when it starts, based on how many members are ` +
+        `registered right then — it never shifts again mid-quest even if people join or leave:\n` +
+        `• Below 30 registered members — 1,000,000 total XP • 500 total Boss KC • 300 total minigame ` +
+        `completions • 30 total HM quests completed.\n` +
+        `• Every **10 more members** past that (30, 40, 50, ...), each target rises again: ` +
+        `+250,000 XP • +25 Boss KC • +25 minigame completions • +5 HM quests completed, per step.\n` +
+        `• Example: with 35 registered members (the first step, just past the 30 threshold), the targets are ` +
+        `already 1,250,000 XP, 525 Boss KC, 325 minigame completions, and 35 HM quest completions; hitting 40 ` +
+        `bumps it up another step on top of that.\n\n` +
         `**What happens when it's completed.** The moment the target is hit:\n` +
         `1. A coin flip picks ONE of 2 possible clan-wide boosts (below) to go live.\n` +
         `2. That boost starts running immediately and lasts **exactly 1 week** — the maximum length any Clan ` +

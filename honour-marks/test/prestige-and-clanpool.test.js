@@ -135,10 +135,49 @@ async function registerMember(userId, rsn, guildId = "g1") {
     const quest = await clanpool.ensureClanQuest("g-clan");
     assert.ok(quest);
     assert.ok(clanpool.CLAN_QUEST_TYPES.includes(quest.quest_type));
-    assert.strictEqual(quest.target, clanpool.CLAN_QUEST_TARGETS[quest.quest_type]);
+    // Only 2 members registered — well under the first 30-member threshold —
+    // so this should be the plain base target for whichever type was rolled.
+    assert.strictEqual(quest.target, clanpool.CLAN_QUEST_BASE_TARGETS[quest.quest_type]);
+    assert.strictEqual(quest.target, clanpool.computeClanQuestTarget(quest.quest_type, 2));
 
     const again = await clanpool.ensureClanQuest("g-clan");
     assert.strictEqual(again.quest_type, quest.quest_type, "a second call must not create a 2nd quest");
+  });
+
+  await check("Clan Pool targets scale up by a fixed step every 10 members starting at 30", () => {
+    // Below the first threshold, every category is just its base number.
+    for (const n of [0, 10, 20, 29]) {
+      assert.strictEqual(clanpool.clanMemberTier(n), 0, `${n} members should still be tier 0`);
+    }
+    assert.strictEqual(clanpool.computeClanQuestTarget("skill_xp", 0), 1_000_000);
+    assert.strictEqual(clanpool.computeClanQuestTarget("boss_kc", 0), 500);
+    assert.strictEqual(clanpool.computeClanQuestTarget("minigame", 0), 300);
+    assert.strictEqual(clanpool.computeClanQuestTarget("quest_completions", 0), 30);
+
+    // The bump lands exactly AT 30/40/50/60, not one before or one after.
+    assert.strictEqual(clanpool.clanMemberTier(29), 0);
+    assert.strictEqual(clanpool.clanMemberTier(30), 1);
+    assert.strictEqual(clanpool.clanMemberTier(39), 1);
+    assert.strictEqual(clanpool.clanMemberTier(40), 2);
+    assert.strictEqual(clanpool.clanMemberTier(49), 2);
+    assert.strictEqual(clanpool.clanMemberTier(50), 3);
+
+    // At 50 members (3 steps past the base) every category has stepped up 3 times.
+    assert.strictEqual(clanpool.computeClanQuestTarget("skill_xp", 50), 1_000_000 + 3 * 250_000);
+    assert.strictEqual(clanpool.computeClanQuestTarget("boss_kc", 50), 500 + 3 * 25);
+    assert.strictEqual(clanpool.computeClanQuestTarget("minigame", 50), 300 + 3 * 25);
+    assert.strictEqual(clanpool.computeClanQuestTarget("quest_completions", 50), 30 + 3 * 5);
+  });
+
+  await check("a quest started with more registered members locks in the scaled-up target", async () => {
+    for (let i = 0; i < 30; i++) {
+      await registerMember(`u-scale${i}`, `ScaleRsn${i}`, "g-scale");
+      snapshots[`ScaleRsn${i}`] = { skills: {}, bosses: {} };
+    }
+    fake.db.hm_clan_quest = fake.db.hm_clan_quest.filter((r) => r.guild_id !== "g-scale");
+    const quest = await clanpool.ensureClanQuest("g-scale");
+    assert.strictEqual(quest.target, clanpool.computeClanQuestTarget(quest.quest_type, 30));
+    assert.strictEqual(clanpool.clanMemberTier(30), 1, "30 registered members should already be tier 1");
   });
 
   await check("progress sums every member's delta vs their own baseline; a lazy-joined member starts at 0", async () => {

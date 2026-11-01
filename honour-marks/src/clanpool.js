@@ -21,20 +21,49 @@ const { BOSS_POOL, MINIGAME_BOSSES } = require("./quests");
  * was still running), and a brand new quest of a random type starts right
  * away so there is never a gap with no active Clan Pool quest.
  *
- * Target numbers below are agent-chosen defaults (the user had no exact
- * numbers and asked for "grindy but still possible for 5-6 active players"
- * within the 1-month window) — flagged to the user, easy to retune later by
- * just editing CLAN_QUEST_TARGETS.
+ * Target numbers scale up with the clan's registered member count, so the
+ * quest stays roughly as grindy-but-achievable as the clan grows instead of
+ * staying fixed forever. Every CLAN_MEMBER_THRESHOLD_STEP members past
+ * CLAN_MEMBER_THRESHOLD_START (30, 40, 50, ...) is one more "tier", and each
+ * tier adds one CLAN_QUEST_TARGET_STEP on top of that category's
+ * CLAN_QUEST_BASE_TARGETS. Below 30 members, it's always just the base
+ * number. A quest's target is computed ONCE, when it starts, from the member
+ * count at that moment — it never changes mid-quest even if membership does.
  */
 
 const CLAN_QUEST_TYPES = ["skill_xp", "boss_kc", "minigame", "quest_completions"];
 
-const CLAN_QUEST_TARGETS = {
-  skill_xp: 3_000_000, // total clan XP gained across all registered members, per month
-  boss_kc: 750, // total Boss PvM KC (BOSS_POOL only — raids/minigames have their own category)
+const CLAN_QUEST_BASE_TARGETS = {
+  skill_xp: 1_000_000, // total clan XP gained across all registered members, per month
+  boss_kc: 500, // total Boss PvM KC (BOSS_POOL only — raids/minigames have their own category)
   minigame: 300, // total minigame completions (Wintertodt crates, Tempoross, GOTR rifts, etc.)
-  quest_completions: 60, // total finished Honour Marks quests (solo + team), clan-wide
+  quest_completions: 30, // total finished Honour Marks quests (solo + team), clan-wide
 };
+
+// How much each category's target rises by, per member-count tier reached.
+const CLAN_QUEST_TARGET_STEP = {
+  skill_xp: 250_000,
+  boss_kc: 25,
+  minigame: 25,
+  quest_completions: 5,
+};
+
+const CLAN_MEMBER_THRESHOLD_START = 30; // first tier bump happens at this many registered members
+const CLAN_MEMBER_THRESHOLD_STEP = 10; // then every this-many members after that (40, 50, 60, ...)
+
+/** 0 below 30 members, 1 at 30-39, 2 at 40-49, 3 at 50-59, and so on. */
+function clanMemberTier(memberCount) {
+  if (!memberCount || memberCount < CLAN_MEMBER_THRESHOLD_START) return 0;
+  return Math.floor((memberCount - CLAN_MEMBER_THRESHOLD_START) / CLAN_MEMBER_THRESHOLD_STEP) + 1;
+}
+
+/** The actual target for a quest type, given how many members are registered right now. */
+function computeClanQuestTarget(questType, memberCount) {
+  const tier = clanMemberTier(memberCount);
+  const base = CLAN_QUEST_BASE_TARGETS[questType] || 0;
+  const step = CLAN_QUEST_TARGET_STEP[questType] || 0;
+  return base + tier * step;
+}
 
 const CLAN_QUEST_LABELS = {
   skill_xp: "Total Skilling XP",
@@ -127,8 +156,8 @@ async function ensureClanQuest(guildId) {
   if (existing) return existing;
 
   const questType = CLAN_QUEST_TYPES[Math.floor(Math.random() * CLAN_QUEST_TYPES.length)];
-  const target = CLAN_QUEST_TARGETS[questType];
   const members = await getRegisteredMembers(guildId);
+  const target = computeClanQuestTarget(questType, members.length);
   const completionCounts = questType === "quest_completions" ? await getLifetimeQuestCompletions(guildId) : null;
 
   const baselines = {};
@@ -238,8 +267,11 @@ function clanBoostMultiplier(boost, kind) {
 }
 
 module.exports = {
-  CLAN_QUEST_TYPES, CLAN_QUEST_TARGETS, CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI,
+  CLAN_QUEST_TYPES, CLAN_QUEST_BASE_TARGETS, CLAN_QUEST_TARGET_STEP,
+  CLAN_MEMBER_THRESHOLD_START, CLAN_MEMBER_THRESHOLD_STEP,
+  CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI,
   CLAN_BOOST_KINDS, CLAN_BOOST_PCT, CLAN_BOOST_DURATION_MS, CLAN_BOOST_LABELS,
+  clanMemberTier, computeClanQuestTarget,
   ensureClanQuest, checkClanQuestProgress, completeClanQuest, getActiveClanBoost, clanBoostMultiplier,
   getLifetimeQuestCompletions, currentMemberTotal, getRegisteredMembers,
 };
