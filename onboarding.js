@@ -51,6 +51,8 @@ const {
   GuildMemberFlags,
   MessageFlags,
   ModalBuilder,
+  PermissionFlagsBits,
+  StringSelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
@@ -91,6 +93,68 @@ const ROSTER_UPLOAD_ROLE_IDS = [
 const STAFF_ALERT_CHANNEL_ID = "1561481869197840504";
 const RANK_LIST_CHANNEL_ID   = "1561482413341679757";
 const RANK_LOG_CHANNEL_ID    = "1561484125016428605";
+
+// ================= TICKETING SYSTEM =================
+const TICKET_CONTACT_CHANNEL_ID    = "1546566171317506098"; // Permanent panel w/ the dropdown lives here
+const TICKET_CATEGORY_ID           = "1546573889532993606"; // New ticket channels are created under this category
+const TICKET_TRANSCRIPT_CHANNEL_ID = "1546574241909047406"; // Closed-ticket transcripts are posted here
+// New-ticket alerts reuse the existing Staff Alert channel (STAFF_ALERT_CHANNEL_ID) —
+// it's the same channel ID the clan already uses for rank-up/member-left alerts.
+const TICKET_CLOSE_DELETE_DELAY_MS = 10 * 1000; // Ticket channel is deleted 10s after it's closed
+
+const STAFF_APPLICATION_QUESTIONS = [
+  "Why do you want to be on Staff?",
+  "Do you have any issues with helping recruitment, events, or moderation?",
+  "What new ideas/events could you come up with for us to do as a clan?",
+  "Anything else you want to provide that may help your application?",
+];
+
+// Roles allowed to VIEW each ticket type's channel. The member who opened a
+// ticket can always see their own channel regardless of this list.
+//   - Co-Owners see every ticket type.
+//   - Leaders see everything except reports made against a Leader/Staff member.
+//   - Staff see member reports, help requests, and staff applications — not
+//     reports made against a Leader/Staff member.
+//   - Jr. Staff only see help requests and member reports.
+const TICKET_TYPES = {
+  help: {
+    key: "help",
+    label: "Need Help/Ask a Question",
+    selectDescription: "General questions or need a hand with something",
+    instructions: "Please detail your problem or question as much as you can. A staff member will be with you shortly.",
+    allowedRoleIds: [CO_OWNER_ROLE_ID, LEADER_ROLE_ID, STAFF_ROLE_ID, JR_STAFF_ROLE_ID],
+    isApplication: false,
+  },
+  report_member: {
+    key: "report_member",
+    label: "Report an Issue with Another Clan Member",
+    selectDescription: "Report a problem involving a fellow clan member",
+    instructions:
+      "Please detail what the issue is, who it is about, and provide any screenshots or other evidence to support your report.",
+    allowedRoleIds: [CO_OWNER_ROLE_ID, LEADER_ROLE_ID, STAFF_ROLE_ID, JR_STAFF_ROLE_ID],
+    isApplication: false,
+  },
+  report_staff: {
+    key: "report_staff",
+    label: "Report an Issue with a Leader/Staff Member",
+    selectDescription: "Report a problem involving a Leader or Staff member",
+    instructions:
+      "Please detail what the issue is, who it is about, and provide any screenshots or other evidence to support your report.\n\n" +
+      "This ticket is only visible to Co-Owners.",
+    allowedRoleIds: [CO_OWNER_ROLE_ID],
+    isApplication: false,
+  },
+  apply_staff: {
+    key: "apply_staff",
+    label: "Apply for Staff",
+    selectDescription: "Submit an application to join the Staff team",
+    instructions: null, // Built separately from STAFF_APPLICATION_QUESTIONS
+    allowedRoleIds: [CO_OWNER_ROLE_ID, LEADER_ROLE_ID, STAFF_ROLE_ID],
+    isApplication: true,
+  },
+};
+
+const TICKET_TYPE_ORDER = ["help", "report_member", "report_staff", "apply_staff"];
 
 // OSRS Voice Hub — joining this channel immediately redirects the member into
 // a brand-new temporary "OSRS Voice N" channel instead of letting them sit in the hub.
@@ -294,6 +358,22 @@ const ID = {
   LEFT_C1:           "left_c1",
   LEFT_C2:           "left_c2",
   LEFT_CANCEL:       "left_cancel",
+  // Ticketing system custom IDs
+  TICKET_SELECT:        "ticket_select",
+  TICKET_CONFIRM:       "ticket_confirm",
+  TICKET_CANCEL:        "ticket_cancel",
+  TICKET_CLOSE_C1:      "ticket_close_c1",
+  TICKET_CLOSE_C2:      "ticket_close_c2",
+  TICKET_CLOSE_CANCEL:  "ticket_close_cancel",
+  TICKET_ACCEPT_C1:     "ticket_accept_c1",
+  TICKET_ACCEPT_C2:     "ticket_accept_c2",
+  TICKET_ACCEPT_CANCEL: "ticket_accept_cancel",
+  TICKET_DENY_C1:       "ticket_deny_c1",
+  TICKET_DENY_C2:       "ticket_deny_c2",
+  TICKET_DENY_CANCEL:   "ticket_deny_cancel",
+  TICKET_DENY_MODAL:        "ticket_deny_modal",
+  TICKET_DENY_REASON_INPUT: "ticket_deny_reason_input",
+  TICKET_ALERT_ACK:     "ticket_alert_ack",
 };
 
 const COLOR = {
@@ -840,6 +920,635 @@ async function ensureOrientationMessage() {
     payload: buildOrientationMessage(),
     what: "orientation embed",
   });
+}
+
+// ================= TICKETING SYSTEM =================
+// A permanent dropdown panel in the Contact Us channel lets a member pick a
+// reason to reach out. After they confirm their pick, a private ticket
+// channel is created under TICKET_CATEGORY_ID, visible only to the member
+// and whichever roles are allowed to see that ticket type (TICKET_TYPES).
+//
+// Ticket state (who opened it, which type, when) is stored in the channel's
+// topic as a small JSON blob rather than in a database — the channel itself
+// is the only place that state needs to live, and it disappears exactly when
+// the ticket does.
+const TICKET_TOPIC_PREFIX = "HEIMDALL_TICKET::";
+
+function encodeTicketTopic(data) {
+  return `${TICKET_TOPIC_PREFIX}${JSON.stringify(data)}`;
+}
+
+function decodeTicketTopic(topic) {
+  if (typeof topic !== "string" || !topic.startsWith(TICKET_TOPIC_PREFIX)) return null;
+  try {
+    const parsed = JSON.parse(topic.slice(TICKET_TOPIC_PREFIX.length));
+    if (!parsed || typeof parsed !== "object" || !parsed.type || !parsed.openerId) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function slugifyForChannelName(text) {
+  const slug = String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 30);
+  return slug || "member";
+}
+
+const TICKET_CHANNEL_NAME_SLUGS = {
+  help: "help",
+  report_member: "member-report",
+  report_staff: "staff-report",
+  apply_staff: "staff-app",
+};
+
+function buildTicketChannelName(type, user) {
+  const typeSlug = TICKET_CHANNEL_NAME_SLUGS[type.key] || "ticket";
+  const userSlug = slugifyForChannelName(user?.username || user?.tag || user?.id);
+  return `ticket-${typeSlug}-${userSlug}`.slice(0, 90);
+}
+
+async function findOpenTicketChannel(guild, openerId, typeKey) {
+  const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
+  for (const ch of channels.values()) {
+    if (!ch || ch.parentId !== TICKET_CATEGORY_ID) continue;
+    const meta = decodeTicketTopic(ch.topic);
+    if (meta && meta.openerId === openerId && meta.type === typeKey) return ch;
+  }
+  return null;
+}
+
+function buildTicketPermissionOverwrites(guild, type, openerId) {
+  const viewPerms = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.AttachFiles,
+    PermissionFlagsBits.EmbedLinks,
+  ];
+
+  const overwrites = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }, // @everyone
+    { id: openerId, allow: viewPerms },
+  ];
+
+  for (const roleId of type.allowedRoleIds) {
+    overwrites.push({ id: roleId, allow: [...viewPerms, PermissionFlagsBits.ManageMessages] });
+  }
+
+  if (client.user?.id) {
+    overwrites.push({
+      id: client.user.id,
+      allow: [...viewPerms, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageMessages],
+    });
+  }
+
+  return overwrites;
+}
+
+// ---- Permanent ticket panel (dropdown) ----
+function buildTicketPanelMessage() {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle("Contact Us")
+    .setDescription(
+      "Need something from Leadership or Staff? Pick the option below that best matches why you're reaching out, " +
+      "confirm your choice, and a private ticket channel will be created just for you.\n\n" +
+      "Only you and the roles who need to see that type of ticket will be able to see the channel."
+    )
+    .addFields(
+      TICKET_TYPE_ORDER.map((key) => ({
+        name: TICKET_TYPES[key].label,
+        value: TICKET_TYPES[key].selectDescription,
+      }))
+    )
+    .setFooter({ text: "Odinheim • Contact Us" });
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(ID.TICKET_SELECT)
+    .setPlaceholder("Select a reason for contacting us...")
+    .addOptions(
+      TICKET_TYPE_ORDER.map((key) => ({
+        label: TICKET_TYPES[key].label,
+        description: TICKET_TYPES[key].selectDescription,
+        value: key,
+      }))
+    );
+
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(select)] };
+}
+
+async function ensureTicketPanelMessage() {
+  return ensureEmbedMessage({
+    channelId: TICKET_CONTACT_CHANNEL_ID,
+    label: "Tickets",
+    buttonIds: [ID.TICKET_SELECT],
+    payload: buildTicketPanelMessage(),
+    what: "ticket panel embed",
+  });
+}
+
+// ---- In-ticket opening message ----
+function buildTicketOpeningMessage(type, openerId) {
+  const lines = [`Opened by <@${openerId}>.`, ""];
+
+  if (type.isApplication) {
+    lines.push("Please answer the following questions. Try to be as honest and detailed as possible:", "");
+    STAFF_APPLICATION_QUESTIONS.forEach((q, i) => lines.push(`**${i + 1}. ${q}**`));
+  } else {
+    lines.push(type.instructions);
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(type.isApplication ? COLOR.gold : COLOR.main)
+    .setTitle(type.label)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: "Odinheim Ticket System" })
+    .setTimestamp();
+
+  const components = [];
+  if (type.isApplication) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(ID.TICKET_ACCEPT_C1).setLabel("Accept Application").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(ID.TICKET_DENY_C1).setLabel("Deny Application").setStyle(ButtonStyle.Secondary)
+      )
+    );
+  }
+  components.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(ID.TICKET_CLOSE_C1).setLabel("Close Ticket").setStyle(ButtonStyle.Danger)
+    )
+  );
+
+  return { embeds: [embed], components };
+}
+
+// ---- Ticket-open alert (single confirmation, auto-deletes on click) ----
+async function sendTicketOpenAlert(type, user, channel) {
+  const alertChannel = await getStaffAlertChannel();
+  if (!alertChannel) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle("New Ticket Opened")
+    .setDescription(`**${user.tag}** opened a **${type.label}** ticket: ${channel}`)
+    .setFooter({ text: "Click Acknowledge to dismiss this alert." });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(ID.TICKET_ALERT_ACK).setLabel("Acknowledge").setStyle(ButtonStyle.Primary)
+  );
+
+  await alertChannel.send({ embeds: [embed], components: [row] }).catch((e) =>
+    console.warn("[Tickets] Could not send ticket-open alert:", e.message)
+  );
+}
+
+async function onTicketAlertAck(interaction) {
+  await interaction.deferUpdate().catch(() => {});
+  await interaction.message?.delete().catch((e) => console.warn("[Tickets] Could not delete ticket alert:", e.message));
+}
+
+// ---- Dropdown selection -> single confirmation -> channel creation ----
+async function onTicketSelect(interaction) {
+  const typeKey = interaction.values?.[0];
+  const type = TICKET_TYPES[typeKey];
+  if (!type) {
+    return interaction.reply({ content: "That option isn't valid. Please try again.", flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle("Confirm Your Ticket")
+    .setDescription(
+      `You selected **${type.label}**.\n\n` +
+      "Click **Confirm** to open a private ticket channel, or **Cancel** to pick something else."
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${ID.TICKET_CONFIRM}:${typeKey}`).setLabel("Confirm").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(ID.TICKET_CANCEL).setLabel("Cancel").setStyle(ButtonStyle.Danger)
+  );
+
+  return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
+}
+
+async function onTicketCancel(interaction) {
+  return interaction.update({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR.warn)
+        .setTitle("Cancelled")
+        .setDescription("No ticket was created. Use the dropdown in the ticket panel whenever you're ready."),
+    ],
+    components: [],
+  });
+}
+
+async function onTicketConfirm(interaction, typeKey) {
+  const type = TICKET_TYPES[typeKey];
+  if (!type) {
+    return interaction.update({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Something went wrong")
+          .setDescription("That ticket type is no longer valid. Please pick again from the ticket panel."),
+      ],
+      components: [],
+    });
+  }
+
+  await interaction.deferUpdate();
+
+  const guild = interaction.guild;
+  const existing = await findOpenTicketChannel(guild, interaction.user.id, typeKey).catch(() => null);
+  if (existing) {
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.warn)
+          .setTitle("You already have a ticket open")
+          .setDescription(`You already have an open **${type.label}** ticket: ${existing}.`),
+      ],
+      components: [],
+    });
+  }
+
+  let channel;
+  try {
+    channel = await guild.channels.create({
+      name: buildTicketChannelName(type, interaction.user),
+      type: ChannelType.GuildText,
+      parent: TICKET_CATEGORY_ID,
+      topic: encodeTicketTopic({
+        type: typeKey,
+        openerId: interaction.user.id,
+        openerTag: interaction.user.tag,
+        openedAt: Date.now(),
+      }),
+      permissionOverwrites: buildTicketPermissionOverwrites(guild, type, interaction.user.id),
+      reason: `Ticket opened by ${interaction.user.tag} (${type.label})`,
+    });
+  } catch (err) {
+    console.error(`[Tickets] Could not create ticket channel for ${interaction.user.id}:`, err.message);
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("I couldn't open your ticket")
+          .setDescription("Something went wrong creating the channel. Please try again, or reach out to a staff member directly."),
+      ],
+      components: [],
+    });
+  }
+
+  await channel
+    .send({ content: `<@${interaction.user.id}>`, ...buildTicketOpeningMessage(type, interaction.user.id) })
+    .catch((e) => console.warn("[Tickets] Could not post ticket opening message:", e.message));
+
+  await sendTicketOpenAlert(type, interaction.user, channel);
+
+  await interaction.editReply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(COLOR.ok)
+        .setTitle("Ticket Created")
+        .setDescription(`Your ticket has been created: ${channel}`),
+    ],
+    components: [],
+  });
+}
+
+// ---- Close / Accept / Deny authorization ----
+function isTicketParticipant(member, meta) {
+  if (!member || !meta) return false;
+  if (member.id === meta.openerId) return true;
+  return hasAnyRole(member, [CO_OWNER_ROLE_ID, LEADER_ROLE_ID, STAFF_ROLE_ID, JR_STAFF_ROLE_ID]);
+}
+
+function isTicketDecisionMaker(member, meta) {
+  if (!member || !meta) return false;
+  if (member.id === meta.openerId) return false; // Applicants can't decide their own application
+  return hasAnyRole(member, [CO_OWNER_ROLE_ID, LEADER_ROLE_ID, STAFF_ROLE_ID, JR_STAFF_ROLE_ID]);
+}
+
+function ticketNotFoundEmbed() {
+  return new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle("Something went wrong")
+    .setDescription("This doesn't look like an active ticket channel anymore.");
+}
+
+function ticketNotAllowedEmbed() {
+  return new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle("This isn't available to you")
+    .setDescription("You don't have permission to do that in this ticket.");
+}
+
+// ---- Transcript generation & shared closing logic ----
+async function buildChannelTranscript(channel) {
+  const allMessages = [];
+  let before;
+  // Ticket channels are expected to be short-lived, but cap pagination at
+  // 200 pages (20,000 messages) as a sane upper bound against an abused channel.
+  for (let i = 0; i < 200; i++) {
+    const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    allMessages.push(...batch.values());
+    before = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  allMessages.reverse(); // oldest first
+
+  if (allMessages.length === 0) return "(No messages were sent in this ticket.)";
+
+  return allMessages
+    .map((m) => {
+      const ts = new Date(m.createdTimestamp).toISOString().replace("T", " ").slice(0, 19);
+      const author = m.author ? `${m.author.tag} (${m.author.id})` : "Unknown";
+      const content = m.content || "";
+      const attachments = m.attachments?.size
+        ? [...m.attachments.values()].map((a) => `[attachment: ${a.url}]`).join(" ")
+        : "";
+      return `[${ts}] ${author}: ${content}${attachments ? ` ${attachments}` : ""}`.trim();
+    })
+    .join("\n");
+}
+
+async function finalizeTicketClosure(channel, meta, closerUser, options = {}) {
+  const type = TICKET_TYPES[meta.type] || { label: "Ticket" };
+  const transcriptBody = await buildChannelTranscript(channel).catch((e) => {
+    console.warn("[Tickets] Could not build transcript:", e.message);
+    return "(Could not generate transcript.)";
+  });
+
+  const header =
+    `Ticket Transcript\n` +
+    `Channel: #${channel.name} (${channel.id})\n` +
+    `Type: ${type.label}\n` +
+    `Opened by: ${meta.openerTag || meta.openerId} (${meta.openerId})\n` +
+    `Opened at: ${meta.openedAt ? new Date(meta.openedAt).toISOString() : "unknown"}\n` +
+    `Closed by: ${closerUser.tag} (${closerUser.id})\n` +
+    `Closed at: ${new Date().toISOString()}\n` +
+    (options.decision ? `Decision: ${options.decision}\n` : "") +
+    (options.reason ? `Reason: ${options.reason}\n` : "") +
+    `\n----------------------------------------\n\n`;
+
+  const fullTranscript = header + transcriptBody;
+  const fileName = `transcript-${channel.name}.txt`;
+
+  // Post to the transcript log channel
+  const transcriptChannel = await getChannelById(TICKET_TRANSCRIPT_CHANNEL_ID, "TicketTranscript");
+  if (transcriptChannel) {
+    const summaryEmbed = new EmbedBuilder()
+      .setColor(COLOR.main)
+      .setTitle(`Ticket Closed — ${type.label}`)
+      .addFields(
+        { name: "Opened By", value: `<@${meta.openerId}>`, inline: true },
+        { name: "Closed By", value: `<@${closerUser.id}>`, inline: true },
+        { name: "Channel", value: `#${channel.name}`, inline: true }
+      );
+    if (options.decision) summaryEmbed.addFields({ name: "Decision", value: options.decision, inline: true });
+    if (options.reason) summaryEmbed.addFields({ name: "Reason", value: options.reason.slice(0, 1024), inline: false });
+
+    await transcriptChannel
+      .send({ embeds: [summaryEmbed], files: [new AttachmentBuilder(Buffer.from(fullTranscript, "utf8"), { name: fileName })] })
+      .catch((e) => console.warn("[Tickets] Could not post transcript:", e.message));
+  }
+
+  // DM a copy to the member who opened the ticket
+  try {
+    const openerUser = await client.users.fetch(meta.openerId);
+    const dmEmbed = new EmbedBuilder()
+      .setColor(COLOR.main)
+      .setTitle(`Your Ticket Has Been Closed — ${type.label}`)
+      .setDescription(
+        `Your **${type.label}** ticket has been closed by **${closerUser.tag}**.` +
+        (options.decision ? `\n\n**Decision:** ${options.decision}` : "") +
+        (options.reason ? `\n**Reason:** ${options.reason}` : "") +
+        `\n\nA full transcript is attached.`
+      );
+    await openerUser.send({
+      embeds: [dmEmbed],
+      files: [new AttachmentBuilder(Buffer.from(fullTranscript, "utf8"), { name: fileName })],
+    });
+  } catch (err) {
+    console.warn(`[Tickets] Could not DM transcript to ${meta.openerId}:`, err.message);
+  }
+
+  await channel
+    .send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.warn)
+          .setTitle("Ticket Closed")
+          .setDescription("This channel will be deleted in 10 seconds."),
+      ],
+    })
+    .catch(() => {});
+
+  const deleteTimer = setTimeout(async () => {
+    await channel.delete("Ticket closed").catch((e) =>
+      console.warn(`[Tickets] Could not delete ticket channel ${channel.id}:`, e.message)
+    );
+  }, TICKET_CLOSE_DELETE_DELAY_MS);
+  if (typeof deleteTimer.unref === "function") deleteTimer.unref();
+}
+
+// ---- Close Ticket (2-step confirmation) ----
+async function onTicketCloseC1(interaction) {
+  const meta = decodeTicketTopic(interaction.channel?.topic);
+  if (!meta) return interaction.reply({ embeds: [ticketNotFoundEmbed()], flags: MessageFlags.Ephemeral });
+  if (!isTicketParticipant(interaction.member, meta)) {
+    return interaction.reply({ embeds: [ticketNotAllowedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle("Confirmation 1 of 2 — Close Ticket")
+    .setDescription(
+      "Are you sure you want to close this ticket? This will save a transcript, DM it to the member who opened it, " +
+      "and delete this channel shortly after."
+    );
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(ID.TICKET_CLOSE_C2).setLabel("Yes, Close Ticket (2/2)").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(ID.TICKET_CLOSE_CANCEL).setLabel("No, Go Back").setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
+}
+
+async function onTicketCloseCancel(interaction) {
+  return interaction.update({
+    embeds: [new EmbedBuilder().setColor(COLOR.warn).setTitle("Cancelled").setDescription("The ticket was not closed.")],
+    components: [],
+  });
+}
+
+async function onTicketCloseC2(interaction) {
+  const meta = decodeTicketTopic(interaction.channel?.topic);
+  if (!meta) return interaction.update({ embeds: [ticketNotFoundEmbed()], components: [] });
+  if (!isTicketParticipant(interaction.member, meta)) {
+    return interaction.update({ embeds: [ticketNotAllowedEmbed()], components: [] });
+  }
+
+  await interaction.update({
+    embeds: [
+      new EmbedBuilder().setColor(COLOR.ok).setTitle("Closing Ticket").setDescription("Saving the transcript and closing this ticket..."),
+    ],
+    components: [],
+  });
+
+  await finalizeTicketClosure(interaction.channel, meta, interaction.user, {});
+}
+
+// ---- Staff Application: Accept (2-step confirmation) ----
+async function onTicketAcceptC1(interaction) {
+  const meta = decodeTicketTopic(interaction.channel?.topic);
+  if (!meta || meta.type !== "apply_staff") return interaction.reply({ embeds: [ticketNotFoundEmbed()], flags: MessageFlags.Ephemeral });
+  if (!isTicketDecisionMaker(interaction.member, meta)) {
+    return interaction.reply({ embeds: [ticketNotAllowedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.ok)
+    .setTitle("Confirmation 1 of 2 — Accept Application")
+    .setDescription(`Are you sure you want to accept <@${meta.openerId}>'s staff application? This will grant them the Jr. Staff role.`);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(ID.TICKET_ACCEPT_C2).setLabel("Yes, Accept (2/2)").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(ID.TICKET_ACCEPT_CANCEL).setLabel("No, Go Back").setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
+}
+
+async function onTicketAcceptCancel(interaction) {
+  return interaction.update({
+    embeds: [new EmbedBuilder().setColor(COLOR.warn).setTitle("Cancelled").setDescription("No decision was made on this application.")],
+    components: [],
+  });
+}
+
+async function onTicketAcceptC2(interaction) {
+  const meta = decodeTicketTopic(interaction.channel?.topic);
+  if (!meta || meta.type !== "apply_staff") return interaction.update({ embeds: [ticketNotFoundEmbed()], components: [] });
+  if (!isTicketDecisionMaker(interaction.member, meta)) {
+    return interaction.update({ embeds: [ticketNotAllowedEmbed()], components: [] });
+  }
+
+  await interaction.update({
+    embeds: [
+      new EmbedBuilder().setColor(COLOR.ok).setTitle("Accepting Application").setDescription("Granting the Jr. Staff role and closing this ticket..."),
+    ],
+    components: [],
+  });
+
+  let roleGranted = true;
+  try {
+    const member = await interaction.guild.members.fetch(meta.openerId);
+    await member.roles.add(JR_STAFF_ROLE_ID, `Staff application accepted by ${interaction.user.tag}`);
+  } catch (err) {
+    roleGranted = false;
+    console.warn(`[Tickets] Could not grant Jr. Staff role to ${meta.openerId}:`, err.message);
+    await interaction.channel
+      .send({ content: "I couldn't automatically grant the Jr. Staff role (they may have left the server). Please add it manually." })
+      .catch(() => {});
+  }
+
+  await finalizeTicketClosure(interaction.channel, meta, interaction.user, {
+    decision: roleGranted ? "Accepted — Jr. Staff role granted" : "Accepted — role grant failed, add manually",
+  });
+}
+
+// ---- Staff Application: Deny (2-step confirmation + reason modal) ----
+async function onTicketDenyC1(interaction) {
+  const meta = decodeTicketTopic(interaction.channel?.topic);
+  if (!meta || meta.type !== "apply_staff") return interaction.reply({ embeds: [ticketNotFoundEmbed()], flags: MessageFlags.Ephemeral });
+  if (!isTicketDecisionMaker(interaction.member, meta)) {
+    return interaction.reply({ embeds: [ticketNotAllowedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle("Confirmation 1 of 2 — Deny Application")
+    .setDescription(`Are you sure you want to deny <@${meta.openerId}>'s staff application?`);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(ID.TICKET_DENY_C2).setLabel("Yes, Deny (2/2)").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(ID.TICKET_DENY_CANCEL).setLabel("No, Go Back").setStyle(ButtonStyle.Secondary)
+  );
+
+  return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
+}
+
+async function onTicketDenyCancel(interaction) {
+  return interaction.update({
+    embeds: [new EmbedBuilder().setColor(COLOR.warn).setTitle("Cancelled").setDescription("No decision was made on this application.")],
+    components: [],
+  });
+}
+
+async function onTicketDenyC2(interaction) {
+  const meta = decodeTicketTopic(interaction.channel?.topic);
+  if (!meta || meta.type !== "apply_staff") return interaction.update({ embeds: [ticketNotFoundEmbed()], components: [] });
+  if (!isTicketDecisionMaker(interaction.member, meta)) {
+    return interaction.update({ embeds: [ticketNotAllowedEmbed()], components: [] });
+  }
+
+  // The final confirmation opens a modal asking for the denial reason — a
+  // modal must be the direct response to this click, so the ephemeral
+  // confirmation message itself is simply left as-is behind it.
+  const modal = new ModalBuilder().setCustomId(ID.TICKET_DENY_MODAL).setTitle("Denial Reason");
+  const input = new TextInputBuilder()
+    .setCustomId(ID.TICKET_DENY_REASON_INPUT)
+    .setLabel("Why is this application being denied?")
+    .setStyle(TextInputStyle.Paragraph)
+    .setMinLength(1)
+    .setMaxLength(1000)
+    .setRequired(true)
+    .setPlaceholder("This will be included in the DM sent to the applicant.");
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+
+  await interaction.showModal(modal);
+}
+
+async function onTicketDenyModalSubmit(interaction) {
+  const reason = interaction.fields.getTextInputValue(ID.TICKET_DENY_REASON_INPUT);
+  const meta = decodeTicketTopic(interaction.channel?.topic);
+  if (!meta || meta.type !== "apply_staff") {
+    return interaction.reply({ embeds: [ticketNotFoundEmbed()], flags: MessageFlags.Ephemeral });
+  }
+  if (!isTicketDecisionMaker(interaction.member, meta)) {
+    return interaction.reply({ embeds: [ticketNotAllowedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.reply({
+    embeds: [
+      new EmbedBuilder().setColor(COLOR.bad).setTitle("Denying Application").setDescription("Recording the denial reason and closing this ticket..."),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+
+  await interaction.channel
+    .send({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Application Denied")
+          .setDescription(`<@${meta.openerId}>'s staff application was denied by <@${interaction.user.id}>.`)
+          .addFields({ name: "Reason", value: reason.slice(0, 1024) }),
+      ],
+    })
+    .catch(() => {});
+
+  await finalizeTicketClosure(interaction.channel, meta, interaction.user, { decision: "Denied", reason });
 }
 
 // ================= OSRS VOICE HUB (JOIN-TO-CREATE) =================
@@ -4469,13 +5178,31 @@ async function handleInteraction(interaction) {
       case ID.LEFT_C1:              return onMemberLeftConfirm1(interaction, payload);
       case ID.LEFT_C2:              return onMemberLeftConfirm2(interaction, payload);
       case ID.LEFT_CANCEL:          return onMemberLeftCancel(interaction, payload);
+      case ID.TICKET_CONFIRM:       return onTicketConfirm(interaction, payload);
+      case ID.TICKET_CANCEL:        return onTicketCancel(interaction);
+      case ID.TICKET_CLOSE_C1:      return onTicketCloseC1(interaction);
+      case ID.TICKET_CLOSE_C2:      return onTicketCloseC2(interaction);
+      case ID.TICKET_CLOSE_CANCEL:  return onTicketCloseCancel(interaction);
+      case ID.TICKET_ACCEPT_C1:     return onTicketAcceptC1(interaction);
+      case ID.TICKET_ACCEPT_C2:     return onTicketAcceptC2(interaction);
+      case ID.TICKET_ACCEPT_CANCEL: return onTicketAcceptCancel(interaction);
+      case ID.TICKET_DENY_C1:       return onTicketDenyC1(interaction);
+      case ID.TICKET_DENY_C2:       return onTicketDenyC2(interaction);
+      case ID.TICKET_DENY_CANCEL:   return onTicketDenyCancel(interaction);
+      case ID.TICKET_ALERT_ACK:     return onTicketAlertAck(interaction);
       default:                      return;
     }
+  }
+
+  if (interaction.isStringSelectMenu?.()) {
+    if (interaction.customId === ID.TICKET_SELECT) return onTicketSelect(interaction);
+    return;
   }
 
   if (interaction.isModalSubmit()) {
     if (interaction.customId === ID.MODAL) return onModalSubmit(interaction);
     if (interaction.customId === ID.ROSTER_MODAL) return onRosterModalSubmit(interaction);
+    if (interaction.customId === ID.TICKET_DENY_MODAL) return onTicketDenyModalSubmit(interaction);
   }
 }
 
@@ -4496,6 +5223,11 @@ client.once(Events.ClientReady, async () => {
     await ensureOrientationMessage();
   } catch (err) {
     console.error("[Orientation] ensureOrientationMessage failed:", err.message);
+  }
+  try {
+    await ensureTicketPanelMessage();
+  } catch (err) {
+    console.error("[Tickets] ensureTicketPanelMessage failed:", err.message);
   }
   try {
     await scanExistingTempVoiceChannels();
@@ -4603,6 +5335,40 @@ module.exports = {
   clearTempVoiceTimer,
   scanExistingTempVoiceChannels,
   deletePingsFor,
+  // Ticketing system exports
+  TICKET_CONTACT_CHANNEL_ID,
+  TICKET_CATEGORY_ID,
+  TICKET_TRANSCRIPT_CHANNEL_ID,
+  TICKET_CLOSE_DELETE_DELAY_MS,
+  TICKET_TYPES,
+  TICKET_TYPE_ORDER,
+  STAFF_APPLICATION_QUESTIONS,
+  encodeTicketTopic,
+  decodeTicketTopic,
+  buildTicketChannelName,
+  buildTicketPermissionOverwrites,
+  buildTicketPanelMessage,
+  ensureTicketPanelMessage,
+  buildTicketOpeningMessage,
+  buildChannelTranscript,
+  finalizeTicketClosure,
+  isTicketParticipant,
+  isTicketDecisionMaker,
+  findOpenTicketChannel,
+  onTicketSelect,
+  onTicketConfirm,
+  onTicketCancel,
+  onTicketCloseC1,
+  onTicketCloseC2,
+  onTicketCloseCancel,
+  onTicketAcceptC1,
+  onTicketAcceptC2,
+  onTicketAcceptCancel,
+  onTicketDenyC1,
+  onTicketDenyC2,
+  onTicketDenyCancel,
+  onTicketDenyModalSubmit,
+  onTicketAlertAck,
   // Ranking system exports
   CLAN_CREATION_DATE,
   RANK_TIERS,
