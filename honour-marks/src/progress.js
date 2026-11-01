@@ -4,7 +4,8 @@ const { fetchHiscores, diffProgress } = require("./jagex");
 const {
   getMember, getActiveSoloQuests, creditHm, bumpCounts, awardRankXp,
 } = require("./quests");
-const { getBoostMultiplier } = require("./shop");
+const { getBoostMultiplier, isPrestiged, prestigeHmMultiplier, prestigeRankXpMultiplier } = require("./shop");
+const { getActiveClanBoost, clanBoostMultiplier } = require("./clanpool");
 
 /**
  * Quest completion and expiry.
@@ -63,7 +64,17 @@ async function checkSoloQuests({ guildId, userId, memberRsn }) {
 
     if (error || !deleted || deleted.length === 0) continue;
 
-    const hm = Number(quest.hm_reward) || 0;
+    // Prestige (+10% HM, +25% Rank XP, permanent, account-wide) and a Clan
+    // Pool boost (+5% HM or +5% Rank XP, clan-wide, up to 1 week) both only
+    // apply at the moment a quest is actually FINISHED here — never on the
+    // expiry/partial-credit path below, matching the existing personal-Boost
+    // exclusion. They combine multiplicatively with each other and with the
+    // personal Boost.
+    const prestiged = await isPrestiged(userId);
+    const clanBoost = await getActiveClanBoost(guildId);
+    const hmMultiplier = prestigeHmMultiplier(prestiged) * clanBoostMultiplier(clanBoost, "hm_gain");
+
+    const hm = Math.round((Number(quest.hm_reward) || 0) * hmMultiplier);
     await creditHm({
       guildId,
       userId,
@@ -74,7 +85,10 @@ async function checkSoloQuests({ guildId, userId, memberRsn }) {
       refId: String(quest.id),
     });
 
-    const boostMultiplier = await getBoostMultiplier(userId, quest.tree);
+    const boostMultiplier =
+      (await getBoostMultiplier(userId, quest.tree)) *
+      prestigeRankXpMultiplier(prestiged) *
+      clanBoostMultiplier(clanBoost, "rank_xp");
     const xpResult = await awardRankXp({
       guildId,
       userId,
@@ -169,26 +183,39 @@ async function completePartyQuest(quest, progress) {
   if (error || !deleted || deleted.length === 0) return { ok: false };
 
   const hm = Number(quest.hm_reward) || 0;
-  // Each member can have a different active boost for this tree, so the
-  // boosted Rank XP is tracked per member in `rank_xp_breakdown`. One row is
-  // written for the whole party AFTER the loop — writing it inside the loop
-  // (as this used to) inserted one full-duplicate completion row per member,
-  // which made #hm-database and every party total count every quest 2-4x.
+  // Each member can have a different active boost for this tree, AND now a
+  // different Prestige status, so both the boosted Rank XP and the boosted HM
+  // are tracked per member — `rank_xp_breakdown` and `hm_breakdown`. One row
+  // is written for the whole party AFTER the loop — writing it inside the
+  // loop (as this used to) inserted one full-duplicate completion row per
+  // member, which made #hm-database and every party total count every quest
+  // 2-4x. A Clan Pool boost, if active, applies the same to everyone.
   const rankXpBreakdown = {};
+  const hmBreakdown = {};
+  const clanBoost = await getActiveClanBoost(quest.guild_id);
 
   for (const uid of quest.members) {
     const member = await getMember(uid);
+    const prestiged = await isPrestiged(uid);
+
+    const memberHm = Math.round(
+      hm * prestigeHmMultiplier(prestiged) * clanBoostMultiplier(clanBoost, "hm_gain")
+    );
     await creditHm({
       guildId: quest.guild_id,
       userId: uid,
-      amount: hm,
+      amount: memberHm,
       kind: "team_quest",
       reason: `${quest.size} ${quest.tree} quest complete`,
       idempotencyKey: `party:${quest.id}:${uid}`,
       refId: String(quest.id),
     });
+    hmBreakdown[uid] = memberHm;
 
-    const boostMultiplier = await getBoostMultiplier(uid, quest.tree);
+    const boostMultiplier =
+      (await getBoostMultiplier(uid, quest.tree)) *
+      prestigeRankXpMultiplier(prestiged) *
+      clanBoostMultiplier(clanBoost, "rank_xp");
     const xpResult = await awardRankXp({
       guildId: quest.guild_id,
       userId: uid,
@@ -206,6 +233,7 @@ async function completePartyQuest(quest, progress) {
   }
 
   const totalRankXp = Object.values(rankXpBreakdown).reduce((sum, v) => sum + v, 0);
+  const totalHm = Object.values(hmBreakdown).reduce((sum, v) => sum + v, 0);
 
   await supabase.from("hm_party_quest_completions").insert({
     guild_id: quest.guild_id,
@@ -215,12 +243,13 @@ async function completePartyQuest(quest, progress) {
     tree: quest.tree,
     difficulty: quest.difficulty,
     completed: true,
-    hm_awarded: hm,
+    hm_awarded: totalHm,
+    hm_breakdown: hmBreakdown,
     rank_xp_awarded: totalRankXp,
     rank_xp_breakdown: rankXpBreakdown,
   });
 
-  return { ok: true, hm };
+  return { ok: true, hm: totalHm };
 }
 
 /**
@@ -304,7 +333,14 @@ async function sweepExpiredQuests() {
     } catch { /* pay 0 if hiscores are unreachable */ }
 
     const hm = Math.round(((Number(quest.hm_reward) || 0) * pct) / 100);
+    // No Prestige/Clan Boost on an expiry — same flat amount for every
+    // member, same exclusion as the personal Boost already had. hm_breakdown
+    // is still populated (flat value per member) so hm_member_totals, which
+    // now reads HM per member out of this column, doesn't undercount these
+    // rows as if nobody got paid.
+    const hmBreakdown = {};
     for (const uid of quest.members) {
+      hmBreakdown[uid] = hm;
       if (hm <= 0) continue;
       await creditHm({
         guildId: quest.guild_id,
@@ -326,6 +362,7 @@ async function sweepExpiredQuests() {
       difficulty: quest.difficulty,
       completed: false,
       hm_awarded: hm,
+      hm_breakdown: hmBreakdown,
       rank_xp_awarded: 0,
     });
 

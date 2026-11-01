@@ -1,7 +1,7 @@
 "use strict";
 const { getSupabase } = require("./db");
 const {
-  TREES, TREE_BY_KEY, createSoloQuest, createPartyQuest, createOpenTeam,
+  TREES, TREE_BY_KEY, createSoloQuest, buildSoloQuestPayload, createPartyQuest, createOpenTeam,
   getPerks, getPerkTier, getItems, getItemTier, ITEM_SLOT, ITEM_PCT_BY_TIER, itemPercentForTier,
 } = require("./quests");
 
@@ -81,6 +81,63 @@ const CONSUMABLES = {
 
 function perkBonusPercent(tier) {
   return (Number(tier) || 0) * 5;
+}
+
+// ── Prestige ─────────────────────────────────────────────────────────────────
+/**
+ * Prestige is a one-time, permanent, ACCOUNT-WIDE purchase — unlike a Perk or
+ * Item, it isn't per-category and has no tiers, just owned or not. Once
+ * bought it adds +10% HM and +25% Rank XP to EVERY quest a Prestiged member
+ * FINISHES (solo or team), on top of everything else (Perks, Items, personal
+ * Boosts, a Clan Pool boost — see src/progress.js, where it's actually
+ * applied, at credit time, the same place a personal Boost already is).
+ */
+const PRESTIGE_COST = 100000;
+const PRESTIGE_HM_BONUS_PCT = 10;
+const PRESTIGE_RANK_XP_BONUS_PCT = 25;
+const PRESTIGE_EMOJI = "🌟";
+
+async function isPrestiged(userId) {
+  const supabase = getSupabase();
+  if (!supabase || !userId) return false;
+  const { data } = await supabase.from("hm_prestige").select("user_id").eq("user_id", userId).maybeSingle();
+  return !!data;
+}
+
+/** `{userId: true}` for every prestiged member in one query — used by the
+ *  quest board / database panels so they don't do one lookup per row. */
+async function getPrestigedSet(userIds) {
+  const supabase = getSupabase();
+  if (!supabase || !userIds?.length) return new Set();
+  const { data } = await supabase.from("hm_prestige").select("user_id").in("user_id", userIds);
+  return new Set((data || []).map((r) => r.user_id));
+}
+
+function prestigeHmMultiplier(prestiged) {
+  return prestiged ? 1 + PRESTIGE_HM_BONUS_PCT / 100 : 1;
+}
+
+function prestigeRankXpMultiplier(prestiged) {
+  return prestiged ? 1 + PRESTIGE_RANK_XP_BONUS_PCT / 100 : 1;
+}
+
+async function buyPrestige({ guildId, userId }) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+  if (await isPrestiged(userId)) return { error: "You're already Prestiged — there's only one tier." };
+
+  const debit = await tryDebit({
+    guildId, userId, amount: PRESTIGE_COST, kind: "prestige",
+    reason: "Prestige", refId: "prestige",
+  });
+  if (!debit.ok) return { error: debit.error };
+
+  const { error } = await supabase.from("hm_prestige").insert({ user_id: userId, guild_id: guildId });
+  if (error) {
+    await supabase.from("hm_balances").update({ balance: debit.balance + PRESTIGE_COST }).eq("user_id", userId);
+    return { error: "Couldn't save your Prestige purchase. You were refunded." };
+  }
+  return { ok: true, balance: debit.balance };
 }
 
 // ── Items catalog ────────────────────────────────────────────────────────────
@@ -461,14 +518,14 @@ async function consumeItem(userId, key) {
  * token at all (the random-roll path), in which case this behaves exactly
  * like a plain `createSoloQuest` call.
  */
-async function createSoloQuestWithChoiceToken({ guildId, member, tree, questType, picks, tokenConsumed }) {
+async function createSoloQuestWithChoiceToken({ guildId, member, tree, questType, picks, difficulty, tokenConsumed }) {
   // `picks` is already null whenever nothing was actually paid for it — the
   // caller (handlePickTarget in index.js) only ever passes real picks
   // through alongside tokenConsumed: true. Honouring `picks` unconditionally
   // here also lets a mandatory, no-token pick (Raids — see buildSoloTargets'
   // docs on why raids are never randomly assigned) flow through the exact
   // same refund-aware path with tokenConsumed: false and nothing to refund.
-  const result = await createSoloQuest({ guildId, member, tree, questType, picks });
+  const result = await createSoloQuest({ guildId, member, tree, questType, picks, difficulty });
 
   if (result.error && tokenConsumed) {
     const refunded = await grantConsumable(member.user_id, guildId, "quest_choice_token");
@@ -521,6 +578,27 @@ async function createOpenTeamWithChoiceToken({ guildId, posterId, size, tree, di
   return { ...result, tokenConsumed, refunded: false };
 }
 
+/**
+ * Builds (but does NOT insert) a solo quest payload, with the same Quest
+ * Choice Token refund-on-failure rule as createSoloQuestWithChoiceToken.
+ * Used by the Boss PvM / Raids confirm-or-cancel preview (index.js): the
+ * token, if any, is spent the moment the member confirms their picks, same
+ * timing as before this preview existed — but the quest itself isn't written
+ * to the database until they separately press Confirm on the preview. A
+ * Cancel from that preview refunds the token too, via the SAME
+ * `grantConsumable` call this file's other refund paths already use — that
+ * refund happens in index.js, not here, since Cancel isn't a `result.error`.
+ */
+async function buildSoloQuestPreviewWithChoiceToken({ guildId, member, tree, questType, picks, difficulty, tokenConsumed }) {
+  const built = await buildSoloQuestPayload({ guildId, member, tree, questType, picks, difficulty });
+
+  if (built.error && tokenConsumed) {
+    const refunded = await grantConsumable(member.user_id, guildId, "quest_choice_token");
+    return { ...built, tokenConsumed, refunded };
+  }
+  return { ...built, tokenConsumed, refunded: false };
+}
+
 async function activateBoost({ guildId, userId, tree, tier }) {
   const supabase = getSupabase();
   const spec = BOOST_TIERS.find((t) => t.tier === Number(tier));
@@ -560,5 +638,8 @@ module.exports = {
   getInventory, getActiveBoosts, getBoostMultiplier,
   tryDebit, buyPerk, buyItem, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
   createSoloQuestWithChoiceToken, createPartyQuestWithChoiceToken, createOpenTeamWithChoiceToken,
+  buildSoloQuestPreviewWithChoiceToken,
+  PRESTIGE_COST, PRESTIGE_HM_BONUS_PCT, PRESTIGE_RANK_XP_BONUS_PCT, PRESTIGE_EMOJI,
+  isPrestiged, getPrestigedSet, prestigeHmMultiplier, prestigeRankXpMultiplier, buyPrestige,
   TREES,
 };

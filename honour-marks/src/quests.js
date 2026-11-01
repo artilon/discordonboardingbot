@@ -112,11 +112,42 @@ const BOSS_POOL = ALL_BOSSES.filter(
 
 // ── Targets & rewards ────────────────────────────────────────────────────────
 // Solo: one category, targets scale with quest type.
+// Skill categories no longer have a fixed count/XP per quest type — see
+// SOLO_SKILL_DIFFICULTY/SOLO_SKILL_XP below for the difficulty picker that
+// replaced it. Boss/Raid/Minigame are unchanged.
 const SOLO_REQUIREMENTS = {
-  skill:  { daily: { count: 1, xp: 20000 },  weekly: { count: 1, xp: 75000 },  monthly: { count: 2, xp: 150000 } },
   boss:   { daily: { kc: 15 },               weekly: { kc: 40 },                monthly: { kc: 100 } },
   raid:   { daily: { kc: 3 },                weekly: { kc: 8 },                 monthly: { kc: 20 } },
   minigame: { daily: { kc: 5 },              weekly: { kc: 15 },                monthly: { kc: 40 } },
+};
+
+// A solo SKILL quest (Gathering/Production/Combat/Utility), at any of the
+// three quest types, now also asks for a difficulty — Easy just one skill,
+// Extreme stacks up to four — the same "difficulty picks the TARGET COUNT"
+// idea team quests already use (PARTY_DIFFICULTY), just with a 4th tier.
+// Each tier also raises the XP needed per skill by 25% on top of Easy, and
+// `mult` (kept equal to `count`, same convention as PARTY_DIFFICULTY) scales
+// the quest's HM + Rank XP reward to match the extra work.
+const SOLO_SKILL_DIFFICULTY = {
+  easy:    { label: "Easy",    emoji: "🟢", count: 1, mult: 1 },
+  medium:  { label: "Medium",  emoji: "🟡", count: 2, mult: 2 },
+  hard:    { label: "Hard",    emoji: "🔴", count: 3, mult: 3 },
+  extreme: { label: "Extreme", emoji: "🟣", count: 4, mult: 4 },
+};
+const SOLO_SKILL_DIFFICULTIES = Object.keys(SOLO_SKILL_DIFFICULTY); // ["easy","medium","hard","extreme"]
+
+// Per-skill XP required, by quest type + difficulty. Weekly is the numbers
+// given when this was designed (50,000 / 62,500 / 75,000 / 87,500 — each
+// tier +25% over Easy); Daily and Monthly scale off Weekly using the exact
+// same ratios the old flat per-quest-type requirements already used
+// (Daily = Weekly ÷ 4, Monthly = Weekly × 2) — which happens to reproduce
+// the old flat Daily (20,000) and Monthly (150,000) values exactly at the
+// Hard tier, so this is a strict superset of the previous behaviour rather
+// than an unrelated new number.
+const SOLO_SKILL_XP = {
+  daily:   { easy: 12500, medium: 15625, hard: 18750, extreme: 21875 },
+  weekly:  { easy: 50000, medium: 62500, hard: 75000, extreme: 87500 },
+  monthly: { easy: 100000, medium: 125000, hard: 150000, extreme: 175000 },
 };
 
 // Flat HM. Team quests pay each member the same amount, because the target is
@@ -266,19 +297,26 @@ const SOLO_RAID_POOL = ["chambers_of_xeric", "theatre_of_blood", "tombs_of_amasc
  * however many actually exist in the pool — used by the hand-pick UI so its
  * "select exactly N" always matches what the quest will really require.
  */
-function soloTargetPool(tree, questType, expansionTier = 0) {
+function soloTargetPool(tree, questType, expansionTier = 0, difficulty = "easy") {
   const kind = treeKind(tree);
+
+  if (kind === "skill") {
+    const diffKey = SOLO_SKILL_DIFFICULTY[difficulty] ? difficulty : "easy";
+    const diff = SOLO_SKILL_DIFFICULTY[diffKey];
+    const perSkillXp = SOLO_SKILL_XP[questType]?.[diffKey];
+    if (!perSkillXp) return null;
+    const pool = SKILLS_BY_TREE[tree] || [];
+    const baseCount = diff.count;
+    const count = expansionTier > 0 ? Math.min(baseCount + expansionTier, pool.length) : Math.min(baseCount, pool.length);
+    return { kind, count, value: perSkillXp, pool };
+  }
+
   const req = SOLO_REQUIREMENTS[kind][questType];
   if (!req) return null;
 
   const baseCount = req.count || 1;
-  const wantsExtra = (kind === "skill" || kind === "boss") && expansionTier > 0;
+  const wantsExtra = kind === "boss" && expansionTier > 0;
 
-  if (kind === "skill") {
-    const pool = SKILLS_BY_TREE[tree] || [];
-    const count = wantsExtra ? Math.min(baseCount + expansionTier, pool.length) : baseCount;
-    return { kind, count, value: req.xp, pool };
-  }
   if (kind === "boss") {
     const count = wantsExtra ? Math.min(baseCount + expansionTier, BOSS_POOL.length) : baseCount;
     return { kind, count, value: req.kc, pool: BOSS_POOL };
@@ -304,8 +342,8 @@ function soloTargetPool(tree, questType, expansionTier = 0) {
  * the requirement before anything is rolled. Omitting either reproduces the
  * exact old behaviour (plain uniform random, base requirement, untouched).
  */
-function buildSoloTargets(tree, questType, picks = null, baseline = null, effects = null) {
-  const spec = soloTargetPool(tree, questType);
+function buildSoloTargets(tree, questType, picks = null, baseline = null, effects = null, difficulty = "easy") {
+  const spec = soloTargetPool(tree, questType, 0, difficulty);
   if (!spec) return { skills: {}, bosses: {} };
   const { kind, pool } = spec;
   const { count, value } = effects
@@ -409,8 +447,10 @@ function buildPartyTargets(tree, size, difficulty, baselines = null, effects = n
   return targets;
 }
 
-function soloHmReward(questType) {
-  return SOLO_HM[questType] || 0;
+/** `skillMult` is the SOLO_SKILL_DIFFICULTY tier's `mult` for a skill quest
+ *  (1/2/3/4 — defaults to 1, a no-op, for every non-skill category). */
+function soloHmReward(questType, skillMult = 1) {
+  return Math.round((SOLO_HM[questType] || 0) * (Number(skillMult) || 1));
 }
 
 function partyHmReward(size, difficulty) {
@@ -694,9 +734,19 @@ async function getActivePartyQuestsForUser(userId) {
  * Creates a solo quest. Rejects if the slot is full or the daily/weekly/monthly
  * cap for this reset period is spent.
  */
-async function createSoloQuest({ guildId, member, tree, questType, picks = null }) {
-  const supabase = getSupabase();
-  if (!supabase) return { error: "Database unavailable." };
+/**
+ * Computes everything a solo quest needs WITHOUT writing anything to the
+ * database — the "what would this quest actually be" half of quest creation.
+ * Split out from createSoloQuest so Boss PvM and Raids can show a member a
+ * free preview (see index.js's solo quest confirm/cancel flow) of exactly
+ * what was rolled/picked before it's actually locked in, while every other
+ * category still goes straight from build to insert in one call, unchanged.
+ *
+ * `difficulty` only means anything for a skill-tree quest (Easy/Medium/Hard/
+ * Extreme — see SOLO_SKILL_DIFFICULTY) and is stored as "normal" for every
+ * other category, same as before this existed.
+ */
+async function buildSoloQuestPayload({ guildId, member, tree, questType, picks = null, difficulty = "easy" }) {
   if (!TREE_BY_KEY[tree]) return { error: "Unknown category." };
   if (!QUEST_DURATION_DAYS[questType]) return { error: "Unknown quest type." };
   if (!member?.rsn) return { error: "Register your RuneScape name first with `/register`." };
@@ -719,6 +769,10 @@ async function createSoloQuest({ guildId, member, tree, questType, picks = null 
     };
   }
 
+  const kind = treeKind(tree);
+  const skillDiffKey = kind === "skill" && SOLO_SKILL_DIFFICULTY[difficulty] ? difficulty : "easy";
+  const skillMult = kind === "skill" ? SOLO_SKILL_DIFFICULTY[skillDiffKey].mult : 1;
+
   // Perks (+HM%), the Clan Chat XP item (+Rank XP%), the Quest & Threshold
   // Reduction item (-requirement%), and the Quest Expansion item (more
   // targets/requirement, scaled reward) are all applied once, right here, at
@@ -726,38 +780,59 @@ async function createSoloQuest({ guildId, member, tree, questType, picks = null 
   // nothing downstream (progress.js, the boost multiplier, the completion
   // flow) needs to know any of this exists.
   const effects = await aggregateTeamEffects([member], tree);
-  const targets = buildSoloTargets(tree, questType, picks, baseline, effects);
-  const spec = soloTargetPool(tree, questType);
+  const targets = buildSoloTargets(tree, questType, picks, baseline, effects, skillDiffKey);
+  const spec = soloTargetPool(tree, questType, 0, skillDiffKey);
   const { rewardScale } = spec ? applyItemEffects(spec.kind, spec.count, spec.value, effects, spec.pool.length) : { rewardScale: 1 };
 
-  const hmReward = Math.round(soloHmReward(questType) * rewardScale * (1 + effects.perkPct / 100));
+  const hmReward = Math.round(soloHmReward(questType, skillMult) * rewardScale * (1 + effects.perkPct / 100));
   const rankXpReward = Math.round(
-    (config.rankXp[`quest_solo_${questType}`] || 0) * rewardScale * (1 + effects.clanChatPct / 100)
+    (config.rankXp[`quest_solo_${questType}`] || 0) * skillMult * rewardScale * (1 + effects.clanChatPct / 100)
   );
 
   const now = new Date();
   const expires = new Date(now.getTime() + QUEST_DURATION_DAYS[questType] * 86400000);
 
-  const { error } = await supabase.from("hm_quests").insert({
-    guild_id: guildId,
-    user_id: member.user_id,
-    quest_type: questType,
-    tree,
-    difficulty: "normal",
-    targets,
-    baseline,
-    hm_reward: hmReward,
-    rank_xp_reward: rankXpReward,
-    created_at: now.toISOString(),
-    expires_at: expires.toISOString(),
-  });
+  return {
+    ok: true,
+    payload: {
+      guild_id: guildId,
+      user_id: member.user_id,
+      quest_type: questType,
+      tree,
+      difficulty: kind === "skill" ? skillDiffKey : "normal",
+      targets,
+      baseline,
+      hm_reward: hmReward,
+      rank_xp_reward: rankXpReward,
+      created_at: now.toISOString(),
+      expires_at: expires.toISOString(),
+    },
+  };
+}
+
+/** Writes an already-built solo quest payload (see buildSoloQuestPayload)
+ *  exactly as given — no re-rolling, no re-validation beyond what the
+ *  database itself enforces (the unique slot constraint). */
+async function insertSoloQuestPayload(payload) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+
+  const { error } = await supabase.from("hm_quests").insert(payload);
 
   if (error) {
-    if (error.code === "23505") return { error: `You already have an active ${questType} quest.` };
-    console.error("[Quests] createSoloQuest:", error.message);
+    if (error.code === "23505") return { error: `You already have an active ${payload.quest_type} quest.` };
+    console.error("[Quests] insertSoloQuestPayload:", error.message);
     return { error: "Couldn't create that quest. Try again in a moment." };
   }
   return { ok: true };
+}
+
+async function createSoloQuest(args) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+  const built = await buildSoloQuestPayload(args);
+  if (built.error) return { error: built.error };
+  return insertSoloQuestPayload(built.payload);
 }
 
 /**
@@ -1135,13 +1210,15 @@ module.exports = {
   TREES, TREE_BY_KEY, QUEST_TREES, SKILL_TREE, SKILLS_BY_TREE,
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
   SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY, PARTY_DIFFICULTIES, PARTY_SIZES, LFG_EXPIRY_HOURS,
+  SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES, SOLO_SKILL_XP,
   QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD,
   buildSoloTargets, buildPartyTargets, soloTargetPool, partyTargetPool, treeKind,
   soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestsForUser, MAX_ACTIVE_PARTY_QUESTS,
-  createSoloQuest, cancelSoloQuest, createPartyQuest, creditHm, bumpCounts,
+  createSoloQuest, buildSoloQuestPayload, insertSoloQuestPayload,
+  cancelSoloQuest, createPartyQuest, creditHm, bumpCounts,
   getOpenTeams, getOpenTeamForUser, createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
   awardRankXp,
   diffProgress, fetchHiscores, cleanRsn,
