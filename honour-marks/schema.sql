@@ -103,9 +103,13 @@ create table if not exists public.hm_lfg_posts (
   guild_id   text not null,
   poster_id  text not null,
   team_size  text not null check (team_size in ('duo','trio','quad')),
+  -- Easy/Medium/Hard — set by the poster when they start the listing, same
+  -- choice a closed-group team quest makes. Carried over onto the real
+  -- hm_party_quests row by joinOpenTeam once the listing fills.
+  difficulty text not null default 'easy',
   categories text[] not null default '{}',
   members    text[] not null default '{}',
-  -- The poster's hand-picked shared target (a Quest Choice Token spent at
+  -- The poster's hand-picked shared target(s) (a Quest Choice Token spent at
   -- post time), stored up front so anyone browsing the board can see it
   -- before joining. Null means "not hand-picked, rolls at random when the
   -- listing fills."
@@ -117,9 +121,11 @@ create unique index if not exists uq_hm_lfg_poster
   on public.hm_lfg_posts (guild_id, poster_id);
 
 -- Safety net for a database that already ran an older copy of this file
--- before `picks` existed.
+-- before `picks`/`difficulty` existed.
 alter table public.hm_lfg_posts
   add column if not exists picks jsonb;
+alter table public.hm_lfg_posts
+  add column if not exists difficulty text not null default 'easy';
 
 -- 8. Reset counters (fast path for the quest board + per-member caps)
 create table if not exists public.hm_quest_counts (

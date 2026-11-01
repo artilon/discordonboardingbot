@@ -51,8 +51,6 @@ const {
   GuildMemberFlags,
   MessageFlags,
   ModalBuilder,
-  StringSelectMenuBuilder,
-  StringSelectMenuOptionBuilder,
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
@@ -94,14 +92,13 @@ const STAFF_ALERT_CHANNEL_ID = "1561481869197840504";
 const RANK_LIST_CHANNEL_ID   = "1561482413341679757";
 const RANK_LOG_CHANNEL_ID    = "1561484125016428605";
 
-// Temporary Voice Channel Creator & Category IDs
-const CREATE_VOICE_CHANNEL_ID        = "1562519552414453911";
-const SOCIAL_HUB_CATEGORY_ID         = "1546412771598532628";
-const OSRS_CATEGORY_ID               = "1545654996928823377";
-const OTHER_GAMES_CATEGORY_ID        = "1545654996928823378";
-const VOICE_EMPTY_TIMEOUT_MS         = 5 * 60 * 1000; // Auto-delete 5 minutes after last person leaves
-const VOICE_INITIAL_EMPTY_TIMEOUT_MS = 60 * 1000;     // Auto-delete after 60 seconds if nobody joins after creation
-const VOICE_CREATE_COOLDOWN_MS       = 5 * 60 * 1000; // Limit each user to creating 1 voice channel every 5 minutes
+// OSRS Voice Hub — joining this channel immediately redirects the member into
+// a brand-new temporary "OSRS Voice N" channel instead of letting them sit in the hub.
+const OSRS_VOICE_HUB_CHANNEL_ID           = "1566285643200602123";
+const OSRS_VOICE_CATEGORY_ID              = "1545654996928823377";
+const OSRS_VOICE_PREFIX                   = "OSRS Voice";
+const OSRS_VOICE_EMPTY_TIMEOUT_MS         = 2 * 60 * 1000; // Auto-delete 2 minutes after last person leaves
+const OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS = 60 * 1000;     // Safety net: delete if the member never actually joins
 
 // Weekly Events (Skill of the Week & Boss of the Week)
 const WEEKLY_EVENTS_CHANNEL_ID       = "1562600669796507760";
@@ -224,30 +221,6 @@ const PVM_BOSS_ENTRIES = OSRS_BOSSES.filter(
   (b) => !RAID_NAMES.includes(b.name) && !MINIGAME_NAMES.includes(b.name)
 );
 
-const VOICE_CATEGORIES = [
-  {
-    key: "social",
-    categoryId: SOCIAL_HUB_CATEGORY_ID,
-    label: "Social Hub",
-    prefix: "Social Voice",
-    description: "Creates Social Voice 1, 2, 3... under Social Hub",
-  },
-  {
-    key: "osrs",
-    categoryId: OSRS_CATEGORY_ID,
-    label: "Old School Runescape",
-    prefix: "OSRS Voice",
-    description: "Creates OSRS Voice 1, 2, 3... under Old School Runescape",
-  },
-  {
-    key: "other_games",
-    categoryId: OTHER_GAMES_CATEGORY_ID,
-    label: "Other Games",
-    prefix: "Other Games Voice",
-    description: "Creates Other Games Voice 1, 2, 3... under Other Games",
-  },
-];
-
 // Clan creation date floor (join dates earlier than this are clamped to 2026-10-11)
 const CLAN_CREATION_DATE = "2026-10-11";
 
@@ -288,9 +261,8 @@ const config = {
   settleMs: 3000,
   rankSyncIntervalMs: 30 * 60 * 1000, // Check Supabase + tenure milestones every 30 minutes
   weeklyEventPollIntervalMs: WEEKLY_EVENT_POLL_INTERVAL_MS,
-  voiceEmptyTimeoutMs: VOICE_EMPTY_TIMEOUT_MS,
-  voiceInitialEmptyTimeoutMs: VOICE_INITIAL_EMPTY_TIMEOUT_MS,
-  voiceCreateCooldownMs: VOICE_CREATE_COOLDOWN_MS,
+  osrsVoiceEmptyTimeoutMs: OSRS_VOICE_EMPTY_TIMEOUT_MS,
+  osrsVoiceInitialEmptyTimeoutMs: OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS,
   multiplyMonthlyYearly: false,       // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
   growthChartRange: "all",            // "30d" | "6m" | "all"
   supabase: null,                     // Initialized on startup or injected for tests
@@ -322,10 +294,6 @@ const ID = {
   LEFT_C1:           "left_c1",
   LEFT_C2:           "left_c2",
   LEFT_CANCEL:       "left_cancel",
-  // Temporary voice channel creator custom IDs
-  VOICE_CATEGORY_SELECT: "voice_cat_select",
-  VOICE_CREATE_CONFIRM:  "voice_create_confirm",
-  VOICE_CREATE_CANCEL:   "voice_create_cancel",
 };
 
 const COLOR = {
@@ -874,31 +842,8 @@ async function ensureOrientationMessage() {
   });
 }
 
-// ================= TEMPORARY VOICE CHANNEL CREATOR =================
-const selectedVoiceCategoryByUser = new Map(); // userId -> categoryKey
-const voiceCreateLastAtByUser = new Map();     // userId -> timestampMs
-const tempVoiceDeleteTimers = new Map();       // channelId -> Timeout
-
-function getVoiceCreateCooldownRemainingMs(userId, nowMs = Date.now()) {
-  if (!userId) return 0;
-  const lastAt = voiceCreateLastAtByUser.get(userId);
-  if (!lastAt) return 0;
-  const cooldownMs = config.voiceCreateCooldownMs ?? VOICE_CREATE_COOLDOWN_MS;
-  const elapsed = nowMs - lastAt;
-  return elapsed < cooldownMs ? cooldownMs - elapsed : 0;
-}
-
-function clearVoiceCreateCooldown(userId) {
-  if (!userId) voiceCreateLastAtByUser.clear();
-  else voiceCreateLastAtByUser.delete(userId);
-}
-
-function getVoiceCategoryConfig(keyOrCategoryId) {
-  if (!keyOrCategoryId) return null;
-  return (
-    VOICE_CATEGORIES.find((c) => c.key === keyOrCategoryId || c.categoryId === keyOrCategoryId) || null
-  );
-}
+// ================= OSRS VOICE HUB (JOIN-TO-CREATE) =================
+const tempVoiceDeleteTimers = new Map(); // channelId -> Timeout
 
 function escapeRegex(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -906,9 +851,8 @@ function escapeRegex(str) {
 
 function isManagedTempVoiceChannel(channel) {
   if (!channel || channel.type !== ChannelType.GuildVoice) return false;
-  const cfg = VOICE_CATEGORIES.find((c) => c.categoryId === channel.parentId);
-  if (!cfg) return false;
-  const pattern = new RegExp(`^${escapeRegex(cfg.prefix)} \\d+$`, "i");
+  if (channel.parentId !== OSRS_VOICE_CATEGORY_ID) return false;
+  const pattern = new RegExp(`^${escapeRegex(OSRS_VOICE_PREFIX)} \\d+$`, "i");
   return pattern.test(String(channel.name || "").trim());
 }
 
@@ -944,7 +888,7 @@ function scheduleTempVoiceDeletion(channel, customTimeoutMs = null) {
   }
   if (tempVoiceDeleteTimers.has(channel.id)) return; // Countdown already running
 
-  const timeoutMs = customTimeoutMs ?? (config.voiceEmptyTimeoutMs ?? VOICE_EMPTY_TIMEOUT_MS);
+  const timeoutMs = customTimeoutMs ?? (config.osrsVoiceEmptyTimeoutMs ?? OSRS_VOICE_EMPTY_TIMEOUT_MS);
   const timer = setTimeout(async () => {
     tempVoiceDeleteTimers.delete(channel.id);
     try {
@@ -953,11 +897,11 @@ function scheduleTempVoiceDeletion(channel, customTimeoutMs = null) {
         (await client.channels.fetch(channel.id).catch(() => null));
       if (!fresh || !isManagedTempVoiceChannel(fresh)) return;
       if (getNonBotVoiceMemberCount(fresh) === 0) {
-        await fresh.delete("Temporary voice channel empty timeout reached");
-        console.log(`[TempVoice] Deleted empty temporary voice channel ${fresh.name} (${fresh.id}).`);
+        await fresh.delete("Temporary OSRS voice channel empty timeout reached");
+        console.log(`[OsrsVoice] Deleted empty temporary voice channel ${fresh.name} (${fresh.id}).`);
       }
     } catch (err) {
-      console.warn(`[TempVoice] Could not auto-delete voice channel ${channel.id}:`, err.message);
+      console.warn(`[OsrsVoice] Could not auto-delete voice channel ${channel.id}:`, err.message);
     }
   }, timeoutMs);
 
@@ -980,31 +924,14 @@ async function scanExistingTempVoiceChannels() {
   }
 }
 
-async function handleVoiceStateUpdate(oldState, newState) {
-  const joinedChannel = newState?.channel;
-  const leftChannel = oldState?.channel;
-
-  if (joinedChannel && isManagedTempVoiceChannel(joinedChannel)) {
-    if (getNonBotVoiceMemberCount(joinedChannel) > 0) {
-      clearTempVoiceTimer(joinedChannel.id);
-    }
-  }
-
-  if (leftChannel && leftChannel.id !== joinedChannel?.id && isManagedTempVoiceChannel(leftChannel)) {
-    if (getNonBotVoiceMemberCount(leftChannel) === 0) {
-      scheduleTempVoiceDeletion(leftChannel);
-    }
-  }
-}
-
-async function getNextVoiceChannelNumber(guild, cfg) {
+async function getNextOsrsVoiceChannelNumber(guild) {
   const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
   const usedNumbers = new Set();
-  const pattern = new RegExp(`^${escapeRegex(cfg.prefix)} (\\d+)$`, "i");
+  const pattern = new RegExp(`^${escapeRegex(OSRS_VOICE_PREFIX)} (\\d+)$`, "i");
 
   for (const ch of channels.values()) {
     if (!ch || ch.type !== ChannelType.GuildVoice) continue;
-    if (ch.parentId !== cfg.categoryId) continue;
+    if (ch.parentId !== OSRS_VOICE_CATEGORY_ID) continue;
     const match = String(ch.name || "").trim().match(pattern);
     if (match) {
       const n = Number(match[1]);
@@ -1019,79 +946,59 @@ async function getNextVoiceChannelNumber(guild, cfg) {
   return nextNum;
 }
 
-async function createTemporaryVoiceChannel(guild, categoryKey, creatorUser) {
-  const cfg = getVoiceCategoryConfig(categoryKey);
-  if (!cfg) {
-    throw new Error("Invalid voice channel category selected.");
-  }
-
-  const nextNum = await getNextVoiceChannelNumber(guild, cfg);
-  const channelName = `${cfg.prefix} ${nextNum}`;
+async function createOsrsVoiceChannel(guild, creatorUser) {
+  const nextNum = await getNextOsrsVoiceChannelNumber(guild);
+  const channelName = `${OSRS_VOICE_PREFIX} ${nextNum}`;
 
   const created = await guild.channels.create({
     name: channelName,
     type: ChannelType.GuildVoice,
-    parent: cfg.categoryId,
-    reason: `Temporary voice channel created by ${creatorUser?.tag || creatorUser?.id || "member"}`,
+    parent: OSRS_VOICE_CATEGORY_ID,
+    reason: `Temporary OSRS voice channel created for ${creatorUser?.tag || creatorUser?.id || "member"}`,
   });
 
   // Explicitly sync permissions with the parent category
   if (typeof created.lockPermissions === "function") {
     await created.lockPermissions().catch((e) => {
-      console.warn(`[TempVoice] Could not lockPermissions on ${created.id}:`, e.message);
+      console.warn(`[OsrsVoice] Could not lockPermissions on ${created.id}:`, e.message);
     });
   }
 
-  // Start the 60-second initial empty timer until someone connects
-  const initialTimeoutMs = config.voiceInitialEmptyTimeoutMs ?? VOICE_INITIAL_EMPTY_TIMEOUT_MS;
+  // Safety net: delete it if the member never actually ends up joining
+  const initialTimeoutMs = config.osrsVoiceInitialEmptyTimeoutMs ?? OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS;
   scheduleTempVoiceDeletion(created, initialTimeoutMs);
-  console.log(`[TempVoice] Created ${channelName} (${created.id}) under ${cfg.label}.`);
-  return { channel: created, category: cfg, channelName };
+  console.log(`[OsrsVoice] Created ${channelName} (${created.id}).`);
+  return created;
 }
 
-function buildVoiceCreatorMessage() {
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.main)
-    .setTitle("Create a Temporary Voice Channel")
-    .setDescription(
-      "Need a voice channel? Pick a category from the dropdown menu below and click **Confirm & Create Voice Channel**.\n\n" +
-      "• **Social Hub** ➔ `Social Voice 1, 2, 3…`\n" +
-      "• **Old School Runescape** ➔ `OSRS Voice 1, 2, 3…`\n" +
-      "• **Other Games** ➔ `Other Games Voice 1, 2, 3…`\n\n" +
-      "Permissions are automatically synced with the category. Channels auto-delete **after 60 seconds if nobody joins**, or **5 minutes after the last person disconnects** (1 channel per user every 5 minutes)."
-    );
+async function handleVoiceStateUpdate(oldState, newState) {
+  const joinedChannel = newState?.channel;
+  const leftChannel = oldState?.channel;
 
-  const selectMenu = new StringSelectMenuBuilder()
-    .setCustomId(ID.VOICE_CATEGORY_SELECT)
-    .setPlaceholder("Select a category for your voice channel...")
-    .addOptions(
-      VOICE_CATEGORIES.map((c) =>
-        new StringSelectMenuOptionBuilder()
-          .setLabel(c.label)
-          .setValue(c.key)
-          .setDescription(c.description)
-      )
-    );
+  // Joining the OSRS Voice hub instantly creates a brand-new temporary
+  // "OSRS Voice N" channel and moves the member straight into it — they
+  // never actually end up sitting in the hub channel itself.
+  if (joinedChannel && joinedChannel.id === OSRS_VOICE_HUB_CHANNEL_ID) {
+    try {
+      const created = await createOsrsVoiceChannel(joinedChannel.guild, newState.member?.user);
+      await newState.setChannel(created, "Redirected from the OSRS Voice hub into a new temporary channel");
+    } catch (err) {
+      console.error(`[OsrsVoice] Could not redirect ${newState.member?.id} out of the OSRS Voice hub:`, err.message);
+    }
+    return;
+  }
 
-  const selectRow = new ActionRowBuilder().addComponents(selectMenu);
-  const buttonRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(ID.VOICE_CREATE_CONFIRM)
-      .setLabel("Confirm & Create Voice Channel")
-      .setStyle(ButtonStyle.Success)
-  );
+  if (joinedChannel && isManagedTempVoiceChannel(joinedChannel)) {
+    if (getNonBotVoiceMemberCount(joinedChannel) > 0) {
+      clearTempVoiceTimer(joinedChannel.id);
+    }
+  }
 
-  return { embeds: [embed], components: [selectRow, buttonRow] };
-}
-
-async function ensureVoiceCreatorMessage() {
-  return ensureEmbedMessage({
-    channelId: CREATE_VOICE_CHANNEL_ID,
-    label: "TempVoice",
-    buttonIds: [ID.VOICE_CATEGORY_SELECT, ID.VOICE_CREATE_CONFIRM],
-    payload: buildVoiceCreatorMessage(),
-    what: "permanent temporary voice creator embed",
-  });
+  if (leftChannel && leftChannel.id !== joinedChannel?.id && isManagedTempVoiceChannel(leftChannel)) {
+    if (getNonBotVoiceMemberCount(leftChannel) === 0) {
+      scheduleTempVoiceDeletion(leftChannel);
+    }
+  }
 }
 
 // ================= WEEKLY EVENTS: SKILL OF THE WEEK & BOSS OF THE WEEK =================
@@ -4533,58 +4440,11 @@ async function onMemberLeftConfirm2(interaction, encodedRsn) {
   }
 }
 
-// ---- Temporary Voice Channel Creator Interaction Handlers ----
-async function onVoiceCategorySelect(interaction) {
-  const selectedKey = interaction.values?.[0];
-  const cfg = getVoiceCategoryConfig(selectedKey);
-  if (cfg) {
-    selectedVoiceCategoryByUser.set(interaction.user.id, cfg.key);
-  }
-  return interaction.deferUpdate();
-}
-
-async function onVoiceCreateConfirm(interaction, categoryKeyFromButton) {
-  const categoryKey = categoryKeyFromButton || selectedVoiceCategoryByUser.get(interaction.user.id);
-  const cfg = getVoiceCategoryConfig(categoryKey);
-
-  await interaction.deferUpdate();
-  if (!cfg) return;
-
-  // Enforce 5-minute per-user cooldown
-  if (getVoiceCreateCooldownRemainingMs(interaction.user.id) > 0) {
-    return;
-  }
-
-  try {
-    await createTemporaryVoiceChannel(
-      interaction.guild,
-      cfg.key,
-      interaction.user
-    );
-    voiceCreateLastAtByUser.set(interaction.user.id, Date.now());
-    selectedVoiceCategoryByUser.delete(interaction.user.id);
-
-    // Reset the dropdown on the permanent message so the same category can be selected again later
-    await interaction.message?.edit?.(buildVoiceCreatorMessage()).catch(() => {});
-  } catch (err) {
-    console.error(`[TempVoice] Failed to create voice channel for ${interaction.user.id}:`, err.message);
-  }
-}
-
-async function onVoiceCreateCancel(interaction) {
-  selectedVoiceCategoryByUser.delete(interaction.user.id);
-  return interaction.deferUpdate();
-}
-
 async function handleInteraction(interaction) {
   if (!interaction.inGuild()) return;
 
   if (interaction.isChatInputCommand?.() && interaction.commandName === "upload-roster") {
     return onUploadRosterSlashCommand(interaction);
-  }
-
-  if (interaction.isStringSelectMenu?.() && interaction.customId === ID.VOICE_CATEGORY_SELECT) {
-    return onVoiceCategorySelect(interaction);
   }
 
   if (interaction.isButton()) {
@@ -4609,8 +4469,6 @@ async function handleInteraction(interaction) {
       case ID.LEFT_C1:              return onMemberLeftConfirm1(interaction, payload);
       case ID.LEFT_C2:              return onMemberLeftConfirm2(interaction, payload);
       case ID.LEFT_CANCEL:          return onMemberLeftCancel(interaction, payload);
-      case ID.VOICE_CREATE_CONFIRM: return onVoiceCreateConfirm(interaction, payload);
-      case ID.VOICE_CREATE_CANCEL:  return onVoiceCreateCancel(interaction);
       default:                      return;
     }
   }
@@ -4640,10 +4498,9 @@ client.once(Events.ClientReady, async () => {
     console.error("[Orientation] ensureOrientationMessage failed:", err.message);
   }
   try {
-    await ensureVoiceCreatorMessage();
     await scanExistingTempVoiceChannels();
   } catch (err) {
-    console.error("[TempVoice] ensureVoiceCreatorMessage failed:", err.message);
+    console.error("[OsrsVoice] scanExistingTempVoiceChannels failed:", err.message);
   }
   try {
     if (getSupabase()) {
@@ -4694,7 +4551,7 @@ client.on(Events.MessageCreate, (message) => {
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
-  handleVoiceStateUpdate(oldState, newState).catch((e) => console.error("[TempVoice] VoiceStateUpdate error:", e.message));
+  handleVoiceStateUpdate(oldState, newState).catch((e) => console.error("[OsrsVoice] VoiceStateUpdate error:", e.message));
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -4738,16 +4595,13 @@ module.exports = {
   ensurePermanentMessage,
   ensureOrientationMessage,
   buildOrientationMessage,
-  buildVoiceCreatorMessage,
-  ensureVoiceCreatorMessage,
   isManagedTempVoiceChannel,
-  getNextVoiceChannelNumber,
-  createTemporaryVoiceChannel,
+  getNextOsrsVoiceChannelNumber,
+  createOsrsVoiceChannel,
   handleVoiceStateUpdate,
   scheduleTempVoiceDeletion,
   clearTempVoiceTimer,
-  getVoiceCreateCooldownRemainingMs,
-  clearVoiceCreateCooldown,
+  scanExistingTempVoiceChannels,
   deletePingsFor,
   // Ranking system exports
   CLAN_CREATION_DATE,
@@ -4801,14 +4655,11 @@ module.exports = {
   STAFF_ALERT_CHANNEL_ID,
   RANK_LIST_CHANNEL_ID,
   RANK_LOG_CHANNEL_ID,
-  CREATE_VOICE_CHANNEL_ID,
-  SOCIAL_HUB_CATEGORY_ID,
-  OSRS_CATEGORY_ID,
-  OTHER_GAMES_CATEGORY_ID,
-  VOICE_CATEGORIES,
-  VOICE_EMPTY_TIMEOUT_MS,
-  VOICE_INITIAL_EMPTY_TIMEOUT_MS,
-  VOICE_CREATE_COOLDOWN_MS,
+  OSRS_VOICE_HUB_CHANNEL_ID,
+  OSRS_VOICE_CATEGORY_ID,
+  OSRS_VOICE_PREFIX,
+  OSRS_VOICE_EMPTY_TIMEOUT_MS,
+  OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS,
   // Weekly Events exports
   WEEKLY_EVENTS_CHANNEL_ID,
   WEEKLY_EVENT_POLL_INTERVAL_MS,

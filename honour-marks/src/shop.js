@@ -509,10 +509,10 @@ async function createPartyQuestWithChoiceToken({ guildId, members, tree, size, d
  * fill. Refunded if posting itself fails for any reason — the quest hasn't
  * even been created yet at that point, so there's nothing else to undo.
  */
-async function createOpenTeamWithChoiceToken({ guildId, posterId, size, tree, picks, tokenConsumed }) {
+async function createOpenTeamWithChoiceToken({ guildId, posterId, size, tree, difficulty, picks, tokenConsumed }) {
   // See createSoloQuestWithChoiceToken above for why `picks` isn't re-gated
   // on tokenConsumed here.
-  const result = await createOpenTeam({ guildId, posterId, size, tree, picks });
+  const result = await createOpenTeam({ guildId, posterId, size, tree, difficulty, picks });
 
   if (result.error && tokenConsumed) {
     const refunded = await grantConsumable(posterId, guildId, "quest_choice_token");

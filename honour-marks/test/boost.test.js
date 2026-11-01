@@ -301,13 +301,16 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
     ].map(([id, rsn]) => fake.db.hm_members.push({ user_id: id, guild_id: "g1", rsn })));
     nextSnapshot = { skills: { mining: { experience: 20000 } }, bosses: {} };
 
-    // The teammate is already on another active team quest — createPartyQuest
-    // rejects for a reason that has nothing to do with the hand-pick itself.
-    fake.db.hm_party_quests.push({
-      id: 9000, guild_id: "g1", tree: "gathering", size: "duo", difficulty: "easy",
-      members: ["t-choice-mate", "someone-else"], targets: {}, baseline: {}, hm_reward: 100,
-      expires_at: new Date(Date.now() + 86400000).toISOString(),
-    });
+    // The teammate is already on MAX_ACTIVE_PARTY_QUESTS (3) active team
+    // quests — createPartyQuest rejects for a reason that has nothing to do
+    // with the hand-pick itself.
+    for (let i = 0; i < 3; i++) {
+      fake.db.hm_party_quests.push({
+        id: 9000 + i, guild_id: "g1", tree: "gathering", size: "duo", difficulty: "easy",
+        members: ["t-choice-mate", `someone-else-${i}`], targets: {}, baseline: {}, hm_reward: 100,
+        expires_at: new Date(Date.now() + 86400000).toISOString(),
+      });
+    }
 
     const result = await createPartyQuestWithChoiceToken({
       guildId: "g1", members: ["t-choice-creator", "t-choice-mate"], tree: "gathering", size: "duo",
@@ -331,7 +334,7 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
 
     const result = await createPartyQuestWithChoiceToken({
       guildId: "g1", members: ["t-choice-ok", "t-choice-ok-mate"], tree: "gathering", size: "duo",
-      difficulty: "easy", picks: ["mining", "fishing"], tokenConsumed: true, userId: "t-choice-ok",
+      difficulty: "medium", picks: ["mining", "fishing"], tokenConsumed: true, userId: "t-choice-ok",
     });
     assert.strictEqual(result.ok, true, result.error);
     assert.strictEqual(result.refunded, false);
@@ -340,7 +343,7 @@ async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${n
     const row = fake.db.hm_party_quests.find((r) => r.members.includes("t-choice-ok"));
     assert.deepStrictEqual(
       Object.keys(row.targets.skills).sort(), ["fishing", "mining"],
-      "both hand-picked targets were used, matching the duo's base count of 2 exactly"
+      "both hand-picked targets were used, matching Medium difficulty's target count of 2 exactly"
     );
   });
 
