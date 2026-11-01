@@ -191,6 +191,25 @@ alter table public.hm_party_quest_completions
 
 create index if not exists idx_hm_pqc_members on public.hm_party_quest_completions using gin (members);
 
+-- 10b. Per-member HM breakdown for a party quest completion — same idea as
+--      rank_xp_breakdown (#10) but for HM: once Prestige (#11b) can make one
+--      member's HM payout from the SAME team quest different from everyone
+--      else's, a single flat `hm_awarded` number stops being enough to know
+--      what any individual member actually received.
+alter table public.hm_party_quest_completions
+  add column if not exists hm_breakdown jsonb not null default '{}'::jsonb;
+
+-- One-time backfill for rows written before hm_breakdown existed: every
+-- member of those rows was paid the exact same hm_awarded amount (Prestige
+-- didn't exist yet), so reconstruct the breakdown from that. Idempotent —
+-- only touches rows that still have the untouched '{}' default.
+update public.hm_party_quest_completions
+set hm_breakdown = (
+  select coalesce(jsonb_object_agg(m, hm_awarded), '{}'::jsonb)
+  from unnest(members) as m
+)
+where hm_breakdown = '{}'::jsonb;
+
 -- 11. Shop ownership
 create table if not exists public.hm_perks (
   user_id    text not null,
@@ -244,6 +263,17 @@ create table if not exists public.hm_active_boosts (
 );
 
 create index if not exists idx_hm_ab_user on public.hm_active_boosts (user_id, tree, expires_at desc);
+
+-- 11b. Prestige — a one-time, permanent, account-wide purchase (NOT a Perk or
+--      Item, which are both per-category): +10% HM and +25% Rank XP on every
+--      quest a Prestiged member FINISHES, solo or team, stacking on top of
+--      everything else (Perks, Items, Boosts). Presence of a row = owned;
+--      there is nothing to tier up or buy again.
+create table if not exists public.hm_prestige (
+  user_id      text primary key,
+  guild_id     text not null,
+  purchased_at timestamptz not null default now()
+);
 
 create table if not exists public.hm_tutorial_progress (
   user_id            text primary key,
@@ -317,15 +347,15 @@ with solo as (
   from public.hm_quest_completions group by user_id
 ),
 party as (
-  -- Every member of a party was paid the same HM (the reward was always a
-  -- flat amount per member), but — since Boosts went live — NOT necessarily
-  -- the same Rank XP, so Rank XP is read per member out of the breakdown
-  -- instead of assuming everyone got the row's shared total.
+  -- Every member of a party used to be paid the same flat HM, but since
+  -- Prestige/Clan Boosts can both vary the HM per member too, HM is now read
+  -- per member out of hm_breakdown — same principle as rank_xp_breakdown
+  -- below, which already had to do this once personal Boosts went live.
   select m as user_id,
          count(*) filter (where size = 'duo'  and completed) as duo,
          count(*) filter (where size = 'trio' and completed) as trio,
          count(*) filter (where size = 'quad' and completed) as quad,
-         coalesce(sum(hm_awarded), 0)                                       as party_hm,
+         coalesce(sum(coalesce((hm_breakdown ->> m)::numeric, 0)), 0)       as party_hm,
          coalesce(sum(coalesce((rank_xp_breakdown ->> m)::numeric, 0)), 0)  as party_rank_xp
   from public.hm_party_quest_completions, unnest(members) as m
   group by m
@@ -353,6 +383,49 @@ left join public.hm_balances b on b.user_id = mem.user_id
 left join solo s               on s.user_id = mem.user_id
 left join party p              on p.user_id = mem.user_id;
 
+-- 15b. CLAN POOL — one shared monthly quest the whole clan works toward
+--      together (a toned-down revival of the original mimir.js Clan Pool
+--      system). Exactly one active quest per guild at a time; a new one
+--      starts automatically the moment the current one is completed.
+create table if not exists public.hm_clan_quest (
+  guild_id   text primary key,
+  quest_type text not null check (quest_type in ('skill_xp','boss_kc','minigame','quest_completions')),
+  target     bigint not null,
+  -- Every currently-registered member's starting total the moment this quest
+  -- began (skill_xp -> summed skill XP, boss_kc -> summed Boss PvM KC,
+  -- minigame -> summed minigame completions, quest_completions -> HM quest
+  -- completions), keyed by user_id. A member who registers mid-quest is
+  -- lazily added here with their CURRENT total the first time progress is
+  -- computed after they register, so only what they do from that point on
+  -- counts — exactly the same "baseline" principle as a personal quest.
+  baselines  jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+-- One shared clan-wide reward boost, awarded automatically (a coin flip
+-- between the two kinds) the moment a Clan Pool quest completes. Applies to
+-- EVERY member's quest completions while active — no activation step, unlike
+-- a personal Shop Boost. Always at most 1 week; a new one replaces whatever
+-- was still running rather than stacking.
+create table if not exists public.hm_clan_boost (
+  guild_id   text primary key,
+  kind       text not null check (kind in ('hm_gain','rank_xp')),
+  bonus_pct  numeric(5,2) not null default 5,
+  started_at timestamptz not null default now(),
+  expires_at timestamptz not null
+);
+
+create table if not exists public.hm_clan_quest_completions (
+  id           bigserial primary key,
+  guild_id     text not null,
+  quest_type   text not null,
+  target       bigint not null,
+  boost_kind   text,
+  completed_at timestamptz not null default now()
+);
+
+create index if not exists idx_hm_cqc_guild on public.hm_clan_quest_completions (guild_id, completed_at desc);
+
 -- 16. RLS off — the bot uses the service-role key.
 do $$
 declare t text;
@@ -362,7 +435,8 @@ begin
     'hm_party_quests','hm_lfg_posts','hm_quest_counts','hm_quest_completions',
     'hm_party_quest_completions','hm_perks','hm_items','hm_inventory',
     'hm_active_boosts','hm_tutorial_progress','hm_panels','hm_audit_log',
-    'hm_rank_xp_rules'
+    'hm_rank_xp_rules','hm_prestige','hm_clan_quest','hm_clan_boost',
+    'hm_clan_quest_completions'
   ] loop
     execute format('alter table public.%I disable row level security', t);
   end loop;

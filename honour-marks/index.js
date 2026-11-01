@@ -16,16 +16,18 @@ const {
 } = require("discord.js");
 
 const { config, assertConfig } = require("./src/config");
-const { getSupabase } = require("./src/db");
+const { getSupabase, getConfigValue, setConfigValue } = require("./src/db");
 const { getRankForXp, formatRankProgress } = require("./src/ranks");
 const {
   TREES, TREE_BY_KEY, QUEST_TREES, PARTY_SIZES, PARTY_DIFFICULTY, PARTY_DIFFICULTIES,
+  SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActivePartyQuestsForUser,
   cancelSoloQuest, createPartyQuest, creditHm,
   createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams, getOpenTeamForUser,
   diffProgress, fetchHiscores, cleanRsn, soloHmReward, partyHmReward,
-  soloTargetPool, partyTargetPool, treeKind,
+  soloTargetPool, partyTargetPool, buildPartyTargets, treeKind,
+  insertSoloQuestPayload, dayStamp,
 } = require("./src/quests");
 const { SKILL_LABELS, bossLabel } = require("./src/jagex");
 const { checkSoloQuests, checkPartyQuest, completePartyQuest, sweepExpiredQuests } = require("./src/progress");
@@ -35,11 +37,17 @@ const {
   getBalance, getPerks, getPerkTier, getItems, getItemTier, getItemTiers, getInventory, getActiveBoosts,
   buyPerk, buyItem, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
   createSoloQuestWithChoiceToken, createPartyQuestWithChoiceToken, createOpenTeamWithChoiceToken,
+  buildSoloQuestPreviewWithChoiceToken,
+  PRESTIGE_COST, PRESTIGE_EMOJI, isPrestiged, getPrestigedSet, buyPrestige,
 } = require("./src/shop");
+const {
+  CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI, CLAN_BOOST_LABELS,
+  ensureClanQuest, checkClanQuestProgress, getActiveClanBoost,
+} = require("./src/clanpool");
 const {
   COLOR, HM_EMOJI,
   renderClaimPanel, renderGuide,
-  renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, syncPanel, emptyPage,
+  renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, renderClanPool, syncPanel, emptyPage,
 } = require("./src/panels");
 const {
   readSetup, bindGuild, createStructure, verifyBindings, seedDefaults,
@@ -128,6 +136,33 @@ function takePendingTeamPick(guildId, userId, size, difficulty, tree) {
   if (Date.now() - entry.ts > TEAM_PICK_TTL_MS) return null;
   if (entry.size !== size || entry.difficulty !== difficulty || entry.tree !== tree) return null;
   return { picks: entry.picks, tokenConsumed: entry.tokenConsumed };
+}
+
+// ── Boss/Raid confirm-or-cancel preview (solo) ──────────────────────────────
+// "Some members getting bosses they don't have completed" — a Boss or Raid
+// solo quest's picked/rolled target is now held here, UNWRITTEN, until the
+// member explicitly confirms it. Cancel costs nothing (no HM, no Skip Token)
+// and sends them back to category selection rather than re-rolling in place.
+// Skill and Minigame quests are unaffected — only Boss PvM and Raids ever
+// populate this map; see handleCreateSolo.
+const pendingSoloPreviews = new Map(); // key -> { payload, tokenConsumed, ts }
+const SOLO_PREVIEW_TTL_MS = 15 * 60 * 1000;
+
+function soloPreviewKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function setPendingSoloPreview(guildId, userId, payload, tokenConsumed) {
+  pendingSoloPreviews.set(soloPreviewKey(guildId, userId), { payload, tokenConsumed, ts: Date.now() });
+}
+
+function takePendingSoloPreview(guildId, userId) {
+  const key = soloPreviewKey(guildId, userId);
+  const entry = pendingSoloPreviews.get(key);
+  pendingSoloPreviews.delete(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > SOLO_PREVIEW_TTL_MS) return null;
+  return entry;
 }
 
 // ── Multi-page target picker ────────────────────────────────────────────────
@@ -246,7 +281,7 @@ async function finalizePickSession(interaction, session) {
   const { mode, questType, tree, size, difficulty, picks } = session;
   clearPickSession(interaction.guildId, interaction.user.id);
 
-  if (mode === "solo_target") return handlePickTarget(interaction, questType, tree, picks);
+  if (mode === "solo_target") return handlePickTarget(interaction, questType, tree, picks, difficulty);
   if (mode === "solo_raid") return handleCreateSolo(interaction, questType, tree, picks, false);
   if (mode === "team_target") return handleTeamPickTarget(interaction, size, difficulty, tree, picks);
   if (mode === "team_raid") return handleTeamRaidPickTarget(interaction, size, difficulty, tree, picks);
@@ -356,6 +391,9 @@ async function refreshPanels(guildId) {
     // The permanent open-teams board lives right under the quest board, in
     // the same channel, as its own synced panel.
     await syncPanel(guildId, questsCh, "open_teams", await renderOpenTeams(guildId));
+    // The Clan Pool board (one shared monthly quest + any active clan-wide
+    // boost) lives right under the open-teams board, same channel.
+    await syncPanel(guildId, questsCh, "clan_pool", await renderClanPool(guildId));
   }
   if (shopCh) {
     await syncPanel(guildId, shopCh, "shop", await renderShop(guildId));
@@ -734,15 +772,12 @@ async function handleQuestStart(interaction) {
   });
 }
 
-async function handlePickTree(interaction, questType) {
-  const member = await getMember(interaction.user.id);
-  if (!member?.rsn) {
-    return interaction.update({
-      embeds: [emptyPage("Not registered", "Run `/register` first so I know which RuneScape account to track.").embed],
-      components: [],
-    });
-  }
-
+/** Renders the category picker. Shared by the initial quest-type pick AND
+ *  the "Cancel" button on a Boss/Raid confirm preview — Cancel always goes
+ *  back to this exact step, never an instant re-roll. Defer-aware (same
+ *  ternary pattern as handleTeamMode) because Cancel calls it after an async
+ *  refund step. */
+async function renderSoloCategoryPicker(interaction, questType) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`hm_pick_tree:${questType}`)
     .setPlaceholder("Select a category…")
@@ -752,10 +787,23 @@ async function handlePickTree(interaction, questType) {
       )
     );
 
-  return interaction.update({
+  const payload = {
     embeds: [emptyPage("📋 Pick a Category", `Your **${questType}** quest will target something in this category.`).embed],
     components: [new ActionRowBuilder().addComponents(menu)],
-  });
+  };
+  return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
+}
+
+async function handlePickTree(interaction, questType) {
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) {
+    return interaction.update({
+      embeds: [emptyPage("Not registered", "Run `/register` first so I know which RuneScape account to track.").embed],
+      components: [],
+    });
+  }
+
+  return renderSoloCategoryPicker(interaction, questType);
 }
 
 /** Pretty label for a solo-quest target pool entry (skill or boss key). */
@@ -781,15 +829,70 @@ async function handleTreeChosen(interaction, questType, tree) {
   if (treeKind(tree) === "raid") {
     return handleRaidPick(interaction, questType, tree);
   }
+  if (treeKind(tree) === "skill") {
+    return handlePickSoloDifficulty(interaction, questType, tree);
+  }
+  return handleCategoryChoiceOffer(interaction, questType, tree, "easy");
+}
 
+/**
+ * Skilling quests now have the same 4-tier difficulty choice Boss PvM team
+ * quests already had: Easy (1 skill), Medium (2), Hard (3), Extreme (4) —
+ * each tier also raises the XP needed per skill by 25% over the last, and
+ * the HM + Rank XP reward scales up to match (see SOLO_SKILL_DIFFICULTY /
+ * SOLO_SKILL_XP in src/quests.js for the exact table). Applies to
+ * daily/weekly/monthly skill quests alike.
+ */
+async function handlePickSoloDifficulty(interaction, questType, tree) {
+  const payload = {
+    embeds: [
+      emptyPage(
+        "💪 Pick a Difficulty",
+        "Harder difficulties ask for more skills at once, but each one also raises the XP needed per skill by **25%** — " +
+        "and the HM + Rank XP reward scales up by the same amount:\n\n" +
+        SOLO_SKILL_DIFFICULTIES.map((key) => {
+          const d = SOLO_SKILL_DIFFICULTY[key];
+          return `${d.emoji} **${d.label}** — ${d.count} skill${d.count === 1 ? "" : "s"}, ${d.mult}x the base reward`;
+        }).join("\n")
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        SOLO_SKILL_DIFFICULTIES.map((key) => {
+          const d = SOLO_SKILL_DIFFICULTY[key];
+          return new ButtonBuilder()
+            .setCustomId(`hm_pick_skill_difficulty:${questType}:${tree}:${key}`)
+            .setLabel(d.label)
+            .setEmoji(d.emoji)
+            .setStyle(ButtonStyle.Primary);
+        })
+      ),
+    ],
+  };
+  return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
+}
+
+async function handleSkillDifficultyChosen(interaction, questType, tree, difficulty) {
+  if (!SOLO_SKILL_DIFFICULTY[difficulty]) difficulty = "easy";
+  return handleCategoryChoiceOffer(interaction, questType, tree, difficulty);
+}
+
+/**
+ * After a category (and, for a Skill quest, a difficulty) is picked, a
+ * member who owns a Quest Choice Token gets offered the chance to spend it
+ * hand-picking the exact target instead of letting the bot roll one at
+ * random. Nothing changes for anyone who doesn't own one — they go straight
+ * to a random quest, same as before.
+ */
+async function handleCategoryChoiceOffer(interaction, questType, tree, difficulty) {
   const inv = await getInventory(interaction.user.id);
   const hasChoiceToken = inv.some((i) => i.tree === "quest_choice_token" && i.boost_tier === 0 && i.quantity > 0);
 
   if (!hasChoiceToken) {
-    return handleCreateSolo(interaction, questType, tree);
+    return handleCreateSolo(interaction, questType, tree, null, false, difficulty);
   }
 
-  return interaction.update({
+  const payload = {
     embeds: [
       emptyPage(
         "🎯 You own a Quest Choice Token",
@@ -799,11 +902,12 @@ async function handleTreeChosen(interaction, questType, tree) {
     ],
     components: [
       new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`hm_quest_choose:${questType}:${tree}`).setLabel("🎯 Hand-pick (uses token)").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`hm_quest_random:${questType}:${tree}`).setLabel("🎲 Random (keep token)").setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`hm_quest_choose:${questType}:${tree}:${difficulty}`).setLabel("🎯 Hand-pick (uses token)").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`hm_quest_random:${questType}:${tree}:${difficulty}`).setLabel("🎲 Random (keep token)").setStyle(ButtonStyle.Secondary)
       ),
     ],
-  });
+  };
+  return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
 }
 
 /**
@@ -818,34 +922,92 @@ async function handleRaidPick(interaction, questType, tree) {
 }
 
 /** Shows the pool for this category so the member can pick their own target(s). */
-async function handleQuestChoose(interaction, questType, tree) {
+async function handleQuestChoose(interaction, questType, tree, difficulty = "easy") {
   // A Quest Expansion item raises how many targets this quest actually needs
   // (skills/bosses only — Raids/Minigames expand via a % instead, which
   // doesn't change the hand-pick UI at all), so the "select exactly N" here
   // has to account for it or a Tier-2+ owner would be stuck unable to pick
   // the real target count.
   const expansionTier = await getItemTier(interaction.user.id, tree, ITEM_SLOT.EXPANSION);
-  const spec = soloTargetPool(tree, questType, expansionTier);
+  const spec = soloTargetPool(tree, questType, expansionTier, difficulty);
   if (!spec || !spec.pool.length) {
-    return handleCreateSolo(interaction, questType, tree);
+    return handleCreateSolo(interaction, questType, tree, null, false, difficulty);
   }
 
-  startPickSession(interaction.guildId, interaction.user.id, { mode: "solo_target", questType, tree, spec });
+  startPickSession(interaction.guildId, interaction.user.id, { mode: "solo_target", questType, tree, difficulty, spec });
   return interaction.update(renderPickSession(getPickSession(interaction.guildId, interaction.user.id)));
 }
 
-async function handlePickTarget(interaction, questType, tree, picks) {
+async function handlePickTarget(interaction, questType, tree, picks, difficulty = "easy") {
   await interaction.deferUpdate();
   const used = await consumeItem(interaction.user.id, "quest_choice_token");
   // If the token is somehow already gone (e.g. spent in another tab a moment
   // ago), fall back to a random target rather than leaving the member with
   // nothing — the picks they made simply don't get honoured without payment.
-  return handleCreateSolo(interaction, questType, tree, used ? picks : null, used);
+  return handleCreateSolo(interaction, questType, tree, used ? picks : null, used, difficulty);
 }
 
-async function handleCreateSolo(interaction, questType, tree, picks = null, tokenConsumed = false) {
+/**
+ * Renders the Boss PvM / Raids confirm-or-cancel preview: the quest has
+ * already been fully rolled/validated (see handleCreateSolo) but NOT yet
+ * written to the database. Confirm inserts it exactly as previewed; Cancel
+ * costs nothing — no HM, no Skip Token — and goes back to category
+ * selection, refunding a spent Quest Choice Token if one was used to reach
+ * this preview. Skill and Minigame quests skip this step entirely and start
+ * immediately, same as before this feature existed.
+ */
+function renderSoloTargetConfirm(interaction, payload) {
+  const kind = treeKind(payload.tree);
+  const keys = [...Object.keys(payload.targets?.skills || {}), ...Object.keys(payload.targets?.bosses || {})];
+  const list = keys.map((k) => targetLabel(kind, k)).join(", ");
+  const treeLabel = TREE_BY_KEY[payload.tree]?.label || payload.tree;
+
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        kind === "raid" ? "⚔️ Confirm Your Raid" : "🎯 Confirm Your Target",
+        `**${payload.quest_type.toUpperCase()} • ${treeLabel}**\n\n` +
+        `🎯 **${list}**\n\n` +
+        "Confirm to start this quest, or cancel and pick a different category instead — no cost or Skip Token either way."
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("hm_solo_target_confirm").setLabel("✅ Confirm").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("hm_solo_target_cancel").setLabel("✖ Cancel").setStyle(ButtonStyle.Danger)
+      ),
+    ],
+  });
+}
+
+async function handleCreateSolo(interaction, questType, tree, picks = null, tokenConsumed = false, difficulty = "easy") {
   if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
   const member = await getMember(interaction.user.id);
+  const kind = treeKind(tree);
+
+  // Boss PvM and Raids never write the quest straight away — the exact
+  // target is shown first and must be explicitly confirmed (see the module
+  // doc comment for why: members were getting assigned bosses they hadn't
+  // completed the requirements for). Skill and Minigame are unaffected.
+  if (kind === "boss" || kind === "raid") {
+    const built = await buildSoloQuestPreviewWithChoiceToken({
+      guildId: interaction.guildId, member, tree, questType, picks, difficulty, tokenConsumed,
+    });
+
+    if (built.error) {
+      const refundNote = built.refunded
+        ? "\n\n_Your Quest Choice Token was not spent — it's back in your inventory._"
+        : "";
+      return interaction.editReply({
+        embeds: [emptyPage("Couldn't start that quest", built.error + refundNote).embed],
+        components: [],
+      });
+    }
+
+    setPendingSoloPreview(interaction.guildId, interaction.user.id, built.payload, built.tokenConsumed);
+    return renderSoloTargetConfirm(interaction, built.payload);
+  }
+
   // createSoloQuestWithChoiceToken (src/shop.js) refunds the Quest Choice
   // Token on ANY rejection reason when tokenConsumed is true — not just the
   // common "already active" case — the same way the Skip Token already
@@ -856,6 +1018,7 @@ async function handleCreateSolo(interaction, questType, tree, picks = null, toke
     tree,
     questType,
     picks,
+    difficulty,
     tokenConsumed,
   });
 
@@ -883,6 +1046,59 @@ async function handleCreateSolo(interaction, questType, tree, picks = null, toke
       ),
     ],
   });
+}
+
+/** The member confirmed the Boss/Raid preview — actually writes the quest
+ *  now, using the exact payload they already saw (nothing is re-rolled). */
+async function handleSoloTargetConfirm(interaction) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+  const entry = takePendingSoloPreview(interaction.guildId, interaction.user.id);
+  if (!entry) {
+    return interaction.editReply({
+      embeds: [emptyPage("That preview expired", "Please start the quest again from the quest board.").embed],
+      components: [],
+    });
+  }
+
+  const inserted = await insertSoloQuestPayload(entry.payload);
+  if (inserted.error) {
+    // A Confirm-time failure is rare (e.g. a duplicate active quest was
+    // somehow created from another tab in the meantime). The token, if one
+    // was spent, was already consumed back when the preview was built and is
+    // NOT refunded a second time here.
+    return interaction.editReply({
+      embeds: [emptyPage("Couldn't start that quest", inserted.error).embed],
+      components: [],
+    });
+  }
+
+  const member = await getMember(interaction.user.id);
+  const quests = await getActiveSoloQuests(interaction.user.id);
+  const quest = quests.find((q) => q.quest_type === entry.payload.quest_type);
+  const snap = await fetchHiscores(member?.rsn);
+  const progress = diffProgress(quest?.baseline, snap, quest?.targets || {});
+
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    embeds: [questProgressEmbed(quest, progress)],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("hm_check").setLabel("✅ Check Quests & Collect").setStyle(ButtonStyle.Success)
+      ),
+    ],
+  });
+}
+
+/** The member cancelled the Boss/Raid preview — refunds a spent Quest Choice
+ *  Token (if any) and goes back to category selection. Never re-rolls. */
+async function handleSoloTargetCancel(interaction) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+  const entry = takePendingSoloPreview(interaction.guildId, interaction.user.id);
+  if (entry?.tokenConsumed) {
+    await grantConsumable(interaction.user.id, interaction.guildId, "quest_choice_token");
+  }
+  const questType = entry?.payload?.quest_type || "daily";
+  return renderSoloCategoryPicker(interaction, questType);
 }
 
 async function handleCheck(interaction) {
@@ -1045,15 +1261,13 @@ async function handlePickSize(interaction, size) {
   });
 }
 
-async function handlePickTeamDifficulty(interaction, size, difficulty) {
-  if (!PARTY_SIZES[size]) {
-    return interaction.update({ embeds: [emptyPage("Unknown size", "Try again.").embed], components: [] });
-  }
-  if (!PARTY_DIFFICULTY[difficulty]) {
-    return interaction.update({ embeds: [emptyPage("Unknown difficulty", "Try again.").embed], components: [] });
-  }
+/** Renders the team category picker. Shared by the initial difficulty pick
+ *  AND the "Cancel" button on a Boss/Raid team-target confirm preview —
+ *  Cancel always goes back to this exact step. Defer-aware (same ternary
+ *  pattern as handleTeamMode) since Cancel calls it after an async step. */
+async function renderTeamCategoryPicker(interaction, size, difficulty) {
   const diffLabel = PARTY_DIFFICULTY[difficulty].label;
-  return interaction.update({
+  const payload = {
     embeds: [
       emptyPage(
         "👥 Pick a Category",
@@ -1068,7 +1282,18 @@ async function handlePickTeamDifficulty(interaction, size, difficulty) {
           .addOptions(TREES.map((t) => new StringSelectMenuOptionBuilder().setLabel(t.label).setValue(t.key).setEmoji(t.emoji)))
       ),
     ],
-  });
+  };
+  return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
+}
+
+async function handlePickTeamDifficulty(interaction, size, difficulty) {
+  if (!PARTY_SIZES[size]) {
+    return interaction.update({ embeds: [emptyPage("Unknown size", "Try again.").embed], components: [] });
+  }
+  if (!PARTY_DIFFICULTY[difficulty]) {
+    return interaction.update({ embeds: [emptyPage("Unknown difficulty", "Try again.").embed], components: [] });
+  }
+  return renderTeamCategoryPicker(interaction, size, difficulty);
 }
 
 /**
@@ -1138,30 +1363,109 @@ async function handleTeamChoose(interaction, size, difficulty, tree, { free = fa
   return interaction.update(renderPickSession(getPickSession(interaction.guildId, interaction.user.id)));
 }
 
-/** The creator skipped the hand-pick — keep the token, go straight to the random flow. */
-async function handleTeamRandom(interaction, size, difficulty, tree) {
+/**
+ * Shows what the team's shared target is about to be and requires the
+ * creator to Confirm before the pick is actually locked in for the team —
+ * same reasoning as the solo Boss/Raid preview: teammates were ending up on
+ * bosses nobody on the team could do. The pick itself is stashed in the same
+ * `pendingTeamPicks` map a real hand-pick already uses, so Confirm just
+ * continues into the ordinary Pick Teammates / Post Open Listing flow
+ * (handleTeamMode) exactly as if the creator had hand-picked it themselves —
+ * no separate insert path is needed. Cancel clears the stash and goes back
+ * to category selection, free, same as the solo side.
+ */
+async function renderTeamTargetConfirm(interaction, size, difficulty, tree, picks) {
+  const treeLabel = TREE_BY_KEY[tree]?.label || tree;
+  const diffLabel = PARTY_DIFFICULTY[difficulty]?.label || difficulty;
+  const kind = treeKind(tree);
+  const list = picks.map((p) => targetLabel(kind, p)).join(", ");
+
+  const payload = {
+    embeds: [
+      emptyPage(
+        kind === "raid" ? "⚔️ Confirm The Team's Raid" : "🎯 Confirm The Team's Target",
+        `**${size} • ${diffLabel} • ${treeLabel}**\n\n` +
+        `🎯 **${list}**\n\n` +
+        "Confirm to lock this in and continue building the team, or cancel to go back and pick a different category — no cost either way."
+      ).embed,
+    ],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`hm_team_target_confirm:${size}:${difficulty}:${tree}`).setLabel("✅ Confirm").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`hm_team_target_cancel:${size}:${difficulty}:${tree}`).setLabel("✖ Cancel").setStyle(ButtonStyle.Danger)
+      ),
+    ],
+  };
+  return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
+}
+
+async function handleTeamTargetConfirm(interaction, size, difficulty, tree) {
   return handleTeamMode(interaction, size, difficulty, tree);
+}
+
+async function handleTeamTargetCancel(interaction, size, difficulty, tree) {
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+  // A preview pick never spends a token (a random roll is free; a Raids pick
+  // is always free; and a token hand-pick's own Cancel is handled the same
+  // way here too, below) — so there's nothing to refund, only to clear.
+  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, null, false);
+  return renderTeamCategoryPicker(interaction, size, difficulty);
+}
+
+/**
+ * The creator skipped the hand-pick on a Boss category — rolls a preview
+ * target right now (using only the creator's own hiscores as the safety
+ * baseline, since teammates aren't chosen yet) and shows it for
+ * confirm-or-cancel, same as a solo Boss quest. Skill and Minigame
+ * categories are unaffected — they still roll at team-finalization time,
+ * same as before this feature existed.
+ */
+async function handleTeamRandom(interaction, size, difficulty, tree) {
+  if (treeKind(tree) !== "boss") {
+    return handleTeamMode(interaction, size, difficulty, tree);
+  }
+
+  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
+  const member = await getMember(interaction.user.id);
+  let baselines = null;
+  if (member?.rsn) {
+    const snap = await fetchHiscores(member.rsn);
+    if (snap) baselines = { [interaction.user.id]: snap };
+  }
+
+  const targets = buildPartyTargets(tree, size, difficulty, baselines, null, null);
+  const picks = Object.keys(targets.bosses);
+  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, picks, false);
+  return renderTeamTargetConfirm(interaction, size, difficulty, tree, picks);
 }
 
 /** The creator confirmed their picks: spend the token now (same timing as
  *  the solo flow) and stash the result for whichever finalize step the
  *  creator reaches next (handleCreateTeam or handlePostOpenTeam). If the
  *  token is somehow already gone (e.g. spent in another tab a moment ago),
- *  fall back to the random flow rather than leaving the creator stuck. */
+ *  fall back to the random flow rather than leaving the creator stuck. A
+ *  Boss hand-pick also goes through the same confirm-or-cancel preview as
+ *  everything else in this category; Skill/Minigame hand-picks don't need
+ *  one (the picker UI they just used already showed exactly what they
+ *  chose), so they go straight into handleTeamMode as before. */
 async function handleTeamPickTarget(interaction, size, difficulty, tree, picks) {
   await interaction.deferUpdate();
   const used = await consumeItem(interaction.user.id, "quest_choice_token");
-  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, used ? picks : null, used);
+  const finalPicks = used ? picks : null;
+  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, finalPicks, used);
+  if (used && treeKind(tree) === "boss") {
+    return renderTeamTargetConfirm(interaction, size, difficulty, tree, finalPicks);
+  }
   return handleTeamMode(interaction, size, difficulty, tree);
 }
 
 /** The creator confirmed which raid(s) the team targets. No token is ever
- *  involved — a Raids pick is mandatory, not a paid extra — so this just
- *  stashes the pick with tokenConsumed: false and moves on. */
+ *  involved — a Raids pick is mandatory, not a paid extra. Raids always get
+ *  the confirm-or-cancel preview, same reasoning as the solo side. */
 async function handleTeamRaidPickTarget(interaction, size, difficulty, tree, picks) {
   await interaction.deferUpdate();
   setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, picks, false);
-  return handleTeamMode(interaction, size, difficulty, tree);
+  return renderTeamTargetConfirm(interaction, size, difficulty, tree, picks);
 }
 
 
@@ -1660,6 +1964,34 @@ async function handleBuyBoost(interaction, value) {
   });
 }
 
+/** Prestige is a one-time, permanent, account-wide purchase — not per
+ *  category like a Perk or Item, and there's nothing to activate afterward
+ *  like a Boost. Button lives on the main Shop panel, not a sub-menu. */
+async function handleBuyPrestige(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const member = await getMember(interaction.user.id);
+  if (!member?.rsn) {
+    return interaction.editReply({ content: "Run `/register` first." });
+  }
+
+  const result = await buyPrestige({ guildId: interaction.guildId, userId: interaction.user.id });
+  if (result.error) {
+    return interaction.editReply({ embeds: [emptyPage("Purchase failed", result.error).embed] });
+  }
+
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    embeds: [
+      emptyPage(
+        `${PRESTIGE_EMOJI} You're Prestiged!`,
+        `Every quest you finish from now on — solo or team — pays extra HM and Rank XP, forever. ` +
+        `You'll show ${PRESTIGE_EMOJI} next to your name on the quest board and in the database.\n\n` +
+        `Cost \`${PRESTIGE_COST.toLocaleString()}\` • Balance \`${result.balance.toLocaleString()}\``
+      ).embed,
+    ],
+  });
+}
+
 async function handleShopConsumables(interaction) {
   const bal = await getBalance(interaction.user.id);
   const options = Object.entries(CONSUMABLES).map(([key, spec]) =>
@@ -1961,13 +2293,17 @@ async function routeInteraction(interaction) {
 
     if (interaction.isButton()) {
       const btnId = interaction.customId;
+      if (btnId.startsWith("hm_pick_skill_difficulty:")) {
+        const [, questType, tree, difficulty] = btnId.split(":");
+        return await handleSkillDifficultyChosen(interaction, questType, tree, difficulty);
+      }
       if (btnId.startsWith("hm_quest_choose:")) {
-        const [, questType, tree] = btnId.split(":");
-        return await handleQuestChoose(interaction, questType, tree);
+        const [, questType, tree, difficulty] = btnId.split(":");
+        return await handleQuestChoose(interaction, questType, tree, difficulty);
       }
       if (btnId.startsWith("hm_quest_random:")) {
-        const [, questType, tree] = btnId.split(":");
-        return await handleCreateSolo(interaction, questType, tree);
+        const [, questType, tree, difficulty] = btnId.split(":");
+        return await handleCreateSolo(interaction, questType, tree, null, false, difficulty);
       }
       if (btnId.startsWith("hm_cancel_quest:")) {
         const questId = btnId.split(":")[1];
@@ -1980,6 +2316,14 @@ async function routeInteraction(interaction) {
       if (btnId.startsWith("hm_team_random:")) {
         const [, size, difficulty, tree] = btnId.split(":");
         return await handleTeamRandom(interaction, size, difficulty, tree);
+      }
+      if (btnId.startsWith("hm_team_target_confirm:")) {
+        const [, size, difficulty, tree] = btnId.split(":");
+        return await handleTeamTargetConfirm(interaction, size, difficulty, tree);
+      }
+      if (btnId.startsWith("hm_team_target_cancel:")) {
+        const [, size, difficulty, tree] = btnId.split(":");
+        return await handleTeamTargetCancel(interaction, size, difficulty, tree);
       }
       if (btnId.startsWith("hm_team_pick_members:")) {
         const [, size, difficulty, tree] = btnId.split(":");
@@ -1994,6 +2338,9 @@ async function routeInteraction(interaction) {
         case "hm_pick_session_prev": return await handlePickSessionPage(interaction, -1);
         case "hm_pick_session_next": return await handlePickSessionPage(interaction, 1);
         case "hm_pick_session_clear": return await handlePickSessionClear(interaction);
+        case "hm_solo_target_confirm": return await handleSoloTargetConfirm(interaction);
+        case "hm_solo_target_cancel": return await handleSoloTargetCancel(interaction);
+        case "hm_buy_prestige": return await handleBuyPrestige(interaction);
         case "hm_quest_start": return await handleQuestStart(interaction);
         case "hm_team_start": return await handleTeamStart(interaction);
         case "hm_check": return await handleCheck(interaction);
@@ -2094,6 +2441,48 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
+// ── Daily Skip Token auto-grant ─────────────────────────────────────────────
+/**
+ * Every registered member gets 1 free Quest Skip Token at midnight America/
+ * Chicago — UNLESS they already own one. Idempotent across restarts: the
+ * last grant date is stored in bot_config (`last_skip_token_grant_date`) and
+ * compared against `dayStamp()` (the same America/Chicago day-stamp every
+ * other reset in this codebase already uses), so a check that runs many
+ * times a day only ever actually grants once per real calendar day.
+ */
+async function grantDailySkipTokens(guildId) {
+  const supabase = getSupabase();
+  if (!supabase) return;
+
+  const today = dayStamp();
+  const last = await getConfigValue(guildId, "last_skip_token_grant_date");
+  if (last === today) return;
+
+  const { data: members } = await supabase
+    .from("hm_members")
+    .select("user_id")
+    .eq("guild_id", guildId)
+    .eq("active", true);
+
+  let granted = 0;
+  for (const m of members || []) {
+    const { data: existing } = await supabase
+      .from("hm_inventory")
+      .select("quantity")
+      .eq("user_id", m.user_id)
+      .eq("tree", "quest_skip_token")
+      .eq("boost_tier", 0)
+      .maybeSingle();
+    if ((Number(existing?.quantity) || 0) > 0) continue; // already owns one
+
+    const ok = await grantConsumable(m.user_id, guildId, "quest_skip_token");
+    if (ok) granted += 1;
+  }
+
+  await setConfigValue(guildId, "last_skip_token_grant_date", today);
+  if (granted) console.log(`[Honour Marks] Auto-granted ${granted} daily Skip Token(s) in guild ${guildId}.`);
+}
+
 client.once(Events.ClientReady, async () => {
   console.log(`[Honour Marks] Online as ${client.user.tag}`);
 
@@ -2137,6 +2526,40 @@ client.once(Events.ClientReady, async () => {
       await refreshPanels(guild.id).catch(() => {});
     }
   }, config.syncIntervalMs).unref?.();
+
+  // Daily Skip Token auto-grant — checked on the same cadence as the expiry
+  // sweep; grantDailySkipTokens is itself a same-day no-op once it has
+  // already run, so running this often just means it fires close to
+  // midnight rather than waiting up to a full extra cycle.
+  const grantSkipTokens = async () => {
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        await grantDailySkipTokens(guild.id);
+      } catch (e) {
+        console.error("[Honour Marks] Daily Skip Token grant failed:", e.message);
+      }
+    }
+  };
+  await grantSkipTokens();
+  setInterval(grantSkipTokens, config.expirySweepMs).unref?.();
+
+  // Clan Pool — evaluates clan-wide progress, lazily tracks new members, and
+  // completes + immediately restarts the quest once the target is hit.
+  const clanPoolTick = async () => {
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        const result = await checkClanQuestProgress(guild.id);
+        if (result?.completed) {
+          scheduleRefresh(guild.id);
+          console.log(`[Honour Marks] Clan Pool quest completed in guild ${guild.id} (${result.finished?.quest_type}).`);
+        }
+      } catch (e) {
+        console.error("[Honour Marks] Clan Pool check failed:", e.message);
+      }
+    }
+  };
+  await clanPoolTick();
+  setInterval(clanPoolTick, config.expirySweepMs).unref?.();
 
   for (const guild of client.guilds.cache.values()) {
     await refreshPanels(guild.id).catch(() => {});

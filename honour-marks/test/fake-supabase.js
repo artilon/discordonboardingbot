@@ -34,6 +34,7 @@ function matchFilters(row, filters) {
     }
     if (op === "ilike") return String(cell || "").toLowerCase() === String(val || "").toLowerCase();
     if (op === "contains") return Array.isArray(cell) && val.every((v) => cell.includes(v));
+    if (op === "in") return Array.isArray(val) && val.some((v) => String(cell) === String(v));
     return true;
   });
 }
@@ -61,7 +62,7 @@ function createFakeSupabase(tables = {}) {
       insert(payload) { q.op = "insert"; q.opLocked = true; q.payload = payload; return api; },
       update(payload) { q.op = "update"; q.opLocked = true; q.payload = payload; return api; },
       delete() { q.op = "delete"; q.opLocked = true; return api; },
-      upsert(payload) { q.op = "upsert"; q.opLocked = true; q.payload = payload; return api; },
+      upsert(payload, opts) { q.op = "upsert"; q.opLocked = true; q.payload = payload; q.onConflict = opts?.onConflict; return api; },
       eq(col, val) { q.filters.push([col, "eq", val]); return api; },
       is(col, val) { q.filters.push([col, "is", val]); return api; },
       lte(col, val) { q.filters.push([col, "lte", val]); return api; },
@@ -70,6 +71,7 @@ function createFakeSupabase(tables = {}) {
       gt(col, val) { q.filters.push([col, "gt", val]); return api; },
       ilike(col, val) { q.filters.push([col, "ilike", val]); return api; },
       contains(col, val) { q.filters.push([col, "contains", val]); return api; },
+      in(col, vals) { q.filters.push([col, "in", vals]); return api; },
       order(col, opts = {}) { q.order.push([col, opts.ascending !== false]); return api; },
       limit(n) { q.limit = n; return api; },
       maybeSingle() { q.single = true; return api; },
@@ -83,10 +85,15 @@ function createFakeSupabase(tables = {}) {
           for (const p of payloads) {
             const row = { id: nextId++, ...p };
             if (q.op === "upsert") {
-              // onConflict is ignored; simulate a primary-key merge on user_id
-              const key = Object.keys(p).includes("page_index")
-                ? { guild_id: p.guild_id, panel_key: p.panel_key, page_index: p.page_index }
-                : { user_id: p.user_id };
+              // Prefers the real `onConflict` columns when given (matches real
+              // PostgREST upsert semantics); falls back to the old hard-coded
+              // guesses for callers written before onConflict was captured.
+              const conflictCols = q.onConflict
+                ? q.onConflict.split(",").map((c) => c.trim())
+                : Object.keys(p).includes("page_index")
+                  ? ["guild_id", "panel_key", "page_index"]
+                  : ["user_id"];
+              const key = Object.fromEntries(conflictCols.map((c) => [c, p[c]]));
               const existing = rows.find((r) =>
                 Object.entries(key).every(([k, v]) => String(r[k]) === String(v))
               );
@@ -95,6 +102,10 @@ function createFakeSupabase(tables = {}) {
             rows.push(row);
             out.push(row);
           }
+          // Real PostgREST honours a trailing .maybeSingle() after an
+          // insert/upsert too (e.g. `.upsert(x).select("*").maybeSingle()`),
+          // collapsing the array to its one row instead of leaving an array.
+          if (q.single) return resolve({ data: out[0] || null, error: null });
           return resolve({ data: out, error: null });
         }
 

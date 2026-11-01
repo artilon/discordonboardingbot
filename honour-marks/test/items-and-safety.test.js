@@ -274,7 +274,7 @@ async function registerMember(userId, rsn) {
 
     const row = fake.db.hm_quests.find((r) => r.user_id === "u-reduce");
     const [value] = Object.values(row.targets.skills);
-    assert.strictEqual(value, Math.round(20000 * 0.9), "base 20000 xp -10% = 18000");
+    assert.strictEqual(value, Math.round(12500 * 0.9), "base Easy-daily 12,500 xp -10% = 11,250");
   });
 
   await check("a Quest Expansion item on a skill quest adds extra full targets and scales the reward proportionally", async () => {

@@ -165,10 +165,10 @@ check("an invalid pick is topped up with a random one from the real pool, never 
   assert.ok(q.SKILLS_BY_TREE.gathering.includes(picked[0]), "falls back into the real pool");
 });
 
-check("a monthly skill quest needing 2 picks keeps both valid choices", () => {
-  const t = q.buildSoloTargets("gathering", "monthly", ["mining", "woodcutting"]);
+check("a monthly Medium skill quest needing 2 picks keeps both valid choices", () => {
+  const t = q.buildSoloTargets("gathering", "monthly", ["mining", "woodcutting"], null, null, "medium");
   assert.deepStrictEqual(Object.keys(t.skills).sort(), ["mining", "woodcutting"]);
-  assert.strictEqual(t.skills.mining, 150000);
+  assert.strictEqual(t.skills.mining, 125000);
 });
 
 check("no picks at all still produces a valid random target (unchanged default behaviour)", () => {
@@ -177,10 +177,17 @@ check("no picks at all still produces a valid random target (unchanged default b
 });
 
 check("soloTargetPool exposes the exact pool and count the picker UI needs", () => {
-  const spec = q.soloTargetPool("combat", "monthly");
+  const spec = q.soloTargetPool("combat", "monthly", 0, "medium");
   assert.strictEqual(spec.kind, "skill");
   assert.strictEqual(spec.count, 2);
   assert.deepStrictEqual(spec.pool, q.SKILLS_BY_TREE.combat);
+});
+
+check("soloTargetPool defaults to Easy (1 skill) for a skill-tree quest with no difficulty given", () => {
+  const spec = q.soloTargetPool("combat", "monthly");
+  assert.strictEqual(spec.kind, "skill");
+  assert.strictEqual(spec.count, 1);
+  assert.strictEqual(spec.value, q.SOLO_SKILL_XP.monthly.easy);
 });
 
 console.log("\n[rewards]");

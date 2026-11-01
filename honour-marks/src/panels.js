@@ -5,9 +5,17 @@ const {
 } = require("discord.js");
 const { getSupabase, getConfigValue, setConfigValue } = require("./db");
 const { getRankForXp, formatRankProgress, RANK_TIERS } = require("./ranks");
-const { TREES, TREE_BY_KEY, PARTY_SIZES, PARTY_DIFFICULTY, LFG_EXPIRY_HOURS, MAX_ACTIVE_PARTY_QUESTS, treeKind, getMember } = require("./quests");
+const {
+  TREES, TREE_BY_KEY, PARTY_SIZES, PARTY_DIFFICULTY, SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES, SOLO_SKILL_XP,
+  LFG_EXPIRY_HOURS, MAX_ACTIVE_PARTY_QUESTS, treeKind, getMember,
+} = require("./quests");
 const { SKILL_LABELS, bossLabel, fetchHiscores, diffProgress } = require("./jagex");
 const { checkPartyQuest } = require("./progress");
+const { PRESTIGE_COST, PRESTIGE_HM_BONUS_PCT, PRESTIGE_RANK_XP_BONUS_PCT, PRESTIGE_EMOJI, isPrestiged, getPrestigedSet } = require("./shop");
+const {
+  CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI, CLAN_BOOST_PCT, CLAN_BOOST_LABELS,
+  ensureClanQuest, getActiveClanBoost,
+} = require("./clanpool");
 
 /** Pretty label for a hand-picked target key (skill or boss/raid/minigame). */
 function pickLabel(tree, key) {
@@ -128,11 +136,14 @@ async function renderDatabase(guildId) {
     ];
   }
 
+  const prestiged = await getPrestigedSet(rows.map((r) => r.user_id));
+
   const lines = rows.map((r) => {
     const total = (Number(r.solo_daily) || 0) + (Number(r.solo_weekly) || 0) +
       (Number(r.solo_monthly) || 0) + (Number(r.duo) || 0) + (Number(r.trio) || 0) + (Number(r.quad) || 0);
+    const prestigeTag = prestiged.has(r.user_id) ? ` ${PRESTIGE_EMOJI}` : "";
     return (
-      `**${r.rsn}** — ${HM_EMOJI} \`${(Number(r.balance) || 0).toLocaleString()}\` held • ` +
+      `**${r.rsn}**${prestigeTag} — ${HM_EMOJI} \`${(Number(r.balance) || 0).toLocaleString()}\` held • ` +
       `\`${(Number(r.total_earned) || 0).toLocaleString()}\` earned total\n` +
       `┗ Quests \`${total}\` • D \`${r.solo_daily || 0}\` · W \`${r.solo_weekly || 0}\` · M \`${r.solo_monthly || 0}\` · ` +
       `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\``
@@ -194,7 +205,8 @@ function formatProgressParts(parts) {
 async function formatSoloQuestLine(q) {
   const targetLabels = targetLabelsFromTargets(q.targets).join(", ") || "?";
   const expiresAt = `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`;
-  const head = `• <@${q.user_id}> — ${q.quest_type} • ${q.tree} • 🎯 **${targetLabels}**`;
+  const prestigeTag = (await isPrestiged(q.user_id).catch(() => false)) ? ` ${PRESTIGE_EMOJI}` : "";
+  const head = `• <@${q.user_id}>${prestigeTag} — ${q.quest_type} • ${q.tree} • 🎯 **${targetLabels}**`;
 
   const member = await getMember(q.user_id).catch(() => null);
   if (!member?.rsn) return `${head}\n   ┗ _not registered — progress unavailable_ • ends ${expiresAt}`;
@@ -215,7 +227,8 @@ async function formatSoloQuestLine(q) {
 async function formatTeamQuestLine(q) {
   const targetLabels = targetLabelsFromTargets(q.targets).join(", ") || "?";
   const expiresAt = `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`;
-  const membersMention = q.members.map((m) => `<@${m}>`).join(", ");
+  const prestiged = await getPrestigedSet(q.members).catch(() => new Set());
+  const membersMention = q.members.map((m) => `<@${m}>${prestiged.has(m) ? ` ${PRESTIGE_EMOJI}` : ""}`).join(", ");
   const head = `• **${q.size}** • ${q.tree} • 🎯 **${targetLabels}** — ${membersMention}`;
 
   const evaluated = await checkPartyQuest(q).catch(() => null);
@@ -373,6 +386,59 @@ async function renderOpenTeams(guildId) {
   return [{ embed, components }];
 }
 
+// ── Clan Pool ────────────────────────────────────────────────────────────────
+/**
+ * The one shared monthly clan quest, plus any currently-running clan-wide
+ * reward boost — both always visible here, including the boost's remaining
+ * time, so nobody has to ask a staff member what's active. Read-only: the
+ * quest and boost are both driven entirely by `checkClanQuestProgress`
+ * (src/clanpool.js) on a timer in index.js, never by anything clicked here.
+ */
+async function renderClanPool(guildId) {
+  const supabase = getSupabase();
+  if (!supabase) return [emptyPage("🏆 Clan Pool", "Database unavailable.")];
+
+  const quest = await ensureClanQuest(guildId).catch(() => null);
+  const boost = await getActiveClanBoost(guildId).catch(() => null);
+
+  const lines = [];
+  if (quest) {
+    const label = CLAN_QUEST_LABELS[quest.quest_type] || quest.quest_type;
+    const emoji = CLAN_QUEST_EMOJI[quest.quest_type] || "🏆";
+    const baselineCount = Object.keys(quest.baselines || {}).length;
+    lines.push(
+      `${emoji} **${label}** — target **${Number(quest.target).toLocaleString()}**\n` +
+      `┗ Tracking **${baselineCount}** registered member${baselineCount === 1 ? "" : "s"}. ` +
+      `Everyone's gains since the quest started count toward the shared total.`
+    );
+  } else {
+    lines.push("_No active Clan Pool quest right now — one will start automatically._");
+  }
+
+  lines.push("");
+  if (boost) {
+    const label = CLAN_BOOST_LABELS[boost.kind] || boost.kind;
+    const expiresAt = Math.floor(new Date(boost.expires_at).getTime() / 1000);
+    lines.push(`🔥 **Active clan-wide boost:** ${label} — ends <t:${expiresAt}:R>`);
+  } else {
+    lines.push("_No clan-wide boost active right now._ One is awarded automatically the moment the Clan Pool quest completes.");
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("🏆 Clan Pool")
+    .setDescription(
+      "One shared monthly quest the WHOLE clan works toward together. The moment it's finished, a new one " +
+      `starts right away — there's never a gap. Completing it also awards a clan-wide boost (${CLAN_BOOST_PCT}%, ` +
+      "up to 1 week) that applies to EVERY member automatically, no activation needed.\n\n" +
+      lines.join("\n")
+    )
+    .setFooter({ text: "Odinheim • Honour Marks" })
+    .setTimestamp();
+
+  return [{ embed, components: [] }];
+}
+
 // ── Role self-service ────────────────────────────────────────────────────────
 /**
  * The claim panel.
@@ -464,20 +530,29 @@ async function renderShop(guildId) {
       `${boostLines.join("\n")}\n\n` +
       `**🎫 Consumables — one-time use, spent the moment you use them**\n` +
       `🎫 **Quest Skip Token** (4 ${HM_EMOJI}) — cancel an active solo quest, no penalty\n` +
-      `🎯 **Quest Choice Token** (50 ${HM_EMOJI}) — hand-pick your next quest's target`
+      `🎯 **Quest Choice Token** (50 ${HM_EMOJI}) — hand-pick your next quest's target\n\n` +
+      `${PRESTIGE_EMOJI} **Prestige — permanent, one-time, account-wide** (${PRESTIGE_COST.toLocaleString()} ${HM_EMOJI}) — ` +
+      `+${PRESTIGE_RANK_XP_BONUS_PCT}% Rank XP and +${PRESTIGE_HM_BONUS_PCT}% HM on EVERY quest you finish, solo or team, forever. ` +
+      `Unlike a Perk, it isn't per-category — it applies everywhere at once, and there's only one tier. ` +
+      `A Prestiged member shows ${PRESTIGE_EMOJI} next to their name on the quest board and in the database.`
     )
     .setFooter({ text: "Odinheim • Honour Marks Shop" })
     .setTimestamp();
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("hm_shop_perks").setLabel("🎖️ Perks").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("hm_shop_items").setLabel("🗃️ Items").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("hm_shop_boosts").setLabel("⚡ Boosts").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("hm_shop_consumables").setLabel("🎫 Consumables").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("hm_inventory").setLabel("🎒 Inventory").setStyle(ButtonStyle.Secondary)
-  );
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("hm_shop_perks").setLabel("🎖️ Perks").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("hm_shop_items").setLabel("🗃️ Items").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("hm_shop_boosts").setLabel("⚡ Boosts").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("hm_shop_consumables").setLabel("🎫 Consumables").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("hm_inventory").setLabel("🎒 Inventory").setStyle(ButtonStyle.Secondary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("hm_buy_prestige").setLabel(`${PRESTIGE_EMOJI} Buy Prestige`).setStyle(ButtonStyle.Success)
+    ),
+  ];
 
-  return [{ embed, components: [row] }];
+  return [{ embed, components: rows }];
 }
 
 // ── Guide ────────────────────────────────────────────────────────────────────
@@ -520,11 +595,12 @@ function renderGuide(setup = {}) {
         `your very first click to the exact numbers behind every quest type. What's in it, in order:\n` +
         `1. The Basics (this page) • 2. Your First 10 Minutes • 3. Solo Quests In Detail • ` +
         `4. Boss PvM, Raids & Minigames Explained • 5. Team Quests Step By Step • ` +
+        `5b. Team Quests — Requirements & Rewards • ` +
         `6. Looking For Group Step By Step • 7. Checking Progress & Collecting Rewards • ` +
-        `8. Shop: Perks • 8b. Shop: Items • 9. Boss PvM Safety Check • 10. Weighted Skill Rolls • ` +
-        `11. Shop: Boosts • 12. Shop: Consumables • 13. Your Inventory • ` +
-        `14. How This Affects Your Clan Rank • 15. Commands & Where To Look Things Up • ` +
-        `16. Troubleshooting & FAQ.\n\n` +
+        `8. Shop: Perks • 8b. Shop: Items • 8c. Shop: Prestige • 9. Boss PvM Safety Check • ` +
+        `10. Weighted Skill Rolls • 11. Shop: Boosts • 12. Shop: Consumables • 13. Your Inventory • ` +
+        `14. The Clan Pool (Monthly Clan-Wide Quest) • 15. How This Affects Your Clan Rank • ` +
+        `16. Commands & Where To Look Things Up • 17. Troubleshooting & FAQ.\n\n` +
         `If you only read one more page right now, make it the next one.`,
     },
     {
@@ -571,20 +647,34 @@ function renderGuide(setup = {}) {
         `hand-picking the exact target yourself or rolling randomly anyway. **Raids are the one exception** — ` +
         `you always pick exactly which raid yourself, for free, with no random option and no token needed ` +
         `(see Page 4 for why).\n\n` +
+        `**Boss PvM and Raids always show a confirm/cancel preview before the quest actually starts** — once ` +
+        `your target is picked (randomly or by hand), the bot shows you exactly what it rolled and you must ` +
+        `press ✅ Confirm before anything is saved. Pressing ✖ Cancel costs nothing — no HM, no Skip Token — ` +
+        `and simply sends you back to pick a category again. This exists specifically so no one gets quietly ` +
+        `assigned a boss they can't actually do yet (see Page 4).\n\n` +
+        `**Skilling quests have a difficulty picker**, exactly like team quests: after choosing a Gathering, ` +
+        `Production, Combat, or Utility category, you pick 🟢 **Easy** (1 skill), 🟡 **Medium** (2 skills), ` +
+        `🔴 **Hard** (3 skills), or 🟣 **Extreme** (4 skills). Each tier up raises the XP needed **per skill** ` +
+        `by 25% over the last, and scales the HM + Rank XP reward up by the exact same multiplier (1×/2×/3×/4×) ` +
+        `— so Extreme asks for 4x the targets at 1.75x the XP each, for 4x the reward. Boss PvM, Raids, and ` +
+        `Minigame quests don't have a difficulty picker — they stay a single flat target regardless of length.\n\n` +
         `**Exact requirements**, by category type and length — when a quest needs more than one target, EACH ` +
         `one individually needs the full amount shown below; they are never split or added together:\n\n` +
-        `**Skill categories** (Gathering, Production, Combat, Utility) — gain this much XP in one skill ` +
-        `(two *different* skills for Monthly):\n` +
-        `• Daily — 1 skill, 20,000 XP • Weekly — 1 skill, 75,000 XP • Monthly — 2 skills, 150,000 XP **each**\n\n` +
+        `**Skill categories** (Gathering, Production, Combat, Utility) — XP needed in EACH skill, by tier:\n` +
+        `• Daily — 🟢 12,500 • 🟡 15,625 • 🔴 18,750 • 🟣 21,875\n` +
+        `• Weekly — 🟢 50,000 • 🟡 62,500 • 🔴 75,000 • 🟣 87,500\n` +
+        `• Monthly — 🟢 100,000 • 🟡 125,000 • 🔴 150,000 • 🟣 175,000\n\n` +
         `**Boss PvM** — kill count on one boss (see Page 4 for which ones are possible):\n` +
         `• Daily — 15 KC • Weekly — 40 KC • Monthly — 100 KC\n\n` +
         `**Raids** — clears of one raid (any difficulty mode counts the same):\n` +
         `• Daily — 3 clears • Weekly — 8 clears • Monthly — 20 clears\n\n` +
         `**Minigames** — completions of one minigame:\n` +
         `• Daily — 5 completions • Weekly — 15 completions • Monthly — 40 completions\n\n` +
-        `**Rewards** (flat — a Perk can raise the HM, see Page 8):\n` +
-        `• Daily — 50 ${HM_EMOJI} + 100 Rank XP • Weekly — 150 ${HM_EMOJI} + 250 Rank XP • ` +
-        `Monthly — 400 ${HM_EMOJI} + 750 Rank XP\n\n` +
+        `**Rewards** (before a Perk/Item/Prestige bonus, see Pages 8, 8b & 8c) — Boss PvM, Raids, and ` +
+        `Minigames are always the flat Easy-tier number below; a skilling quest's reward scales up with ` +
+        `whichever difficulty you picked (🟡 2×, 🔴 3×, 🟣 4× the 🟢 numbers shown):\n` +
+        `• Daily — 50 ${HM_EMOJI} + 100 Rank XP (🟢) • Weekly — 150 ${HM_EMOJI} + 250 Rank XP (🟢) • ` +
+        `Monthly — 400 ${HM_EMOJI} + 750 Rank XP (🟢)\n\n` +
         `**If time runs out before you finish**, the quest is removed automatically with no penalty beyond ` +
         `losing the slot. You still get paid ${HM_EMOJI} HM for the percentage of the target you actually ` +
         `reached (e.g. 40% progress = 40% of the HM reward, rounded), but **zero Rank XP** — Rank XP only pays ` +
@@ -623,6 +713,14 @@ function renderGuide(setup = {}) {
         `it on once you're always choosing anyway.\n\n` +
         `**Minigames** are rolled from: Guardians of the Rift, Wintertodt, Tempoross, Soul Wars, and Last Man ` +
         `Standing. One completion = one full round, as counted by the OSRS hiscores for that activity.\n\n` +
+        `**Confirm or cancel, before anything starts.** Because a random Boss PvM (or hand-picked Raids) roll ` +
+        `used to sometimes hand someone a fight they genuinely couldn't do yet, both now stop and show you ` +
+        `exactly what was picked before saving anything — you get a ✅ Confirm button to actually start it and ` +
+        `a ✖ Cancel button that costs absolutely nothing (no HM, no Skip Token) and just returns you to picking ` +
+        `a category again, as many times as you want. For a **solo** quest this preview is shown to you alone; ` +
+        `for a **team** quest, it's shown only to whoever is CREATING the team, before teammates are picked or ` +
+        `the listing is posted — once confirmed, that target is locked in for the whole team. Skill and ` +
+        `Minigame quests skip this step entirely and start the instant you finish picking, same as always.\n\n` +
         `All of this applies to BOTH solo and team quests — team quests draw from exactly the same pools, just ` +
         `with higher combined targets split across more people (Page 5).`,
     },
@@ -651,12 +749,21 @@ function renderGuide(setup = {}) {
         `happen — teammates and later joiners never get this choice, and it's locked in before the team is ` +
         `finalized specifically so that anyone browsing the **Looking For Group** board can see the chosen ` +
         `target(s) before deciding whether to join (Page 6).\n` +
+        `4c. **If the category is Boss PvM or Raids**, you (the creator) see a confirm/cancel preview of the ` +
+        `exact target(s) rolled or picked before the team is finalized — ✅ Confirm locks it in for the whole ` +
+        `team, ✖ Cancel costs nothing and sends you back to pick a category again (Page 4). Teammates never see ` +
+        `this step themselves; it's decided once, by the creator, before anyone else is involved.\n` +
         `5. Choose how to fill the rest of the team:\n` +
         `　• **Pick Teammates** — a member picker opens where you select the exact number of other people ` +
         `needed (1 for Duo, 2 for Trio, 3 for Quad). Everyone picked must already be registered with ` +
         `\`/register\`, or it fails to create. The quest starts **immediately** once confirmed.\n` +
         `　• **📋 Post Open Listing** — skips picking anyone; instead it posts a public listing to the ` +
-        `**Looking For Group** board (Page 6) and starts automatically once enough other members join it.\n\n` +
+        `**Looking For Group** board (Page 6) and starts automatically once enough other members join it.`,
+    },
+    {
+      short: "Team Quest Rewards",
+      title: "👥 Step 4b: Team Quests — Requirements & Rewards",
+      body:
         `**Per-target requirement**, by category and size — the team's combined gains must reach the full ` +
         `amount on EACH target, same "never split or summed together across targets" rule as solo quests. ` +
         `Difficulty only changes how many of these targets the quest has (1/2/3), never the amount per target:\n\n` +
@@ -792,6 +899,26 @@ function renderGuide(setup = {}) {
         `safe, each needing proportionally more kills instead, so the total grind and reward stay the same.`,
     },
     {
+      short: "Shop: Prestige",
+      title: "🌟 Step 7c: The Shop — Prestige, Step By Step",
+      body:
+        `**Prestige** is a **one-time, permanent, account-wide** purchase — unlike a Perk or Item, it isn't ` +
+        `bought per category, it's bought exactly **once ever** and then applies to absolutely every quest you ` +
+        `finish, forever, in every category at the same time.\n\n` +
+        `**Cost:** ${PRESTIGE_COST.toLocaleString()} ${HM_EMOJI}, paid once.\n\n` +
+        `**What it does, the moment you buy it:**\n` +
+        `• +${PRESTIGE_RANK_XP_BONUS_PCT}% Rank XP on every quest you finish from then on (solo or team).\n` +
+        `• +${PRESTIGE_HM_BONUS_PCT}% ${HM_EMOJI} HM on every quest you finish from then on (solo or team).\n\n` +
+        `**It stacks with everything else** — Perks, Items, Boosts, and Clan Pool boosts (Page 14) all still ` +
+        `apply on top of Prestige exactly as normal; Prestige is simply one more multiplier in the mix, it ` +
+        `never replaces or caps out any of the others.\n\n` +
+        `**Buying it:** open ${shopCh} and press the **${PRESTIGE_EMOJI} Prestige** button — it's bought ` +
+        `**immediately** if you can afford it, with no confirmation step, and can't be sold back or refunded.\n\n` +
+        `**You'll always be shown as Prestiged afterward** — a ${PRESTIGE_EMOJI} tag appears right next to your ` +
+        `name both on the quest board (next to any quest you have active) and in ${dbCh}, so everyone can see ` +
+        `who's reached it at a glance. Buying it again once you already own it does nothing and isn't offered.`,
+    },
+    {
       short: "Boss Safety Check",
       title: "🛡️ How The Boss PvM Safety Check Works",
       body:
@@ -872,9 +999,16 @@ function renderGuide(setup = {}) {
       body:
         `Consumables are **one-time use** — buying one just adds it to your **Inventory**, and it's spent the ` +
         `moment you actually use it. Buying it alone does nothing by itself.\n\n` +
-        `**🎫 Quest Skip Token — 4 HM.** Instantly cancels one active **solo** quest. No reward, no penalty — ` +
-        `it disappears and that slot is immediately free for a new quest. Doesn't work on team quests.\n` +
-        `Step by step:\n` +
+        `**🎫 Quest Skip Token — 4 HM, or free once a day.** Instantly cancels one active **solo** quest. No ` +
+        `reward, no penalty — it disappears and that slot is immediately free for a new quest. Doesn't work on ` +
+        `team quests.\n\n` +
+        `**Daily free grant.** Every midnight (America/Chicago time, the same reset clock as every other daily ` +
+        `limit in this system), every registered member who does **not already own at least one** Quest Skip ` +
+        `Token is automatically given exactly one, for free, with no action needed from you. Already own one ` +
+        `(bought or from a previous day's grant)? You're simply skipped that night — tokens never pile up ` +
+        `endlessly from the daily grant alone, though you can still buy more with HM on top of one you're ` +
+        `holding.\n\n` +
+        `Step by step (buying one manually, if you don't want to wait for the daily grant):\n` +
         `1. Buy it from **🎫 Consumables** in ${shopCh}.\n` +
         `2. Easiest: press **🎒 Inventory**, then **⏭️ Use Quest Skip Token** — that button only shows up when ` +
         `you own one, and takes you straight to the quest list below. You can also get there manually by going ` +
@@ -931,6 +1065,56 @@ function renderGuide(setup = {}) {
         `it (Page 6) — this button only shows up for the member who actually has one open.\n\n` +
         `Your balance (${HM_EMOJI} HM) is shown at the top of this same screen. You can also check it any time ` +
         `with \`/hm balance\` without opening Inventory at all.`,
+    },
+    {
+      short: "Clan Pool",
+      title: "🏯 Step 13b: The Clan Pool — One Shared Monthly Quest",
+      body:
+        `The **Clan Pool** is separate from everything else in this guide so far — instead of one person or one ` +
+        `small team, it's **one single quest the entire clan works toward together**, visible on the quest ` +
+        `board at all times. There is always **exactly one** active, and the moment it's completed, a brand ` +
+        `new one starts immediately — there's never a gap with none running.\n\n` +
+        `**How your progress counts.** Every registered member's current total is snapshotted the moment a ` +
+        `Clan Pool quest begins. From then on, the quest's progress is the **sum, across every tracked member, ` +
+        `of how much their own total has grown since that snapshot** — you don't need to do anything to be ` +
+        `counted, it's calculated from your hiscores automatically in the background. Register mid-quest and ` +
+        `you're added in lazily at your current total the next time it checks, so only what you do from that ` +
+        `point on counts toward it.\n\n` +
+        `**The 4 possible quest types** — one is active at a time, chosen at random when a new one starts:\n` +
+        `• 📈 **Total Skilling XP** — combined OSRS XP gained by the whole clan, any skill, added together.\n` +
+        `• ☠️ **Total Boss PvM KC** — combined kills on the same Boss PvM pool used for Boss quests (Page 4), ` +
+        `added together clan-wide.\n` +
+        `• 🎮 **Total Minigame Completions** — combined completions across the same minigame pool as Minigame ` +
+        `quests (Page 4), added together clan-wide.\n` +
+        `• 📜 **Total HM Quests Completed** — combined count of finished Honour Marks quests, solo and team ` +
+        `alike, by anyone in the clan.\n\n` +
+        `**Targets scale up as the clan grows**, so it stays about as grindy-but-achievable at 50 members as it ` +
+        `was at 20. Every quest's target is locked in fresh when it starts, based on how many members are ` +
+        `registered right then — it never shifts again mid-quest even if people join or leave:\n` +
+        `• Below 30 registered members — 1,000,000 total XP • 500 total Boss KC • 300 total minigame ` +
+        `completions • 30 total HM quests completed.\n` +
+        `• Every **10 more members** past that (30, 40, 50, ...), each target rises again: ` +
+        `+250,000 XP • +25 Boss KC • +25 minigame completions • +5 HM quests completed, per step.\n` +
+        `• Example: with 35 registered members (the first step, just past the 30 threshold), the targets are ` +
+        `already 1,250,000 XP, 525 Boss KC, 325 minigame completions, and 35 HM quest completions; hitting 40 ` +
+        `bumps it up another step on top of that.\n\n` +
+        `**What happens when it's completed.** The moment the target is hit:\n` +
+        `1. A coin flip picks ONE of 2 possible clan-wide boosts (below) to go live.\n` +
+        `2. That boost starts running immediately and lasts **exactly 1 week** — the maximum length any Clan ` +
+        `Pool boost can run.\n` +
+        `3. If a different boost was already active, it's **replaced**, not stacked — only one Clan Pool boost ` +
+        `runs at a time, clan-wide.\n` +
+        `4. A brand new Clan Pool quest of a randomly chosen type begins right away.\n\n` +
+        `**The 2 possible boosts** (same 5% either way, only the kind differs):\n` +
+        `• **+5% HM clan-wide for completing quests** — every member's HM payout from finishing any quest is ` +
+        `5% higher for the week it's active.\n` +
+        `• **+5% Clan Chat Rank XP clan-wide** — every member's Rank XP payout from finishing any quest is 5% ` +
+        `higher for the week it's active.\n` +
+        `Both stack normally with Prestige (Page 8c), Perks, Items, and personal Boosts — they're all separate ` +
+        `multipliers that apply together, nothing here caps out or replaces your own bonuses.\n\n` +
+        `**Where to see it.** The quest board always shows the current Clan Pool quest (type, target, and ` +
+        `combined progress so far) and, if one is running, the active boost with exactly how much time is left ` +
+        `on it — you never need to ask, it's always visible to everyone.`,
     },
     {
       short: "Rank & XP",
@@ -1130,7 +1314,7 @@ module.exports = {
   COLOR, HM_EMOJI, DESC_BUDGET,
   chunkLines, buildPanelComponents,
   renderClaimPanel, renderGuide,
-  renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, emptyPage,
+  renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, renderClanPool, emptyPage,
   getPanelLedger, syncPanel,
   getRankForXp, formatRankProgress,
   getConfigValue, setConfigValue,
