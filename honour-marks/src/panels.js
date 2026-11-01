@@ -32,6 +32,15 @@ const COLOR = {
 
 const HM_EMOJI = "<:hm:1565236821330493512>";
 
+// Branding images, served straight out of this (public) repo via GitHub's raw
+// content CDN — Discord just needs a plain public URL for setImage/
+// setThumbnail, it doesn't fetch these through the bot at all. Swapping either
+// file at the same path keeps the URL (and every embed using it) working;
+// renaming the file or changing branches requires updating these constants.
+const MEDIA_BASE_URL = "https://raw.githubusercontent.com/artilon/discordonboardingbot/main/honour-marks/media";
+const HM_ICON_URL = `${MEDIA_BASE_URL}/hm-icon.png`; // small "profile" image — top-right thumbnail
+const MIMIR_SHOP_BANNER_URL = `${MEDIA_BASE_URL}/mimir-shop-banner.jpg`; // wide banner under the description
+
 /**
  * THE EMBED LIMIT, SOLVED
  * =======================
@@ -168,8 +177,12 @@ async function renderDatabase(guildId) {
       .setColor(COLOR.main)
       .setTitle(i === 0 ? "📊 Honour Marks Database" : "📊 Honour Marks Database (cont'd)")
       .setDescription((i === 0 ? header : "") + chunk.join("\n"))
+      .setThumbnail(HM_ICON_URL)
       .setFooter({ text: `Odinheim • ${chunks.length > 1 ? `Part ${i + 1}/${chunks.length} • ` : ""}Updated` })
       .setTimestamp();
+    // Banner only on page 1 — repeating a big image on every "cont'd" page
+    // would just push the actual member rows further down each time.
+    if (i === 0) embed.setImage(MIMIR_SHOP_BANNER_URL);
     return { embed, components: [] };
   });
 }
@@ -291,8 +304,11 @@ async function renderQuestBoard(guildId, setup = {}) {
       .setColor(COLOR.main)
       .setTitle(i === 0 ? "📜 Quest Board" : "📜 Quest Board (cont'd)")
       .setDescription((i === 0 ? header : "") + chunk.join("\n"))
+      .setThumbnail(HM_ICON_URL)
       .setFooter({ text: `Odinheim • Honour Marks${chunks.length > 1 ? ` • Part ${i + 1}/${chunks.length}` : ""}` })
       .setTimestamp();
+    // Banner only on page 1 — see renderDatabase for why.
+    if (i === 0) embed.setImage(MIMIR_SHOP_BANNER_URL);
     return { embed, components: buildPanelComponents("quest_board", i, chunks.length) };
   });
 }
@@ -471,6 +487,8 @@ function renderClaimPanel(setup = {}) {
       `exact in-game name — no slash commands needed.\n\n` +
       `_These channels are read-only. Everything you do happens through buttons on their panels._`
     )
+    .setThumbnail(HM_ICON_URL)
+    .setImage(MIMIR_SHOP_BANNER_URL)
     .setFooter({ text: "Odinheim • Honour Marks" });
 
   const row = new ActionRowBuilder().addComponents(
@@ -536,6 +554,8 @@ async function renderShop(guildId) {
       `Unlike a Perk, it isn't per-category — it applies everywhere at once, and there's only one tier. ` +
       `A Prestiged member shows ${PRESTIGE_EMOJI} next to their name on the quest board and in the database.`
     )
+    .setThumbnail(HM_ICON_URL)
+    .setImage(MIMIR_SHOP_BANNER_URL)
     .setFooter({ text: "Odinheim • Honour Marks Shop" })
     .setTimestamp();
 
