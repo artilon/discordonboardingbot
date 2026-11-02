@@ -30,6 +30,83 @@ function pctOf(targets, baseline, current) {
   return diffProgress(baseline, current, targets).totalPct;
 }
 
+/**
+ * Pays out one solo quest and records it as complete, unconditionally — the
+ * caller has already decided this quest is done (either because live
+ * hiscores actually confirm it, via `checkSoloQuests` below, or because an
+ * admin is force-completing it regardless of progress). Pulled out on its
+ * own so both paths share the exact same reward math instead of two copies
+ * that could quietly drift apart.
+ *
+ * Idempotency: delete-then-award would be wrong; instead delete the quest
+ * row first, and only award if the delete actually removed something. That
+ * makes a double-click (or a double force-complete) harmless.
+ */
+async function completeSoloQuest(quest, { guildId, userId, memberRsn }) {
+  const supabase = getSupabase();
+  if (!supabase) return { ok: false };
+
+  const { data: deleted, error } = await supabase
+    .from("hm_quests")
+    .delete()
+    .eq("id", quest.id)
+    .select("id");
+
+  if (error || !deleted || deleted.length === 0) return { ok: false };
+
+  // Prestige (+10% HM, +25% Rank XP, permanent, account-wide) and a Clan
+  // Pool boost (+5% HM or +5% Rank XP, clan-wide, up to 1 week) both only
+  // apply at the moment a quest is actually FINISHED here — never on the
+  // expiry/partial-credit path below, matching the existing personal-Boost
+  // exclusion. They combine multiplicatively with each other and with the
+  // personal Boost.
+  const prestiged = await isPrestiged(userId);
+  const clanBoost = await getActiveClanBoost(guildId);
+  const hmMultiplier = prestigeHmMultiplier(prestiged) * clanBoostMultiplier(clanBoost, "hm_gain");
+
+  const hm = Math.round((Number(quest.hm_reward) || 0) * hmMultiplier);
+  await creditHm({
+    guildId,
+    userId,
+    amount: hm,
+    kind: "quest",
+    reason: `${quest.quest_type} ${quest.tree} quest complete`,
+    idempotencyKey: `quest:${quest.id}`,
+    refId: String(quest.id),
+  });
+
+  const boostMultiplier =
+    (await getBoostMultiplier(userId, quest.tree)) *
+    prestigeRankXpMultiplier(prestiged) *
+    clanBoostMultiplier(clanBoost, "rank_xp");
+  const xpResult = await awardRankXp({
+    guildId,
+    userId,
+    rsn: memberRsn,
+    eventKey: `quest_solo_${quest.quest_type}`,
+    reason: boostMultiplier > 1
+      ? `${quest.quest_type} ${quest.tree} quest complete (boosted ${boostMultiplier}×)`
+      : `${quest.quest_type} ${quest.tree} quest complete`,
+    discriminator: String(quest.id),
+    multiplier: boostMultiplier,
+  });
+
+  await supabase.from("hm_quest_completions").insert({
+    guild_id: guildId,
+    user_id: userId,
+    quest_type: quest.quest_type,
+    tree: quest.tree,
+    difficulty: quest.difficulty,
+    hm_awarded: hm,
+    rank_xp_awarded: xpResult.amount || 0,
+    progress_pct: 100,
+  });
+
+  await bumpCounts({ guildId, userId, questType: quest.quest_type });
+
+  return { ok: true, hm, xp: xpResult.amount || 0 };
+}
+
 /** Evaluates every active solo quest for a member against live hiscores. */
 async function checkSoloQuests({ guildId, userId, memberRsn }) {
   const quests = await getActiveSoloQuests(userId);
@@ -52,71 +129,12 @@ async function checkSoloQuests({ guildId, userId, memberRsn }) {
 
     if (!finished) continue;
 
-    const supabase = getSupabase();
-    // Idempotency: delete-then-award would be wrong; instead delete the quest
-    // row first, and only award if the delete actually removed something. That
-    // makes a double-click on "Check" harmless.
-    const { data: deleted, error } = await supabase
-      .from("hm_quests")
-      .delete()
-      .eq("id", quest.id)
-      .select("id");
-
-    if (error || !deleted || deleted.length === 0) continue;
-
-    // Prestige (+10% HM, +25% Rank XP, permanent, account-wide) and a Clan
-    // Pool boost (+5% HM or +5% Rank XP, clan-wide, up to 1 week) both only
-    // apply at the moment a quest is actually FINISHED here — never on the
-    // expiry/partial-credit path below, matching the existing personal-Boost
-    // exclusion. They combine multiplicatively with each other and with the
-    // personal Boost.
-    const prestiged = await isPrestiged(userId);
-    const clanBoost = await getActiveClanBoost(guildId);
-    const hmMultiplier = prestigeHmMultiplier(prestiged) * clanBoostMultiplier(clanBoost, "hm_gain");
-
-    const hm = Math.round((Number(quest.hm_reward) || 0) * hmMultiplier);
-    await creditHm({
-      guildId,
-      userId,
-      amount: hm,
-      kind: "quest",
-      reason: `${quest.quest_type} ${quest.tree} quest complete`,
-      idempotencyKey: `quest:${quest.id}`,
-      refId: String(quest.id),
-    });
-
-    const boostMultiplier =
-      (await getBoostMultiplier(userId, quest.tree)) *
-      prestigeRankXpMultiplier(prestiged) *
-      clanBoostMultiplier(clanBoost, "rank_xp");
-    const xpResult = await awardRankXp({
-      guildId,
-      userId,
-      rsn: memberRsn,
-      eventKey: `quest_solo_${quest.quest_type}`,
-      reason: boostMultiplier > 1
-        ? `${quest.quest_type} ${quest.tree} quest complete (boosted ${boostMultiplier}×)`
-        : `${quest.quest_type} ${quest.tree} quest complete`,
-      discriminator: String(quest.id),
-      multiplier: boostMultiplier,
-    });
-
-    await supabase.from("hm_quest_completions").insert({
-      guild_id: guildId,
-      user_id: userId,
-      quest_type: quest.quest_type,
-      tree: quest.tree,
-      difficulty: quest.difficulty,
-      hm_awarded: hm,
-      rank_xp_awarded: xpResult.amount || 0,
-      progress_pct: 100,
-    });
-
-    await bumpCounts({ guildId, userId, questType: quest.quest_type });
+    const result = await completeSoloQuest(quest, { guildId, userId, memberRsn });
+    if (!result.ok) continue;
 
     completed += 1;
-    awardedHm += hm;
-    awardedXp += xpResult.amount || 0;
+    awardedHm += result.hm;
+    awardedXp += result.xp;
   }
 
   return { results, completed, awardedHm, awardedXp };
@@ -375,4 +393,6 @@ async function sweepExpiredQuests() {
   return { solo: soloCount, party: partyCount };
 }
 
-module.exports = { checkSoloQuests, checkPartyQuest, completePartyQuest, sweepExpiredQuests };
+module.exports = {
+  checkSoloQuests, completeSoloQuest, checkPartyQuest, completePartyQuest, sweepExpiredQuests,
+};
