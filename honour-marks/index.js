@@ -363,7 +363,7 @@ function scheduleRefresh(guildId) {
 // change this, that's the ONLY place you need to — reorderQuestsPanelsIfNeeded
 // below handles actually moving things in Discord for every guild already
 // running the bot (see its doc comment for why that's needed at all).
-const QUESTS_PANEL_ORDER = ["clan_pool", "quest_board", "open_teams"];
+const QUESTS_PANEL_ORDER = ["quest_board", "open_teams", "clan_pool"];
 const QUESTS_PANEL_ORDER_CONFIG_KEY = "quests_panel_order";
 
 /** Deletes every posted message (and ledger row) for one panel in one channel,
@@ -438,12 +438,12 @@ async function refreshPanels(guildId) {
   }
   if (questsCh) {
     await reorderQuestsPanelsIfNeeded(guildId, questsCh);
-    // Call order here must match QUESTS_PANEL_ORDER above: the Clan Pool
-    // board (one shared monthly quest + any active clan-wide boost) leads
-    // the channel, then the quest board, then the open-teams board.
-    await syncPanel(guildId, questsCh, "clan_pool", await renderClanPool(guildId));
+    // Call order here must match QUESTS_PANEL_ORDER above: the quest board
+    // leads the channel, then the Looking For Group board, then the Clan
+    // Pool board (one shared monthly quest + any active clan-wide boost).
     await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId, setup));
     await syncPanel(guildId, questsCh, "open_teams", await renderOpenTeams(guildId));
+    await syncPanel(guildId, questsCh, "clan_pool", await renderClanPool(guildId));
   }
   if (shopCh) {
     await syncPanel(guildId, shopCh, "shop", await renderShop(guildId));
