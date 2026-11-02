@@ -185,6 +185,12 @@ const QUEST_DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30 };
 const MAX_ACTIVE_PARTY_QUESTS = 3;
 const PARTY_DURATION_DAYS = 14;
 const RESET_PERIOD = { daily: 1, weekly: 7, monthly: 30 };
+// How many solo quests of each type a member can COMPLETE within one reset
+// period before that type locks until the next reset. This is separate from
+// the "one active quest per type at a time" slot rule just above — once a
+// slot is turned in, a member can immediately start another quest of the
+// same type as long as they haven't hit this count yet for the period.
+const SOLO_QUEST_PERIOD_CAP = { daily: 5, weekly: 3, monthly: 2 };
 const PARTY_SIZES = { duo: 2, trio: 3, quad: 4 };
 
 // Open (recruiting) team listings posted to the Looking For Group board.
@@ -756,8 +762,10 @@ async function buildSoloQuestPayload({ guildId, member, tree, questType, picks =
 
   const counts = await getCounts(member.user_id);
   const usedKey = `${questType}_used`;
-  if (counts[usedKey] >= 1) {
-    return { error: `You've already completed your ${questType} quest for this period.` };
+  const periodCap = SOLO_QUEST_PERIOD_CAP[questType] ?? 1;
+  if (counts[usedKey] >= periodCap) {
+    const plural = periodCap === 1 ? "quest" : "quests";
+    return { error: `You've already completed your ${periodCap} ${questType} ${plural} for this period.` };
   }
 
   const baseline = await fetchHiscores(member.rsn);
@@ -1211,7 +1219,7 @@ module.exports = {
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
   SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY, PARTY_DIFFICULTIES, PARTY_SIZES, LFG_EXPIRY_HOURS,
   SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES, SOLO_SKILL_XP,
-  QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD,
+  QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD, SOLO_QUEST_PERIOD_CAP,
   buildSoloTargets, buildPartyTargets, soloTargetPool, partyTargetPool, treeKind,
   soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,

@@ -30,7 +30,9 @@ const {
   insertSoloQuestPayload, dayStamp,
 } = require("./src/quests");
 const { SKILL_LABELS, bossLabel } = require("./src/jagex");
-const { checkSoloQuests, checkPartyQuest, completePartyQuest, sweepExpiredQuests } = require("./src/progress");
+const {
+  checkSoloQuests, completeSoloQuest, checkPartyQuest, completePartyQuest, sweepExpiredQuests,
+} = require("./src/progress");
 const {
   PERK_TIERS, BOOST_TIERS, CONSUMABLES, ITEM_CATALOG, ITEM_SLOT, ITEM_SLOT_LABEL,
   perkBonusPercent, boostBonusLabel,
@@ -743,6 +745,10 @@ async function handleHm(interaction) {
           ),
       ],
     });
+  }
+
+  if (sub === "force-complete") {
+    return await handleForceCompleteQuest(interaction);
   }
 
   if (!(await isStaff(interaction))) {
@@ -2295,6 +2301,184 @@ async function handleCancelQuest(interaction, questId) {
   });
 }
 
+// ── Owner-only: force-complete a quest ──────────────────────────────────────
+// A single hardcoded Discord user ID — deliberately NOT the isStaff() role
+// check every other /hm subcommand uses, because this bypasses every
+// progress/target check a normal completion goes through and always pays the
+// FULL reward. No one else, including Co-Owners or whoever holds the staff
+// role, can use it. Every entry point below re-checks the ID, since a stale
+// select menu or button could otherwise be left open and confirmed later.
+const FORCE_COMPLETE_USER_ID = "351190870416031744";
+
+function notAuthorizedReply(interaction) {
+  return interaction.reply({ content: "You can't use this command.", flags: MessageFlags.Ephemeral });
+}
+
+/** Select-menu option label for one of the admin's own active quests. Kept
+ *  well under Discord's 100-character option-label limit. */
+function forceCompleteOptionLabel(entry) {
+  const q = entry.quest;
+  if (entry.type === "solo") {
+    return `Solo ${q.quest_type} — ${TREE_BY_KEY[q.tree]?.label || q.tree}`;
+  }
+  const diffLabel = PARTY_DIFFICULTY[q.difficulty]?.label || q.difficulty;
+  return `Team ${q.size} (${diffLabel}) — ${TREE_BY_KEY[q.tree]?.label || q.tree}`;
+}
+
+/** Short "label: needed unit" summary of a quest's targets, display only —
+ *  deliberately does NOT call fetchHiscores, since force-completing doesn't
+ *  care what progress actually is. */
+function questTargetSummary(targets) {
+  const parts = diffProgress({}, {}, targets).parts;
+  if (!parts.length) return "no targets set";
+  return parts.map((p) => `${p.label}: ${p.needed.toLocaleString()} ${p.kind === "skill" ? "XP" : "KC"}`).join(", ");
+}
+
+/** `/hm force-complete` — lists every quest (solo and team) the command's
+ *  invoker currently has active, so they can force one through. */
+async function handleForceCompleteQuest(interaction) {
+  if (interaction.user.id !== FORCE_COMPLETE_USER_ID) return notAuthorizedReply(interaction);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const [soloQuests, partyQuests] = await Promise.all([
+    getActiveSoloQuests(interaction.user.id),
+    getActivePartyQuestsForUser(interaction.user.id),
+  ]);
+
+  if (!soloQuests.length && !partyQuests.length) {
+    return interaction.editReply({ content: "You have no active quests right now." });
+  }
+
+  const entries = [
+    ...soloQuests.map((quest) => ({ type: "solo", quest })),
+    ...partyQuests.map((quest) => ({ type: "party", quest })),
+  ];
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("hm_force_complete_select")
+    .setPlaceholder("Choose a quest to force-complete…")
+    .addOptions(
+      entries.map((entry) =>
+        new StringSelectMenuOptionBuilder()
+          .setLabel(forceCompleteOptionLabel(entry).slice(0, 100))
+          .setDescription(questTargetSummary(entry.quest.targets).slice(0, 100))
+          .setValue(`${entry.type}:${entry.quest.id}`)
+      )
+    );
+
+  return interaction.editReply({
+    content:
+      "Pick one of your active quests to force-complete it right now. This skips every progress check and " +
+      "pays the full reward — to you alone for a solo quest, or to every teammate for a team quest.",
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+/** Step 2: the admin picked a quest — show exactly what force-completing it
+ *  will pay out, and ask for the single explicit confirmation. */
+async function handleForceCompleteSelect(interaction) {
+  if (interaction.user.id !== FORCE_COMPLETE_USER_ID) return notAuthorizedReply(interaction);
+
+  const [type, questId] = interaction.values[0].split(":");
+  const quest = type === "solo"
+    ? (await getActiveSoloQuests(interaction.user.id)).find((q) => String(q.id) === questId)
+    : (await getActivePartyQuestsForUser(interaction.user.id)).find((q) => String(q.id) === questId);
+
+  if (!quest) {
+    return interaction.update({
+      content: "That quest isn't active anymore — it may have finished, expired, or been cancelled already.",
+      components: [],
+    });
+  }
+
+  const summary = questTargetSummary(quest.targets);
+  const reward = `${Number(quest.hm_reward || 0).toLocaleString()} HM`;
+  let detail;
+  if (type === "solo") {
+    detail =
+      `**Solo ${quest.quest_type} — ${TREE_BY_KEY[quest.tree]?.label || quest.tree}**\n` +
+      `Target: ${summary}\n` +
+      `Reward: ${reward} (plus Rank XP), paid to you alone.`;
+  } else {
+    const diffLabel = PARTY_DIFFICULTY[quest.difficulty]?.label || quest.difficulty;
+    const members = quest.members.map((m) => `<@${m}>`).join(", ");
+    detail =
+      `**Team ${quest.size} (${diffLabel}) — ${TREE_BY_KEY[quest.tree]?.label || quest.tree}**\n` +
+      `Target: ${summary}\n` +
+      `Reward: ${reward} each (plus Rank XP), paid in full to every teammate: ${members}.`;
+  }
+
+  return interaction.update({
+    content: `${detail}\n\nThis bypasses all progress checks. Force-complete it now?`,
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`hm_force_complete_confirm:${type}:${quest.id}`)
+          .setLabel("Confirm")
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId("hm_force_complete_cancel")
+          .setLabel("Cancel")
+          .setStyle(ButtonStyle.Secondary)
+      ),
+    ],
+  });
+}
+
+/** Step 3: the one explicit confirmation — actually pays out. Re-fetches the
+ *  quest instead of trusting what was shown at Step 2, so a quest that
+ *  finished/expired/was cancelled in the gap between the two can't double-pay
+ *  or crash on a row that's already gone. */
+async function handleForceCompleteConfirm(interaction, type, questId) {
+  if (interaction.user.id !== FORCE_COMPLETE_USER_ID) return notAuthorizedReply(interaction);
+
+  await interaction.deferUpdate();
+
+  if (type === "solo") {
+    const quest = (await getActiveSoloQuests(interaction.user.id)).find((q) => String(q.id) === questId);
+    if (!quest) {
+      return interaction.editReply({ content: "That quest isn't active anymore.", components: [] });
+    }
+    const member = await getMember(interaction.user.id);
+    const result = await completeSoloQuest(quest, {
+      guildId: interaction.guildId,
+      userId: interaction.user.id,
+      memberRsn: member?.rsn,
+    });
+    if (!result.ok) {
+      return interaction.editReply({ content: "Couldn't force-complete that quest — try again.", components: [] });
+    }
+    scheduleRefresh(interaction.guildId);
+    return interaction.editReply({
+      content:
+        `Force-completed. Paid yourself **${result.hm.toLocaleString()} HM** and ` +
+        `**${result.xp.toLocaleString()} Rank XP**.`,
+      components: [],
+    });
+  }
+
+  const quest = (await getActivePartyQuestsForUser(interaction.user.id)).find((q) => String(q.id) === questId);
+  if (!quest) {
+    return interaction.editReply({ content: "That quest isn't active anymore.", components: [] });
+  }
+  const result = await completePartyQuest(quest, null);
+  if (!result.ok) {
+    return interaction.editReply({ content: "Couldn't force-complete that quest — try again.", components: [] });
+  }
+  scheduleRefresh(interaction.guildId);
+  const members = quest.members.map((m) => `<@${m}>`).join(", ");
+  return interaction.editReply({
+    content:
+      `Force-completed. Paid the full reward to every teammate (${result.hm.toLocaleString()} HM total): ${members}.`,
+    components: [],
+  });
+}
+
+async function handleForceCompleteCancel(interaction) {
+  return interaction.update({ content: "Cancelled — nothing was changed.", components: [] });
+}
+
 // ── Router ───────────────────────────────────────────────────────────────────
 // Ephemeral replies only ever show up in the one channel they're triggered
 // from, to the one member who triggered them — but a member who checks
@@ -2357,6 +2541,10 @@ async function routeInteraction(interaction) {
         const questId = btnId.split(":")[1];
         return await handleCancelQuest(interaction, questId);
       }
+      if (btnId.startsWith("hm_force_complete_confirm:")) {
+        const [, type, questId] = btnId.split(":");
+        return await handleForceCompleteConfirm(interaction, type, questId);
+      }
       if (btnId.startsWith("hm_team_choose:")) {
         const [, size, difficulty, tree] = btnId.split(":");
         return await handleTeamChoose(interaction, size, difficulty, tree);
@@ -2404,6 +2592,7 @@ async function routeInteraction(interaction) {
         case "hm_inv_use_skip_token": return await handleInventoryUseSkipToken(interaction);
         case "hm_inv_use_choice_token": return await handleInventoryUseChoiceToken(interaction);
         case "hm_guide_open": return await handleGuideOpen(interaction);
+        case "hm_force_complete_cancel": return await handleForceCompleteCancel(interaction);
         case "hm_db_page": // disabled label button; never fires, kept so a
                            // stray click can never leave an unacked interaction
         case "hm_db_refresh": {
@@ -2456,6 +2645,9 @@ async function routeInteraction(interaction) {
       }
       if (id === "hm_lfg_join") {
         return await handleLfgJoin(interaction, interaction.values[0]);
+      }
+      if (id === "hm_force_complete_select") {
+        return await handleForceCompleteSelect(interaction);
       }
       return;
     }

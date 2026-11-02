@@ -77,6 +77,11 @@ const raw = [
     )
     .addSubcommand((s) =>
       s.setName("refresh").setDescription("Force-refresh all Honour Marks panels")
+    )
+    .addSubcommand((s) =>
+      s
+        .setName("force-complete")
+        .setDescription("Force-complete one of your own active quests and pay the full reward (restricted)")
     ),
 ];
 
