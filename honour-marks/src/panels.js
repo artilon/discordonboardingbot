@@ -207,28 +207,74 @@ function formatProgressParts(parts) {
     .join(" • ");
 }
 
+// A member's own quests always read Daily, then Weekly, then Monthly within
+// their group, regardless of which actually expires soonest — "in order"
+// means this fixed, predictable order, not another expiry sort.
+const SOLO_QUEST_TYPE_ORDER = { daily: 0, weekly: 1, monthly: 2 };
+
 /**
- * Builds the two-line board entry for one solo quest: target(s) up top, live
- * progress underneath. Progress is computed with the same pure
- * `fetchHiscores` + `diffProgress` primitives the "Check Quests & Collect"
- * button uses — deliberately NOT `checkSoloQuests`, which also deletes and
- * pays out finished quests. The board only ever displays; collecting still
- * requires a manual check, per the documented design.
+ * Groups a flat list of solo quest rows (however the DB returned them) by
+ * owner, with each owner's own quests sorted Daily -> Weekly -> Monthly.
+ * The board used to just sort every quest from every member by whichever
+ * happened to expire soonest, which scattered one person's Daily, Weekly and
+ * Monthly across the whole list instead of keeping them together. Groups
+ * are still ordered by whichever member has something expiring soonest, so
+ * the board still roughly reads "who needs attention soonest" at a glance —
+ * it's just that each person's own quests no longer get split apart to do
+ * that.
+ *
+ * @returns {Array<[userId: string, quests: object[]]>}
  */
-async function formatSoloQuestLine(q) {
-  const targetLabels = targetLabelsFromTargets(q.targets).join(", ") || "?";
-  const expiresAt = `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`;
-  const prestigeTag = (await isPrestiged(q.user_id).catch(() => false)) ? ` ${PRESTIGE_EMOJI}` : "";
-  const head = `• <@${q.user_id}>${prestigeTag} — ${q.quest_type} • ${q.tree} • 🎯 **${targetLabels}**`;
+function groupSoloQuestsByUser(quests) {
+  const byUser = new Map();
+  for (const q of quests) {
+    if (!byUser.has(q.user_id)) byUser.set(q.user_id, []);
+    byUser.get(q.user_id).push(q);
+  }
+  for (const list of byUser.values()) {
+    list.sort((a, b) => (SOLO_QUEST_TYPE_ORDER[a.quest_type] ?? 99) - (SOLO_QUEST_TYPE_ORDER[b.quest_type] ?? 99));
+  }
+  return [...byUser.entries()].sort(([, a], [, b]) => {
+    const soonestA = Math.min(...a.map((q) => new Date(q.expires_at).getTime()));
+    const soonestB = Math.min(...b.map((q) => new Date(q.expires_at).getTime()));
+    return soonestA - soonestB;
+  });
+}
 
-  const member = await getMember(q.user_id).catch(() => null);
-  if (!member?.rsn) return `${head}\n   ┗ _not registered — progress unavailable_ • ends ${expiresAt}`;
+/**
+ * Builds one member's whole board entry: their name once, then every one of
+ * their active solo quests listed underneath it (Daily, Weekly, Monthly, in
+ * that order) instead of repeating their mention once per quest. Progress is
+ * computed with the same pure `fetchHiscores` + `diffProgress` primitives
+ * the "Check Quests & Collect" button uses — deliberately NOT
+ * `checkSoloQuests`, which also deletes and pays out finished quests. The
+ * board only ever displays; collecting still requires a manual check, per
+ * the documented design.
+ */
+async function formatSoloQuestGroup(userId, quests) {
+  const prestigeTag = (await isPrestiged(userId).catch(() => false)) ? ` ${PRESTIGE_EMOJI}` : "";
+  const member = await getMember(userId).catch(() => null);
+  const snap = member?.rsn ? await fetchHiscores(member.rsn).catch(() => null) : null;
 
-  const snap = await fetchHiscores(member.rsn).catch(() => null);
-  if (!snap) return `${head}\n   ┗ _progress unavailable right now_ • ends ${expiresAt}`;
+  const lines = [`• <@${userId}>${prestigeTag}`];
+  for (const q of quests) {
+    const targetLabels = targetLabelsFromTargets(q.targets).join(", ") || "?";
+    const expiresAt = `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`;
+    const typeLabel = q.quest_type.charAt(0).toUpperCase() + q.quest_type.slice(1);
+    lines.push(`   • ${typeLabel} • ${q.tree} • 🎯 **${targetLabels}**`);
 
-  const progress = diffProgress(q.baseline, snap, q.targets);
-  return `${head}\n   ┗ ${formatProgressParts(progress.parts)} — **${Math.floor(progress.totalPct)}%** • ends ${expiresAt}`;
+    if (!member?.rsn) {
+      lines.push(`      ┗ _not registered — progress unavailable_ • ends ${expiresAt}`);
+      continue;
+    }
+    if (!snap) {
+      lines.push(`      ┗ _progress unavailable right now_ • ends ${expiresAt}`);
+      continue;
+    }
+    const progress = diffProgress(q.baseline, snap, q.targets);
+    lines.push(`      ┗ ${formatProgressParts(progress.parts)} — **${Math.floor(progress.totalPct)}%** • ends ${expiresAt}`);
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -273,10 +319,15 @@ async function renderQuestBoard(guildId, setup = {}) {
 
   if (activeQuests?.length) {
     lines.push("**Solo Quests In Progress**");
-    for (const q of activeQuests.slice(0, 25)) {
-      lines.push(await formatSoloQuestLine(q));
+    // Grouped by owner (Daily/Weekly/Monthly kept together, in that order)
+    // instead of one flat list of every quest from every member sorted only
+    // by whichever expires soonest — that used to scatter one person's own
+    // quests apart from each other.
+    const groups = groupSoloQuestsByUser(activeQuests);
+    for (const [userId, quests] of groups.slice(0, 25)) {
+      lines.push(await formatSoloQuestGroup(userId, quests));
     }
-    if (activeQuests.length > 25) lines.push(`_…and ${activeQuests.length - 25} more_`);
+    if (groups.length > 25) lines.push(`_…and ${groups.length - 25} more member(s)_`);
     lines.push("");
   }
 
