@@ -48,7 +48,7 @@ const {
 } = require("./src/clanpool");
 const {
   COLOR, HM_EMOJI,
-  renderClaimPanel, renderGuide,
+  renderClaimPanel, renderGuide, renderGuidePage, GUIDE_MENU_SELECT_ID, GUIDE_PAGE_SELECT_ID,
   renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, renderClanPool, syncPanel, emptyPage,
   getPanelLedger,
 } = require("./src/panels");
@@ -2096,26 +2096,39 @@ async function handleBuyConsumable(interaction, key) {
   });
 }
 
+/** "📖 How This Works" — opens the guide on its first category with a
+ *  dropdown to jump anywhere else, instead of dumping every category at once
+ *  into one wall of embeds. */
 async function handleGuideOpen(interaction) {
   const setup = await readSetup(interaction.guildId);
-  const pages = renderGuide(setup || {});
-  // Discord caps a single message at 10 embeds, and this guide has grown well
-  // past that — send it as however many ephemeral messages it takes instead
-  // of silently dropping the tail pages (or erroring outright) past #10.
-  const EMBEDS_PER_MESSAGE = 10;
-  for (let i = 0; i < pages.length; i += EMBEDS_PER_MESSAGE) {
-    const batch = pages.slice(i, i + EMBEDS_PER_MESSAGE).map((p) => p.embed);
-    if (i === 0) {
-      await interaction.reply({ embeds: batch, flags: MessageFlags.Ephemeral });
-    } else {
-      // scheduleEphemeralAutoDelete (called by the router after this handler
-      // returns) only knows how to clean up the PRIMARY reply via
-      // interaction.deleteReply() — a follow-up is its own separate message,
-      // so each one has to be scheduled here directly.
-      const followUp = await interaction.followUp({ embeds: batch, flags: MessageFlags.Ephemeral });
-      setTimeout(() => followUp.delete().catch(() => {}), EPHEMERAL_AUTO_DELETE_MS).unref?.();
-    }
-  }
+  const page = renderGuidePage(setup || {}, 0, GUIDE_PAGE_SELECT_ID);
+  return interaction.reply({ embeds: [page.embed], components: page.components, flags: MessageFlags.Ephemeral });
+}
+
+/**
+ * The dropdown on the permanent, SHARED guide-channel panel. Replies
+ * ephemerally with whichever category was picked instead of editing that
+ * shared message in place — editing it would yank the page out from under
+ * every other member currently reading it.
+ */
+async function handleGuideMenuSelect(interaction) {
+  const setup = await readSetup(interaction.guildId);
+  const index = Number(interaction.values[0]) || 0;
+  const page = renderGuidePage(setup || {}, index, GUIDE_PAGE_SELECT_ID);
+  return interaction.reply({ embeds: [page.embed], components: page.components, flags: MessageFlags.Ephemeral });
+}
+
+/**
+ * The dropdown inside a member's own ephemeral guide reply (from either
+ * handleGuideOpen or handleGuideMenuSelect above). This message is only ever
+ * visible to the one member who opened it, so it's safe to update it in
+ * place to swap categories, unlike the shared panel's dropdown.
+ */
+async function handleGuidePageSelect(interaction) {
+  const setup = await readSetup(interaction.guildId);
+  const index = Number(interaction.values[0]) || 0;
+  const page = renderGuidePage(setup || {}, index, GUIDE_PAGE_SELECT_ID);
+  return interaction.update({ embeds: [page.embed], components: page.components });
 }
 
 async function handleInventory(interaction) {
@@ -2648,6 +2661,12 @@ async function routeInteraction(interaction) {
       }
       if (id === "hm_force_complete_select") {
         return await handleForceCompleteSelect(interaction);
+      }
+      if (id === GUIDE_MENU_SELECT_ID) {
+        return await handleGuideMenuSelect(interaction);
+      }
+      if (id === GUIDE_PAGE_SELECT_ID) {
+        return await handleGuidePageSelect(interaction);
       }
       return;
     }
