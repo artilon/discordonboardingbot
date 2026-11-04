@@ -627,13 +627,22 @@ async function renderShop(guildId) {
 }
 
 // ── Guide ────────────────────────────────────────────────────────────────────
+// The guide used to be posted as one separate message PER section (up to
+// ~18 of them) — reading it meant scrolling past a wall of giant embeds, and
+// the "📖 How This Works" button just dumped every single one into one
+// ephemeral reply at once. Both are now a single message with a dropdown
+// (see GUIDE_MENU_SELECT_ID / GUIDE_PAGE_SELECT_ID below): pick a category,
+// see just that page.
+const GUIDE_MENU_SELECT_ID = "hm_guide_menu_select"; // lives on the permanent, SHARED channel panel
+const GUIDE_PAGE_SELECT_ID = "hm_guide_page_select"; // lives on a per-user EPHEMERAL guide reply
+
 /**
- * The explainer post. Written for someone who has never seen this bot before
- * and has no idea what Honour Marks are. A pure function of `setup` (channel
- * IDs only) so it can be synced as a normal panel AND reused verbatim for the
- * "📖 How This Works" button's ephemeral reply.
+ * The guide's raw content: one `{short, title, body}` entry per category, in
+ * the order they appear in the dropdown. A pure function of `setup` (channel
+ * IDs only) so it has no UI baked in — `renderGuidePage` below turns one
+ * entry into an actual embed + dropdown.
  */
-function renderGuide(setup = {}) {
+function buildGuideSections(setup = {}) {
   const claimCh = setup.channels?.claim ? `<#${setup.channels.claim}>` : "**the role channel**";
   const questsCh = setup.channels?.quests ? `<#${setup.channels.quests}>` : "**the quest board**";
   const shopCh = setup.channels?.shop ? `<#${setup.channels.shop}>` : "**the shop**";
@@ -641,10 +650,6 @@ function renderGuide(setup = {}) {
 
   const rankLadder = RANK_TIERS.map((t) => `${t.name} — ${t.xpNeeded.toLocaleString()} XP`).join(" • ");
 
-  // Every page here is content, not UI — the guide channel is read-only, so
-  // there's nothing to click on any of these. The whole point of this guide
-  // is that a brand new member can read it start to finish and never have to
-  // guess at a single step, number, or edge case anywhere in the system.
   const sections = [
     {
       short: "The Basics",
@@ -711,10 +716,10 @@ function renderGuide(setup = {}) {
         `You can hold **one Daily, one Weekly, and one Monthly solo quest at the same time** — they don't compete ` +
         `with each other, and each can be in a different category if you want. As soon as a slot is **cancelled**, ` +
         `you can immediately start a new quest of that same type for free.\n\n` +
-        `**Completing** one counts against that type's limit for the current period, though: you can complete up ` +
-        `to **${SOLO_QUEST_PERIOD_CAP.daily} Daily**, **${SOLO_QUEST_PERIOD_CAP.weekly} Weekly**, or ` +
-        `**${SOLO_QUEST_PERIOD_CAP.monthly} Monthly** quests before that type locks until the next reset — once ` +
-        `you hit the limit, you'll need to wait even if you have no active quest of that type.\n\n` +
+        `**Completing** one counts against that type's cap for the period, though: up to ` +
+        `**${SOLO_QUEST_PERIOD_CAP.daily} Daily**, **${SOLO_QUEST_PERIOD_CAP.weekly} Weekly**, or ` +
+        `**${SOLO_QUEST_PERIOD_CAP.monthly} Monthly** before that type locks until the next reset — once you ` +
+        `hit it, you'll need to wait even with no active quest of that type.\n\n` +
         `**Durations**, counted from the moment you start (not from any clock reset): Daily = 1 day, ` +
         `Weekly = 7 days, Monthly = 30 days.\n\n` +
         `**Picking a target.** After you choose a category, the bot normally rolls a random skill or boss from ` +
@@ -1272,14 +1277,58 @@ function renderGuide(setup = {}) {
     },
   ];
 
-  return sections.map((s, i) => ({
-    embed: new EmbedBuilder()
-      .setColor(COLOR.gold)
-      .setTitle(s.title)
-      .setDescription(s.body.slice(0, DESC_BUDGET))
-      .setFooter({ text: `Odinheim • Honour Marks — Page ${i + 1}/${sections.length}: ${s.short}` }),
-    components: [],
-  }));
+  return sections;
+}
+
+/** The dropdown itself: one option per guide category, in order. `selectedIndex`
+ *  (if any) is marked as the pre-selected option so re-opening the same page
+ *  (e.g. after navigating elsewhere and back) shows what's actually on screen. */
+function guideSelectRow(sections, selectedIndex, customId) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(customId)
+    .setPlaceholder("Jump to a category…")
+    .addOptions(
+      sections.map((s, i) =>
+        new StringSelectMenuOptionBuilder()
+          .setLabel(`${i + 1}. ${s.short}`.slice(0, 100))
+          .setValue(String(i))
+          .setDefault(i === selectedIndex)
+      )
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+/**
+ * Builds one guide category as an actual page: its embed plus the dropdown
+ * to jump anywhere else. `customId` decides what clicking the dropdown does
+ * downstream (see GUIDE_MENU_SELECT_ID vs GUIDE_PAGE_SELECT_ID above) — this
+ * function itself has no opinion on that, it just wires whichever id it's
+ * given onto the menu.
+ */
+function renderGuidePage(setup, index, customId = GUIDE_PAGE_SELECT_ID) {
+  const sections = buildGuideSections(setup);
+  const i = Math.max(0, Math.min(index, sections.length - 1));
+  const s = sections[i];
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle(s.title)
+    .setDescription(s.body.slice(0, DESC_BUDGET))
+    .setFooter({ text: `Odinheim • Honour Marks — Page ${i + 1}/${sections.length}: ${s.short}` });
+  return { embed, components: [guideSelectRow(sections, i, customId)] };
+}
+
+/**
+ * The guide panel posted to the permanent guide channel. Used to be one
+ * separate message per category (see the comment above GUIDE_MENU_SELECT_ID)
+ * — now it's a single message showing the first category with a dropdown to
+ * jump to any other one. That dropdown uses GUIDE_MENU_SELECT_ID rather than
+ * GUIDE_PAGE_SELECT_ID because this message is shared by the whole server:
+ * picking an option here must reply to the clicking member ephemerally
+ * instead of editing this one shared message in place (which would yank the
+ * page out from under everyone else currently reading it).
+ */
+function renderGuide(setup = {}) {
+  return [renderGuidePage(setup, 0, GUIDE_MENU_SELECT_ID)];
 }
 
 
@@ -1388,7 +1437,8 @@ async function syncPanel(guildId, channel, panelKey, pages) {
 module.exports = {
   COLOR, HM_EMOJI, DESC_BUDGET,
   chunkLines, buildPanelComponents,
-  renderClaimPanel, renderGuide,
+  renderClaimPanel, renderGuide, renderGuidePage, buildGuideSections,
+  GUIDE_MENU_SELECT_ID, GUIDE_PAGE_SELECT_ID,
   renderDatabase, renderQuestBoard, renderShop, renderOpenTeams, renderClanPool, emptyPage,
   getPanelLedger, syncPanel,
   getRankForXp, formatRankProgress,

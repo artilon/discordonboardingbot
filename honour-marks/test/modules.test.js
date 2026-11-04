@@ -10,7 +10,10 @@ const path = require("path");
 const { RANK_TIERS, formatRankProgress, getRankForXp } = require("../src/ranks");
 const { diffProgress, cleanRsn } = require("../src/jagex");
 const q = require("../src/quests");
-const { chunkLines, DESC_BUDGET, renderGuide } = require("../src/panels");
+const {
+  chunkLines, DESC_BUDGET, renderGuide, renderGuidePage, buildGuideSections,
+  GUIDE_MENU_SELECT_ID, GUIDE_PAGE_SELECT_ID,
+} = require("../src/panels");
 
 let passed = 0;
 function check(name, fn) {
@@ -256,40 +259,81 @@ check("empty input still yields one page", () => {
 });
 
 console.log("\n[guide]");
-check("every guide page fits the description budget and has a footer", () => {
-  const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
-  assert.ok(pages.length >= 10, "guide should be a full multi-page manual, not a short blurb");
-  pages.forEach((p, i) => {
-    const desc = p.embed.data.description || "";
-    assert.ok(desc.length > 0, `page ${i + 1} has no description`);
-    assert.ok(desc.length <= DESC_BUDGET, `page ${i + 1} description of ${desc.length} exceeds budget ${DESC_BUDGET}`);
-    assert.ok(p.embed.data.title, `page ${i + 1} has no title`);
-    const footer = p.embed.data.footer?.text || "";
-    assert.ok(
-      footer.includes(`Page ${i + 1}/${pages.length}`),
-      `page ${i + 1} footer "${footer}" doesn't match its real position out of ${pages.length}`
-    );
+check("every guide section fits the description budget and has real content", () => {
+  const sections = buildGuideSections({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+  assert.ok(sections.length >= 10, "guide should be a full multi-category manual, not a short blurb");
+  sections.forEach((s, i) => {
+    assert.ok(s.body?.length > 0, `section ${i + 1} has no body`);
+    assert.ok(s.body.length <= DESC_BUDGET, `section ${i + 1} body of ${s.body.length} exceeds budget ${DESC_BUDGET}`);
+    assert.ok(s.title, `section ${i + 1} has no title`);
+    assert.ok(s.short, `section ${i + 1} has no short label for its dropdown entry`);
+    assert.ok(s.short.length <= 96, `section ${i + 1}'s short label "${s.short}" is too long for a dropdown option`);
   });
 });
 
-check("renderGuide still works with no setup/channels passed at all", () => {
-  const pages = renderGuide();
-  assert.ok(pages.length >= 10);
-  assert.ok(pages.every((p) => (p.embed.data.description || "").length > 0));
+check("buildGuideSections still works with no setup/channels passed at all", () => {
+  const sections = buildGuideSections();
+  assert.ok(sections.length >= 10);
+  assert.ok(sections.every((s) => (s.body || "").length > 0));
 });
 
 check("guide doesn't mention a tutorial reward, and does document the team-quest difficulty choice", () => {
-  const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
-  const all = pages.map((p) => `${p.embed.data.title} ${p.embed.data.description}`).join("\n").toLowerCase();
+  const sections = buildGuideSections({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+  const all = sections.map((s) => `${s.title} ${s.body}`).join("\n").toLowerCase();
   assert.ok(!all.includes("tutorial"), "there is no tutorial-reward feature in the code");
 
-  const teamPage = pages.find((p) => p.embed.data.title.includes("Team Quests"));
-  assert.ok(teamPage, "team quests page should exist");
+  const teamSection = sections.find((s) => s.title.includes("Team Quests"));
+  assert.ok(teamSection, "team quests section should exist");
   assert.ok(
-    /difficulty/i.test(teamPage.embed.data.description) && /easy/i.test(teamPage.embed.data.description) &&
-    /medium/i.test(teamPage.embed.data.description) && /hard/i.test(teamPage.embed.data.description),
+    /difficulty/i.test(teamSection.body) && /easy/i.test(teamSection.body) &&
+    /medium/i.test(teamSection.body) && /hard/i.test(teamSection.body),
     "team quests now have a real Easy/Medium/Hard difficulty picker and the guide should document it"
   );
+});
+
+console.log("\n[guide — dropdown navigation]");
+check("renderGuide posts a SINGLE message (not one per category) with a jump-to-category dropdown", () => {
+  const setup = { channels: { claim: "1", quests: "2", shop: "3", database: "4" } };
+  const pages = renderGuide(setup);
+  assert.strictEqual(pages.length, 1, "the permanent guide panel must be one message, not a wall of them");
+
+  const sections = buildGuideSections(setup);
+  const [page] = pages;
+  assert.ok(page.embed.data.description.length > 0);
+  assert.strictEqual(page.components.length, 1, "exactly one row holding the dropdown");
+
+  const menu = page.components[0].components[0];
+  assert.strictEqual(menu.data.custom_id, GUIDE_MENU_SELECT_ID, "the shared panel's dropdown must use the menu id, not the per-user page id");
+  assert.strictEqual(menu.options.length, sections.length, "the dropdown must list every guide category");
+  assert.ok(menu.options.length <= 25, "a Discord select menu can't hold more than 25 options");
+});
+
+check("renderGuidePage renders any category by index with the matching content and footer", () => {
+  const setup = { channels: { claim: "1", quests: "2", shop: "3", database: "4" } };
+  const sections = buildGuideSections(setup);
+
+  for (let i = 0; i < sections.length; i++) {
+    const page = renderGuidePage(setup, i, GUIDE_PAGE_SELECT_ID);
+    assert.strictEqual(page.embed.data.title, sections[i].title, `page ${i} title should match its section`);
+    assert.strictEqual(page.embed.data.description, sections[i].body.slice(0, DESC_BUDGET));
+    assert.ok(
+      page.embed.data.footer.text.includes(`Page ${i + 1}/${sections.length}`),
+      `page ${i + 1}'s footer should state its real position out of ${sections.length}`
+    );
+    const menu = page.components[0].components[0];
+    assert.strictEqual(menu.data.custom_id, GUIDE_PAGE_SELECT_ID);
+    assert.ok(menu.options[i].data.default, `the dropdown should show category ${i + 1} as the current selection`);
+  }
+});
+
+check("renderGuidePage clamps an out-of-range index instead of returning nothing", () => {
+  const setup = { channels: { claim: "1", quests: "2", shop: "3", database: "4" } };
+  const sections = buildGuideSections(setup);
+  const tooHigh = renderGuidePage(setup, 999, GUIDE_PAGE_SELECT_ID);
+  assert.strictEqual(tooHigh.embed.data.title, sections[sections.length - 1].title);
+
+  const negative = renderGuidePage(setup, -5, GUIDE_PAGE_SELECT_ID);
+  assert.strictEqual(negative.embed.data.title, sections[0].title);
 });
 
 console.log(`\n${passed} checks passed.\n`);

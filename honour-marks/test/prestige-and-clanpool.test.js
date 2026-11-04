@@ -42,7 +42,7 @@ require.cache[jagexPath] = {
 const q = require("../src/quests");
 const shop = require("../src/shop");
 const clanpool = require("../src/clanpool");
-const { renderGuide } = require("../src/panels");
+const { buildGuideSections } = require("../src/panels");
 
 let passed = 0;
 async function check(name, fn) { await fn(); passed += 1; console.log(`  ✓ ${name}`); }
@@ -240,36 +240,36 @@ async function registerMember(userId, rsn, guildId = "g1") {
 
   console.log("\n[Guide documents all 4 new features]");
   await check("the guide has a dedicated Prestige page with the right numbers", () => {
-    const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
-    const prestigePage = pages.find((p) => p.embed.data.title.includes("Prestige"));
+    const sections = buildGuideSections({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+    const prestigePage = sections.find((s) => s.title.includes("Prestige"));
     assert.ok(prestigePage, "a Prestige page should exist");
-    const desc = prestigePage.embed.data.description;
+    const desc = prestigePage.body;
     assert.ok(desc.includes("100,000"), "should state the 100,000 HM cost");
     assert.ok(/10%/.test(desc) && /25%/.test(desc), "should state +10% HM and +25% Rank XP");
   });
 
   await check("the Consumables page documents the daily free Skip Token grant", () => {
-    const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
-    const consumablesPage = pages.find((p) => p.embed.data.title.includes("Consumables"));
+    const sections = buildGuideSections({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+    const consumablesPage = sections.find((s) => s.title.includes("Consumables"));
     assert.ok(consumablesPage, "a Consumables page should exist");
-    assert.ok(/daily/i.test(consumablesPage.embed.data.description) && /midnight/i.test(consumablesPage.embed.data.description));
+    assert.ok(/daily/i.test(consumablesPage.body) && /midnight/i.test(consumablesPage.body));
   });
 
   await check("the Solo Quests page documents the skilling difficulty tiers and exact XP table", () => {
-    const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
-    const soloPage = pages.find((p) => p.embed.data.title.includes("Solo Quests"));
+    const sections = buildGuideSections({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+    const soloPage = sections.find((s) => s.title.includes("Solo Quests"));
     assert.ok(soloPage, "a Solo Quests page should exist");
-    const desc = soloPage.embed.data.description;
+    const desc = soloPage.body;
     for (const needle of ["Easy", "Medium", "Hard", "Extreme", "50,000", "62,500", "75,000", "87,500"]) {
       assert.ok(desc.includes(needle), `Solo Quests page should mention "${needle}"`);
     }
   });
 
   await check("the guide has a dedicated Clan Pool page naming all 4 quest types and both boosts", () => {
-    const pages = renderGuide({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
-    const clanPoolPage = pages.find((p) => p.embed.data.title.includes("Clan Pool"));
+    const sections = buildGuideSections({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
+    const clanPoolPage = sections.find((s) => s.title.includes("Clan Pool"));
     assert.ok(clanPoolPage, "a Clan Pool page should exist");
-    const desc = clanPoolPage.embed.data.description;
+    const desc = clanPoolPage.body;
     for (const needle of ["Skilling XP", "Boss PvM KC", "Minigame Completions", "HM Quests Completed", "coin flip", "1 week"]) {
       assert.ok(desc.includes(needle), `Clan Pool page should mention "${needle}"`);
     }
