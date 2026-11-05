@@ -73,6 +73,17 @@ const BOSS_GROUPS = {
   the_gauntlet: ["the_gauntlet", "the_corrupted_gauntlet"],
   nightmare: ["nightmare", "phosanis_nightmare"],
   dagannoth_kings: ["dagannoth_prime", "dagannoth_rex", "dagannoth_supreme"],
+  // Raid difficulty is deliberately collapsed everywhere else in this bot
+  // (see panels.js guide text and quests.js SOLO_RAID_POOL) — Normal and
+  // Challenge/Hard/Expert Mode are the same content for quest purposes. But
+  // Jagex tracks each difficulty as its own separate hiscores stat, so
+  // without grouping them here, any KC earned on Challenge/Hard/Expert Mode
+  // was silently ignored by diffProgress() for a quest targeting the normal
+  // key. This was a real bug: completing Expert Mode ToA, for example, did
+  // not progress a "Tombs of Amascut" quest at all.
+  chambers_of_xeric: ["chambers_of_xeric", "chambers_of_xeric_challenge_mode"],
+  theatre_of_blood: ["theatre_of_blood", "theatre_of_blood_hard_mode"],
+  tombs_of_amascut: ["tombs_of_amascut", "tombs_of_amascut_expert_mode"],
 };
 
 const BOSS_GROUP_MEMBERS = new Set(
