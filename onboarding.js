@@ -190,6 +190,22 @@ const WEEKLY_RECAP_CHANNEL_ID   = "1546413698979995678";
 const WEEKLY_RECAP_HOUR         = 17; // 5:00 PM, 24h clock, America/Chicago
 const WEEKLY_RECAP_ANCHOR_DATE  = { year: 2026, month: 11, day: 1 }; // First recap posts Sunday, Nov 1, 2026 at 17:00 Central
 
+// Recruitment Drive Event — everything (announcement, leaderboard, per-member
+// evidence threads) lives in this single channel.
+const RECRUITMENT_DRIVE_CHANNEL_ID   = "1567981016642097324";
+const RECRUITMENT_DRIVE_PRIZE_TEXT   = "2 Bonds";
+const RECRUITMENT_UPLOAD_WINDOW_MS   = 10 * 60 * 1000; // 10 minutes to post a screenshot after clicking the button
+const RECRUITMENT_THREAD_AUTO_ARCHIVE_MINUTES = 10080; // 1 week — the max; new posts keep un-archiving it
+// Start/end instants (America/Chicago) are computed further down, right after
+// centralTimeToUtcMs() is defined — see RECRUITMENT_DRIVE_START_MS / _END_MS.
+const RECRUITMENT_STAFF_ROLE_IDS = [
+  OWNER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  LEADER_ROLE_ID,
+  STAFF_ROLE_ID,
+  JR_STAFF_ROLE_ID,
+];
+
 const OSRS_SKILLS = [
   { name: "Attack",       hiscoreNames: ["Attack"] },
   { name: "Strength",     hiscoreNames: ["Strength"] },
@@ -395,6 +411,9 @@ const ID = {
   TICKET_COMPLIMENT_MODAL_GENERAL: "ticket_compliment_modal_general",
   TICKET_COMPLIMENT_MODAL_MEMBER:  "ticket_compliment_modal_member",
   TICKET_COMPLIMENT_MESSAGE_INPUT: "ticket_compliment_message_input",
+  // Recruitment Drive Event custom IDs
+  RECRUITMENT_UPLOAD_BTN:    "recruitment_upload_btn",
+  RECRUITMENT_CONFIRM_BONUS: "recruitment_confirm_bonus",
 };
 
 const COLOR = {
@@ -2074,6 +2093,11 @@ function centralTimeToUtcMs(year, month, day, hour = 0, minute = 0, second = 0) 
   const firstGuess = targetWallUtc - getOffsetAt(targetWallUtc);
   return targetWallUtc - getOffsetAt(firstGuess);
 }
+
+// Recruitment Drive Event window — Nov 10, 2026 12:00 PM Central through
+// Jan 10, 2027 12:00 PM Central.
+const RECRUITMENT_DRIVE_START_MS = centralTimeToUtcMs(2026, 11, 10, 12, 0, 0);
+const RECRUITMENT_DRIVE_END_MS   = centralTimeToUtcMs(2027, 1, 10, 12, 0, 0);
 
 function addCalendarDays(year, month, day, daysToAdd) {
   const d = new Date(Date.UTC(year, month - 1, day + daysToAdd));
@@ -5191,8 +5215,616 @@ async function onUploadRosterSlashCommand(interaction) {
   return interaction.editReply({ embeds: [buildRosterUploadResultEmbed(result)] });
 }
 
+// ================= RECRUITMENT DRIVE EVENT =================
+// One channel (RECRUITMENT_DRIVE_CHANNEL_ID) holds: a permanent announcement
+// embed with an "Upload Screenshot" button, an auto-updating leaderboard
+// embed beneath it, and a bot-created thread per recruiting member holding
+// their numbered screenshot evidence.
+//
+// Discord buttons cannot open a native file-upload dialog, so the button
+// just opens a 10-minute submission window: the member posts their
+// screenshot (plus a short note) as a normal message in the channel, and the
+// bot grabs it, files it into their thread, deletes the original message,
+// and refreshes the leaderboard.
+const pendingRecruitmentUploads = new Map(); // userId -> { expiresAt }
+// In-memory fallback only used if Supabase isn't configured — nothing here
+// survives a restart in that case.
+const recruitmentMemoryStore = { threads: new Map(), submissions: [], nextId: 1 };
+let recruitmentAnnouncementMessageId = null;
+let recruitmentLeaderboardMessageId = null;
+let recruitmentDriveTimer = null;
+let lastRecruitmentPhase = null;
+
+function getRecruitmentDrivePhase(now = Date.now()) {
+  if (now < RECRUITMENT_DRIVE_START_MS) return "scheduled";
+  if (now < RECRUITMENT_DRIVE_END_MS) return "active";
+  return "ended";
+}
+
+function buildRecruitmentDriveEmbed(phase) {
+  const startTs = Math.floor(RECRUITMENT_DRIVE_START_MS / 1000);
+  const endTs = Math.floor(RECRUITMENT_DRIVE_END_MS / 1000);
+
+  const embed = new EmbedBuilder()
+    .setColor(phase === "ended" ? COLOR.bad : phase === "active" ? COLOR.ok : COLOR.main)
+    .setTitle("Recruitment Drive Event")
+    .setDescription(
+      `**Starts:** <t:${startTs}:F> (<t:${startTs}:R>)\n` +
+      `**Ends:** <t:${endTs}:F> (<t:${endTs}:R>)\n\n` +
+      "Every member of the clan has an equal chance at winning. The point of this event is to find players in OSRS " +
+      "who are interested in joining a clan and might want help with the game or learning PvM/Raids — and grow the clan while we do it. " +
+      "We're a social/PvM clan, so when you're talking to potential recruits, it always helps to mention our Honour Marks system as a way " +
+      "to help them level up their account and unlock more content once they join."
+    )
+    .addFields(
+      {
+        name: "Prize",
+        value: `${RECRUITMENT_DRIVE_PRIZE_TEXT} go to whoever recruits the most new members to the clan during the event.`,
+      },
+      {
+        name: "How Points Work",
+        value:
+          "**+1 point** for every person you recruit into the clan. They are not required to stay any length of time for this point to count.\n" +
+          "**+1 additional point** if that same recruit also joins our Discord and completes onboarding, including the server nickname update.",
+      },
+      {
+        name: "What You Need To Submit",
+        value:
+          "A screenshot of the clan chatbox showing you inviting them into the clan **and** them accepting the invite. " +
+          "This is required to receive your point.",
+      },
+      {
+        name: "How To Submit A Screenshot",
+        value:
+          `Press **Upload Screenshot** below, then post your screenshot as a message in <#${RECRUITMENT_DRIVE_CHANNEL_ID}>, ` +
+          "including the recruited player's name and whether they've joined our Discord yet (yes/no) in that same message. " +
+          "Heimdall will automatically move it into your own thread in this channel and remove your original message.",
+      }
+    )
+    .setFooter({
+      text:
+        phase === "ended"
+          ? "This event has ended."
+          : phase === "active"
+          ? "Submissions are open."
+          : "Submissions open at the start date above.",
+    });
+
+  const button = new ButtonBuilder()
+    .setCustomId(ID.RECRUITMENT_UPLOAD_BTN)
+    .setStyle(phase === "active" ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    .setDisabled(phase !== "active")
+    .setLabel(phase === "ended" ? "Event Ended" : phase === "scheduled" ? "Not Started Yet" : "Upload Screenshot");
+
+  const row = new ActionRowBuilder().addComponents(button);
+  return { embeds: [embed], components: [row] };
+}
+
+function buildRecruitmentLeaderboardEmbed(standings, opts = {}) {
+  const embed = new EmbedBuilder()
+    .setColor(opts.final ? COLOR.gold : COLOR.main)
+    .setTitle(opts.final ? "Recruitment Drive — Final Leaderboard" : "Recruitment Drive Leaderboard");
+
+  if (standings.length === 0) {
+    embed.setDescription("No recruits logged yet. Be the first!");
+  } else {
+    const lines = standings.slice(0, 15).map((s, i) => {
+      const rank = i + 1;
+      const bonusNote = s.bonuses > 0 ? ` (+${s.bonuses} discord bonus${s.bonuses === 1 ? "" : "es"})` : "";
+      return `**${rank}.** <@${s.recruiterId}> — **${s.points}** point${s.points === 1 ? "" : "s"} ` +
+        `(${s.recruits} recruit${s.recruits === 1 ? "" : "s"}${bonusNote})`;
+    });
+    embed.setDescription(lines.join("\n"));
+  }
+
+  if (opts.final) {
+    const topScore = standings[0]?.points ?? 0;
+    const winners = standings.filter((s) => s.points === topScore && topScore > 0);
+    if (winners.length === 1) {
+      embed.addFields({ name: "Winner", value: `<@${winners[0].recruiterId}> takes home ${RECRUITMENT_DRIVE_PRIZE_TEXT}!` });
+    } else if (winners.length > 1) {
+      embed.addFields({
+        name: "Tie For First",
+        value: `${winners.map((w) => `<@${w.recruiterId}>`).join(", ")} are tied for first place with **${topScore}** points each.`,
+      });
+    }
+  }
+
+  embed.setFooter({
+    text: `Last updated: ${new Date().toLocaleString("en-US", { timeZone: "America/Chicago" })} Central`,
+  });
+  return { embeds: [embed] };
+}
+
+function isRecruitmentAnnouncementMessage(m) {
+  return m.author?.id === client.user.id && messageHasButton(m, [ID.RECRUITMENT_UPLOAD_BTN]);
+}
+
+function isRecruitmentLeaderboardMessage(m) {
+  const title = m.author?.id === client.user.id ? m.embeds?.[0]?.title : null;
+  return typeof title === "string" && title.startsWith("Recruitment Drive") && title.includes("Leaderboard");
+}
+
+async function getRecruitmentAnnouncementMessage(channel) {
+  if (recruitmentAnnouncementMessageId) {
+    const m = await channel.messages.fetch(recruitmentAnnouncementMessageId).catch(() => null);
+    if (m) return m;
+  }
+  const recent = await fetchRecentMessages(channel, SCAN_PAGES_PERMANENT);
+  const found = recent.find(isRecruitmentAnnouncementMessage) || null;
+  if (found) recruitmentAnnouncementMessageId = found.id;
+  return found;
+}
+
+async function getRecruitmentLeaderboardMessage(channel) {
+  if (recruitmentLeaderboardMessageId) {
+    const m = await channel.messages.fetch(recruitmentLeaderboardMessageId).catch(() => null);
+    if (m) return m;
+  }
+  const recent = await fetchRecentMessages(channel, SCAN_PAGES_PERMANENT);
+  const found = recent.find(isRecruitmentLeaderboardMessage) || null;
+  if (found) recruitmentLeaderboardMessageId = found.id;
+  return found;
+}
+
+async function getRecruitmentStandings() {
+  const supabase = getSupabase();
+  let submissions = [];
+  if (supabase) {
+    const { data, error } = await supabase.from("recruitment_drive_submissions").select("*");
+    if (error) {
+      console.error("[RecruitmentDrive] Could not load submissions:", error.message);
+    } else if (data) {
+      submissions = data;
+    }
+  } else {
+    submissions = recruitmentMemoryStore.submissions;
+  }
+
+  const byRecruiter = new Map();
+  for (const s of submissions) {
+    const key = s.recruiter_id;
+    if (!byRecruiter.has(key)) {
+      byRecruiter.set(key, { recruiterId: key, recruiterTag: s.recruiter_tag, recruits: 0, bonuses: 0, firstAt: s.created_at });
+    }
+    const entry = byRecruiter.get(key);
+    entry.recruits += 1;
+    if (s.join_bonus_awarded) entry.bonuses += 1;
+    if (new Date(s.created_at) < new Date(entry.firstAt)) entry.firstAt = s.created_at;
+  }
+
+  const standings = [...byRecruiter.values()].map((e) => ({ ...e, points: e.recruits + e.bonuses }));
+  standings.sort((a, b) => b.points - a.points || new Date(a.firstAt) - new Date(b.firstAt));
+  return standings;
+}
+
+async function refreshRecruitmentLeaderboard() {
+  const channel = await getChannelById(RECRUITMENT_DRIVE_CHANNEL_ID, "RecruitmentDrive");
+  if (!channel) return;
+  const leaderboard = await getRecruitmentLeaderboardMessage(channel);
+  const standings = await getRecruitmentStandings();
+  const payload = buildRecruitmentLeaderboardEmbed(standings, { final: getRecruitmentDrivePhase() === "ended" });
+  if (leaderboard) {
+    await leaderboard.edit(payload).catch((e) => console.warn("[RecruitmentDrive] Could not refresh leaderboard:", e.message));
+  } else {
+    const sent = await channel.send(payload).catch(() => null);
+    if (sent) recruitmentLeaderboardMessageId = sent.id;
+  }
+}
+
+async function refreshRecruitmentAnnouncement(phase) {
+  const channel = await getChannelById(RECRUITMENT_DRIVE_CHANNEL_ID, "RecruitmentDrive");
+  if (!channel) return;
+  const announcement = await getRecruitmentAnnouncementMessage(channel);
+  if (!announcement) return;
+  await announcement.edit(buildRecruitmentDriveEmbed(phase)).catch((e) => console.warn("[RecruitmentDrive] Could not refresh announcement:", e.message));
+}
+
+async function postRecruitmentDriveFinalResults() {
+  const channel = await getChannelById(RECRUITMENT_DRIVE_CHANNEL_ID, "RecruitmentDrive");
+  if (!channel) return;
+
+  const leaderboardMsg = await getRecruitmentLeaderboardMessage(channel);
+  if (leaderboardMsg?.embeds?.[0]?.title?.includes("Final")) return; // already finalized
+
+  const standings = await getRecruitmentStandings();
+  const payload = buildRecruitmentLeaderboardEmbed(standings, { final: true });
+  if (leaderboardMsg) {
+    await leaderboardMsg.edit(payload).catch((e) => console.warn("[RecruitmentDrive] Could not finalize leaderboard:", e.message));
+  } else {
+    const sent = await channel.send(payload).catch(() => null);
+    if (sent) recruitmentLeaderboardMessageId = sent.id;
+  }
+
+  const topScore = standings[0]?.points ?? 0;
+  const winners = standings.filter((s) => s.points === topScore && topScore > 0);
+  if (winners.length > 1) {
+    await channel
+      .send({
+        content:
+          `The Recruitment Drive has ended and it's a tie for first place between ${winners.map((w) => `<@${w.recruiterId}>`).join(", ")} ` +
+          `at **${topScore}** points each. <@&${LEADER_ROLE_ID}> <@&${CO_OWNER_ROLE_ID}> please decide how the ${RECRUITMENT_DRIVE_PRIZE_TEXT} prize should be handled.`,
+      })
+      .catch(() => {});
+  } else if (winners.length === 1) {
+    await channel
+      .send({
+        content: `The Recruitment Drive has ended! Congratulations to <@${winners[0].recruiterId}> for recruiting the most members and winning ${RECRUITMENT_DRIVE_PRIZE_TEXT}!`,
+      })
+      .catch(() => {});
+  }
+}
+
+async function ensureRecruitmentDriveMessages() {
+  const channel = await getChannelById(RECRUITMENT_DRIVE_CHANNEL_ID, "RecruitmentDrive");
+  if (!channel) return;
+
+  const phase = getRecruitmentDrivePhase();
+  const announcementPayload = buildRecruitmentDriveEmbed(phase);
+
+  let announcement = await getRecruitmentAnnouncementMessage(channel);
+  if (!announcement) {
+    announcement = await channel.send(announcementPayload).catch((e) => {
+      console.error("[RecruitmentDrive] Could not post announcement:", e.message);
+      return null;
+    });
+    if (announcement) {
+      recruitmentAnnouncementMessageId = announcement.id;
+      console.log("[RecruitmentDrive] Posted event announcement.");
+    }
+  } else {
+    await announcement.edit(announcementPayload).catch((e) => console.warn("[RecruitmentDrive] Could not refresh announcement:", e.message));
+  }
+
+  let leaderboard = await getRecruitmentLeaderboardMessage(channel);
+  if (!leaderboard) {
+    const standings = await getRecruitmentStandings();
+    leaderboard = await channel.send(buildRecruitmentLeaderboardEmbed(standings, { final: phase === "ended" })).catch((e) => {
+      console.error("[RecruitmentDrive] Could not post leaderboard:", e.message);
+      return null;
+    });
+    if (leaderboard) {
+      recruitmentLeaderboardMessageId = leaderboard.id;
+      console.log("[RecruitmentDrive] Posted leaderboard.");
+    }
+  }
+
+  lastRecruitmentPhase = phase;
+  if (phase === "ended") {
+    await postRecruitmentDriveFinalResults().catch((e) => console.error("[RecruitmentDrive] Final results check failed:", e.message));
+  }
+}
+
+function startRecruitmentDriveLoop() {
+  if (recruitmentDriveTimer) clearInterval(recruitmentDriveTimer);
+
+  // Check every 60 seconds for whether the event has crossed its start or end
+  // boundary so the button can be enabled/disabled right on schedule.
+  recruitmentDriveTimer = setInterval(async () => {
+    try {
+      const phase = getRecruitmentDrivePhase();
+      if (phase === lastRecruitmentPhase) return;
+      lastRecruitmentPhase = phase;
+      await refreshRecruitmentAnnouncement(phase);
+      if (phase === "ended") {
+        await postRecruitmentDriveFinalResults();
+      }
+    } catch (err) {
+      console.error("[RecruitmentDrive] Loop error:", err.message);
+    }
+  }, 60 * 1000);
+
+  if (typeof recruitmentDriveTimer.unref === "function") recruitmentDriveTimer.unref();
+}
+
+async function getOrCreateRecruitmentThread(channel, memberOrUser) {
+  const recruiterId = memberOrUser.id;
+  const supabase = getSupabase();
+
+  let threadId = null;
+  if (supabase) {
+    const { data } = await supabase
+      .from("recruitment_drive_threads")
+      .select("thread_id")
+      .eq("recruiter_id", recruiterId)
+      .maybeSingle();
+    threadId = data?.thread_id || null;
+  } else {
+    threadId = recruitmentMemoryStore.threads.get(recruiterId) || null;
+  }
+
+  if (threadId) {
+    const existing = await channel.threads.fetch(threadId).catch(() => null);
+    if (existing) return existing;
+  }
+
+  const displayName = (memberOrUser.displayName || memberOrUser.user?.username || memberOrUser.username || "Recruiter").slice(0, 90);
+
+  const thread = await channel.threads
+    .create({
+      name: displayName,
+      autoArchiveDuration: RECRUITMENT_THREAD_AUTO_ARCHIVE_MINUTES,
+      reason: "Recruitment Drive screenshot evidence thread",
+    })
+    .catch((e) => {
+      console.error("[RecruitmentDrive] Could not create thread:", e.message);
+      return null;
+    });
+  if (!thread) return null;
+
+  if (supabase) {
+    const { error } = await supabase
+      .from("recruitment_drive_threads")
+      .upsert({ recruiter_id: recruiterId, thread_id: thread.id }, { onConflict: "recruiter_id" });
+    if (error) console.error("[RecruitmentDrive] Could not persist thread mapping:", error.message);
+  } else {
+    recruitmentMemoryStore.threads.set(recruiterId, thread.id);
+  }
+
+  return thread;
+}
+
+async function getNextRecruitmentScreenshotNumber(recruiterId) {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { count, error } = await supabase
+      .from("recruitment_drive_submissions")
+      .select("id", { count: "exact", head: true })
+      .eq("recruiter_id", recruiterId);
+    if (error) {
+      console.error("[RecruitmentDrive] Could not count submissions:", error.message);
+      return 1;
+    }
+    return (count || 0) + 1;
+  }
+  return recruitmentMemoryStore.submissions.filter((s) => s.recruiter_id === recruiterId).length + 1;
+}
+
+async function recordRecruitmentSubmission({ recruiterId, recruiterTag, threadId, screenshotNumber, note }) {
+  const supabase = getSupabase();
+  const createdAt = new Date().toISOString();
+
+  if (supabase) {
+    const { data, error } = await supabase
+      .from("recruitment_drive_submissions")
+      .insert({
+        recruiter_id: recruiterId,
+        recruiter_tag: recruiterTag,
+        thread_id: threadId,
+        screenshot_number: screenshotNumber,
+        note,
+        created_at: createdAt,
+      })
+      .select("id")
+      .single();
+    if (error) {
+      console.error("[RecruitmentDrive] Could not record submission:", error.message);
+      return null;
+    }
+    return data.id;
+  }
+
+  const id = recruitmentMemoryStore.nextId++;
+  recruitmentMemoryStore.submissions.push({
+    id,
+    recruiter_id: recruiterId,
+    recruiter_tag: recruiterTag,
+    thread_id: threadId,
+    screenshot_number: screenshotNumber,
+    note,
+    join_bonus_awarded: false,
+    created_at: createdAt,
+  });
+  return id;
+}
+
+async function attachRecruitmentSubmissionMessageId(submissionId, messageId) {
+  if (submissionId == null) return;
+  const supabase = getSupabase();
+  if (supabase) {
+    const { error } = await supabase.from("recruitment_drive_submissions").update({ message_id: messageId }).eq("id", submissionId);
+    if (error) console.warn("[RecruitmentDrive] Could not attach message id:", error.message);
+    return;
+  }
+  const row = recruitmentMemoryStore.submissions.find((s) => s.id === submissionId);
+  if (row) row.message_id = messageId;
+}
+
+async function getRecruitmentSubmissionById(submissionId) {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { data, error } = await supabase.from("recruitment_drive_submissions").select("*").eq("id", submissionId).maybeSingle();
+    if (error) {
+      console.error("[RecruitmentDrive] Could not load submission:", error.message);
+      return null;
+    }
+    return data;
+  }
+  return recruitmentMemoryStore.submissions.find((s) => String(s.id) === String(submissionId)) || null;
+}
+
+async function markRecruitmentBonusAwarded(submissionId, staffUserId) {
+  const supabase = getSupabase();
+  const awardedAt = new Date().toISOString();
+  if (supabase) {
+    const { error } = await supabase
+      .from("recruitment_drive_submissions")
+      .update({ join_bonus_awarded: true, join_bonus_awarded_by: staffUserId, join_bonus_awarded_at: awardedAt })
+      .eq("id", submissionId);
+    if (error) console.error("[RecruitmentDrive] Could not mark bonus awarded:", error.message);
+    return;
+  }
+  const row = recruitmentMemoryStore.submissions.find((s) => String(s.id) === String(submissionId));
+  if (row) {
+    row.join_bonus_awarded = true;
+    row.join_bonus_awarded_by = staffUserId;
+    row.join_bonus_awarded_at = awardedAt;
+  }
+}
+
+async function onRecruitmentUploadButton(interaction) {
+  const phase = getRecruitmentDrivePhase();
+  if (phase === "scheduled") {
+    const startTs = Math.floor(RECRUITMENT_DRIVE_START_MS / 1000);
+    return interaction.reply({
+      content: `This event hasn't started yet — it opens <t:${startTs}:F> (<t:${startTs}:R>).`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+  if (phase === "ended") {
+    return interaction.reply({ content: "This event has ended. Thanks for taking part!", flags: MessageFlags.Ephemeral });
+  }
+
+  pendingRecruitmentUploads.set(interaction.user.id, { expiresAt: Date.now() + RECRUITMENT_UPLOAD_WINDOW_MS });
+
+  return interaction.reply({
+    content:
+      `Post your screenshot as a message right here in <#${RECRUITMENT_DRIVE_CHANNEL_ID}> within the next 10 minutes.\n\n` +
+      "In the **same message as the screenshot**, include:\n" +
+      "1. The name of the player you recruited\n" +
+      "2. Whether they've joined our Discord yet (yes/no)\n\n" +
+      "Example: `PlayerName123 - no, not on Discord yet`\n\n" +
+      "Heimdall will move it into your own thread in this channel and delete the original message automatically.",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function onRecruitmentConfirmBonus(interaction, submissionId) {
+  if (!hasAnyRole(interaction.member, RECRUITMENT_STAFF_ROLE_IDS)) {
+    return interaction.reply({
+      content: "Only Staff, Jr. Staff, Leaders, Co-Owners, or the Owner can confirm this bonus.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const submission = await getRecruitmentSubmissionById(submissionId);
+  if (!submission) {
+    return interaction.reply({ content: "Could not find this submission anymore.", flags: MessageFlags.Ephemeral });
+  }
+  if (submission.join_bonus_awarded) {
+    return interaction.reply({ content: "This bonus has already been confirmed.", flags: MessageFlags.Ephemeral });
+  }
+
+  await markRecruitmentBonusAwarded(submissionId, interaction.user.id);
+
+  const confirmedRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_CONFIRM_BONUS}:${submissionId}:done`)
+      .setLabel(`Discord Join Bonus Confirmed — ${interaction.member?.displayName || interaction.user.username}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true)
+  );
+  await interaction.message.edit({ components: [confirmedRow] }).catch((e) => console.warn("[RecruitmentDrive] Could not update thread message:", e.message));
+
+  await refreshRecruitmentLeaderboard();
+
+  return interaction.reply({ content: "Confirmed — the Discord join bonus point has been added to the leaderboard.", flags: MessageFlags.Ephemeral });
+}
+
+async function handleRecruitmentDriveMessage(message) {
+  const phase = getRecruitmentDrivePhase();
+  const session = pendingRecruitmentUploads.get(message.author.id);
+  const hasActiveSession = !!session && session.expiresAt > Date.now();
+  const attachment = message.attachments?.first();
+  const isImage =
+    !!attachment && (attachment.contentType?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(attachment.name || ""));
+
+  if (phase !== "active" || !hasActiveSession || !isImage) {
+    await message.delete().catch(() => {});
+    if (phase === "active") {
+      const note = !hasActiveSession
+        ? "Press **Upload Screenshot** on the event post above first, then post your screenshot here."
+        : "That message needs an image screenshot attached.";
+      const temp = await message.channel.send({ content: `<@${message.author.id}> ${note}` }).catch(() => null);
+      if (temp) setTimeout(() => temp.delete().catch(() => {}), 15000);
+    }
+    return;
+  }
+
+  const note = (message.content || "").trim();
+  if (!note) {
+    await message.delete().catch(() => {});
+    const temp = await message.channel
+      .send({
+        content: `<@${message.author.id}> Please include the recruited player's name and whether they've joined our Discord (yes/no) in the same message as your screenshot, then try again.`,
+      })
+      .catch(() => null);
+    if (temp) setTimeout(() => temp.delete().catch(() => {}), 15000);
+    return; // session stays open so they can retry within the window
+  }
+
+  pendingRecruitmentUploads.delete(message.author.id);
+
+  let buffer;
+  try {
+    const res = await fetch(attachment.url);
+    buffer = Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    console.error("[RecruitmentDrive] Could not download screenshot:", err.message);
+    const temp = await message.channel
+      .send({ content: `<@${message.author.id}> Something went wrong downloading your screenshot. Please try again.` })
+      .catch(() => null);
+    if (temp) setTimeout(() => temp.delete().catch(() => {}), 15000);
+    return;
+  }
+
+  const channel = await getChannelById(RECRUITMENT_DRIVE_CHANNEL_ID, "RecruitmentDrive");
+  if (!channel) return;
+
+  const thread = await getOrCreateRecruitmentThread(channel, message.member || message.author);
+  if (!thread) return;
+
+  const screenshotNumber = await getNextRecruitmentScreenshotNumber(message.author.id);
+  const submissionId = await recordRecruitmentSubmission({
+    recruiterId: message.author.id,
+    recruiterTag: message.author.tag,
+    threadId: thread.id,
+    screenshotNumber,
+    note,
+  });
+
+  const fileName = attachment.name || `screenshot-${screenshotNumber}.png`;
+  const fileAttachment = new AttachmentBuilder(buffer, { name: fileName });
+  const nowTs = Math.floor(Date.now() / 1000);
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle(`Screenshot #${screenshotNumber}`)
+    .addFields(
+      { name: "Submitted By", value: `<@${message.author.id}>`, inline: true },
+      { name: "Uploaded", value: `<t:${nowTs}:F>`, inline: true },
+      { name: "Details", value: note }
+    )
+    .setImage(`attachment://${fileName}`);
+
+  const bonusRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_CONFIRM_BONUS}:${submissionId}`)
+      .setLabel("Confirm Discord Join Bonus (Staff Only)")
+      .setStyle(ButtonStyle.Success)
+  );
+
+  const sent = await thread.send({ embeds: [embed], files: [fileAttachment], components: [bonusRow] }).catch((e) => {
+    console.error("[RecruitmentDrive] Could not post to thread:", e.message);
+    return null;
+  });
+
+  if (sent) {
+    await attachRecruitmentSubmissionMessageId(submissionId, sent.id);
+  }
+
+  await message.delete().catch(() => {});
+  await refreshRecruitmentLeaderboard();
+}
+
 async function handleMessageCreate(message) {
   if (!message || message.author?.bot) return;
+
+  if (message.guildId && message.channelId === RECRUITMENT_DRIVE_CHANNEL_ID) {
+    await handleRecruitmentDriveMessage(message).catch((e) => console.error("[RecruitmentDrive] message handler error:", e.message));
+    return; // this channel is fully bot-managed — nothing else should act on it
+  }
+
   if (!message.attachments || message.attachments.size === 0) return;
 
   const session = pendingRosterUploads.get(message.author.id);
@@ -5461,6 +6093,8 @@ async function handleInteraction(interaction) {
       case ID.TICKET_COMPLIMENT_TARGET:        return onTicketComplimentTarget(interaction, payload);
       case ID.TICKET_COMPLIMENT_USER_CONFIRM:  return onTicketComplimentUserConfirm(interaction, payload);
       case ID.TICKET_COMPLIMENT_USER_CANCEL:   return onTicketComplimentUserCancel(interaction);
+      case ID.RECRUITMENT_UPLOAD_BTN:    return onRecruitmentUploadButton(interaction);
+      case ID.RECRUITMENT_CONFIRM_BONUS: return onRecruitmentConfirmBonus(interaction, payload);
       default:                      return;
     }
   }
@@ -5542,6 +6176,12 @@ client.once(Events.ClientReady, async () => {
     startWeeklyRecapLoop();
   } catch (err) {
     console.error("[WeeklyRecap] Initial check failed:", err.message);
+  }
+  try {
+    await ensureRecruitmentDriveMessages();
+    startRecruitmentDriveLoop();
+  } catch (err) {
+    console.error("[RecruitmentDrive] Initial setup failed:", err.message);
   }
 });
 
@@ -5753,4 +6393,26 @@ module.exports = {
   buildWeeklyRecapEmbed,
   runWeeklyRecap,
   startWeeklyRecapLoop,
+  // Recruitment Drive exports
+  RECRUITMENT_DRIVE_CHANNEL_ID,
+  RECRUITMENT_DRIVE_PRIZE_TEXT,
+  RECRUITMENT_DRIVE_START_MS,
+  RECRUITMENT_DRIVE_END_MS,
+  RECRUITMENT_UPLOAD_WINDOW_MS,
+  RECRUITMENT_STAFF_ROLE_IDS,
+  getRecruitmentDrivePhase,
+  buildRecruitmentDriveEmbed,
+  buildRecruitmentLeaderboardEmbed,
+  getRecruitmentStandings,
+  getOrCreateRecruitmentThread,
+  getNextRecruitmentScreenshotNumber,
+  recordRecruitmentSubmission,
+  getRecruitmentSubmissionById,
+  markRecruitmentBonusAwarded,
+  ensureRecruitmentDriveMessages,
+  refreshRecruitmentLeaderboard,
+  postRecruitmentDriveFinalResults,
+  onRecruitmentUploadButton,
+  onRecruitmentConfirmBonus,
+  handleRecruitmentDriveMessage,
 };
