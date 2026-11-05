@@ -203,6 +203,31 @@ create table if not exists public.weekly_recap_snapshots (
 
 create index if not exists idx_weekly_recap_snapshots_week on public.weekly_recap_snapshots (week_key);
 
+-- 7. Recruitment Drive Event (Nov 10, 2026 12:00 PM Central -> Jan 10, 2027
+--    12:00 PM Central) — one evidence thread per recruiting member, plus a
+--    row per screenshot they submit so the leaderboard can be computed live.
+create table if not exists public.recruitment_drive_threads (
+  recruiter_id text primary key,
+  thread_id    text not null,
+  created_at   timestamptz not null default now()
+);
+
+create table if not exists public.recruitment_drive_submissions (
+  id                     bigserial primary key,
+  recruiter_id           text not null,
+  recruiter_tag          text,
+  thread_id              text not null,
+  message_id             text,
+  screenshot_number      integer not null,
+  note                   text,
+  join_bonus_awarded     boolean not null default false,
+  join_bonus_awarded_by  text,
+  join_bonus_awarded_at  timestamptz,
+  created_at             timestamptz not null default now()
+);
+
+create index if not exists idx_recruitment_drive_submissions_recruiter on public.recruitment_drive_submissions (recruiter_id);
+
 -- Disable RLS so the bot can read/write freely
 alter table public.clan_members disable row level security;
 alter table public.roster_upload disable row level security;
@@ -211,6 +236,8 @@ alter table public.clan_growth_history disable row level security;
 alter table public.weekly_events disable row level security;
 alter table public.pending_rank_xp disable row level security;
 alter table public.weekly_recap_snapshots disable row level security;
+alter table public.recruitment_drive_threads disable row level security;
+alter table public.recruitment_drive_submissions disable row level security;
 
 -- 5. Enable Realtime on clan_members, roster_upload, and clan_growth_history
 do $$

@@ -4,7 +4,8 @@
   "description": "Odinheim Discord onboarding bot",
   "main": "onboarding.js",
   "scripts": {
-    "start": "node onboarding.js"
+    "start": "node onboarding.js",
+    "test": "node test/recruitment-drive.test.js"
   },
   "engines": {
     "node": ">=22"
