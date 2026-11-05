@@ -4593,6 +4593,31 @@ async function syncClanRanks(asOfDate = new Date()) {
 
 let realtimeChannel = null;
 let syncTimer = null;
+const RANK_SYNC_HEARTBEAT_MS = 60 * 1000; // how often we check whether a sync is due
+
+/**
+ * Pure/testable "is it time to run another tenure sync" check. Tenure XP
+ * (time in the clan) is recomputed as a full replay from each member's
+ * joined_date every time syncClanRanks() runs — it is NOT something that
+ * only advances when a roster CSV is re-uploaded. The only thing that was
+ * ever supposed to gate it is: don't overlap a sync already in flight, and
+ * don't run more often than config.rankSyncIntervalMs.
+ *
+ * Pulled out of the old single setInterval(…, 30 minutes) into a 60-second
+ * heartbeat check (same pattern as the Weekly Recap / Weekly Events /
+ * Recruitment Drive loops elsewhere in this file) so a sync is guaranteed to
+ * fire within a minute of becoming due, rather than depending on one
+ * long-lived timer surviving uninterrupted for the full 30 minutes.
+ */
+// `lastSyncAt`/`inFlight` default to the live module state so the heartbeat
+// loop below can call isRankSyncDue() with no arguments, but both are
+// accepted as explicit params too so this decision logic is unit-testable
+// without needing a real Supabase connection or an actual sync to happen.
+function isRankSyncDue(now = Date.now(), lastSyncAt = lastRankSyncFinishedAt, inFlight = rankSyncInFlight) {
+  if (inFlight) return false;
+  if (!lastSyncAt) return true; // never synced yet this process — do it now
+  return now - lastSyncAt >= config.rankSyncIntervalMs;
+}
 
 function startRankingSyncLoop() {
   const supabase = getSupabase();
@@ -4620,15 +4645,27 @@ function startRankingSyncLoop() {
         if (rankSyncInFlight || Date.now() - lastRankSyncFinishedAt < 5000) return;
         syncClanRanks().catch((e) => console.error("[RankSync] Quest XP sync error:", e.message));
       })
-      .subscribe();
+      .subscribe((status, err) => {
+        // Realtime failing to (re)connect is silent otherwise — if this never
+        // logs SUBSCRIBED, tenure/XP updates are relying on the heartbeat
+        // loop below alone, which is still fine, but worth knowing about.
+        if (status === "SUBSCRIBED") {
+          console.log("[RankSync] Realtime subscription active (clan_members / roster_upload / pending_rank_xp).");
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          console.warn(`[RankSync] Realtime subscription status: ${status}${err ? ` (${err.message})` : ""}. Falling back to the ${config.rankSyncIntervalMs / 60000}-minute heartbeat sync.`);
+        }
+      });
   } catch (err) {
     console.warn("[RankSync] Realtime subscription warning:", err.message);
   }
 
+  if (syncTimer) clearInterval(syncTimer);
   if (config.rankSyncIntervalMs > 0) {
+    console.log(`[RankSync] Heartbeat sync loop started — tenure XP and ranks recompute automatically at least every ${config.rankSyncIntervalMs / 60000} minutes.`);
     syncTimer = setInterval(() => {
+      if (!isRankSyncDue()) return;
       syncClanRanks().catch((e) => console.error("[RankSync] Scheduled sync error:", e.message));
-    }, config.rankSyncIntervalMs);
+    }, RANK_SYNC_HEARTBEAT_MS);
     if (typeof syncTimer.unref === "function") syncTimer.unref();
   }
 }
@@ -6331,6 +6368,8 @@ module.exports = {
   buildMemberLeftAlertStep2,
   ensureRankListMessage,
   syncClanRanks,
+  isRankSyncDue,
+  startRankingSyncLoop,
   parseRosterText,
   importRosterRows,
   processRosterUpload,
