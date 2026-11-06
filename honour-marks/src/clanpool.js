@@ -209,6 +209,34 @@ async function completeClanQuest(guildId, quest) {
 }
 
 /**
+ * Read-only progress total for DISPLAY (the Clan Pool board's progress bar) —
+ * deliberately separate from checkClanQuestProgress below, which is the only
+ * function allowed to lazily add members' baselines or complete the quest.
+ * This never writes to the DB and never completes anything, so it's safe to
+ * call on every panel render without racing the periodic tick that does both
+ * of those things. A member not yet in `quest.baselines` contributes 0 here,
+ * same as they would on checkClanQuestProgress's first tick after they're
+ * picked up — so this never shows a number ahead of what the real check will
+ * settle on.
+ */
+async function peekClanQuestProgress(guildId, quest) {
+  if (!quest) return 0;
+
+  const members = await getRegisteredMembers(guildId);
+  const completionCounts =
+    quest.quest_type === "quest_completions" ? await getLifetimeQuestCompletions(guildId) : null;
+  const baselines = quest.baselines || {};
+
+  let total = 0;
+  for (const m of members) {
+    if (!(m.user_id in baselines)) continue;
+    const current = await currentMemberTotal(quest.quest_type, m, completionCounts);
+    total += Math.max(0, current - baselines[m.user_id]);
+  }
+  return total;
+}
+
+/**
  * Evaluates clan-wide progress against live totals, lazily tracks any newly
  * registered member, and completes + immediately restarts the quest once the
  * target is reached. Meant to be called on a periodic timer per guild.
@@ -272,6 +300,6 @@ module.exports = {
   CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI,
   CLAN_BOOST_KINDS, CLAN_BOOST_PCT, CLAN_BOOST_DURATION_MS, CLAN_BOOST_LABELS,
   clanMemberTier, computeClanQuestTarget,
-  ensureClanQuest, checkClanQuestProgress, completeClanQuest, getActiveClanBoost, clanBoostMultiplier,
+  ensureClanQuest, checkClanQuestProgress, peekClanQuestProgress, completeClanQuest, getActiveClanBoost, clanBoostMultiplier,
   getLifetimeQuestCompletions, currentMemberTotal, getRegisteredMembers,
 };
