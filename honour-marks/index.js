@@ -36,6 +36,8 @@ const {
 const {
   PERK_TIERS, BOOST_TIERS, CONSUMABLES, ITEM_CATALOG, ITEM_SLOT, ITEM_SLOT_LABEL,
   perkBonusPercent, boostBonusLabel,
+  joinInventoryFieldLines, perkInventoryLine, itemInventoryLine, consumableInventoryLine,
+  boostOwnedInventoryLine, boostActiveInventoryLine,
   getBalance, getPerks, getPerkTier, getItems, getItemTier, getItemTiers, getInventory, getActiveBoosts,
   buyPerk, buyItem, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
   createSoloQuestWithChoiceToken, createPartyQuestWithChoiceToken, createOpenTeamWithChoiceToken,
@@ -2138,24 +2140,16 @@ async function handleInventory(interaction) {
   const perks = await getPerks(interaction.user.id);
   const items = await getItems(interaction.user.id);
 
-  const boostLines = inv.filter((i) => i.boost_tier > 0).map((i) => {
-    const spec = BOOST_TIERS.find((t) => t.tier === i.boost_tier);
-    return `• ${TREE_BY_KEY[i.tree]?.label || i.tree} — T${i.boost_tier}, ${boostBonusLabel(spec?.multiplier)} quest-completion XP for ${spec?.weeks || "?"} week(s) — not active yet ×${i.quantity}`;
-  });
-  const consumableLines = inv.filter((i) => i.boost_tier === 0).map((i) => {
-    const spec = CONSUMABLES[i.tree];
-    return `• ${spec?.emoji || "🎫"} ${spec?.label || i.tree} ×${i.quantity}`;
-  });
-  const activeLines = boosts.map(
-    (b) => `• ${TREE_BY_KEY[b.tree]?.label || b.tree} — ${boostBonusLabel(b.multiplier)} quest-completion XP, ends <t:${Math.floor(new Date(b.expires_at).getTime() / 1000)}:R>`
-  );
-  const perkLines = perks.map(
-    (p) => `• ${TREE_BY_KEY[p.tree]?.label || p.tree} — T${p.tier} (+${perkBonusPercent(p.tier)}%)`
-  );
-  const itemLines = items.map((i) => {
-    const name = ITEM_CATALOG[i.tree]?.[i.slot]?.[i.tier - 1]?.name || i.slot;
-    return `• ${TREE_BY_KEY[i.tree]?.label || i.tree} — ${ITEM_SLOT_LABEL[i.slot] || i.slot} T${i.tier} (${name})`;
-  });
+  // Every line below spells out the actual effect, not just the name/tier —
+  // what good is seeing you own "Gilded Spade T3" if you can't remember what
+  // a Gilded Spade actually does without going back to the shop panel.
+  const boostLines = inv.filter((i) => i.boost_tier > 0)
+    .map((i) => boostOwnedInventoryLine(i.tree, i.boost_tier, i.quantity));
+  const consumableLines = inv.filter((i) => i.boost_tier === 0)
+    .map((i) => consumableInventoryLine(i.tree, i.quantity));
+  const activeLines = boosts.map((b) => boostActiveInventoryLine(b.tree, b.multiplier, b.expires_at));
+  const perkLines = perks.map((p) => perkInventoryLine(p.tree, p.tier));
+  const itemLines = items.map((i) => itemInventoryLine(i.tree, i.slot, i.tier));
 
   const rows = [];
   const boostOptions = inv
@@ -2221,11 +2215,11 @@ async function handleInventory(interaction) {
         .setTitle("🎒 Inventory")
         .setDescription(`You hold **${bal.balance.toLocaleString()}** ${HM_EMOJI}`)
         .addFields(
-          { name: "Perks", value: perkLines.join("\n") || "_None_", inline: false },
-          { name: "Items", value: itemLines.join("\n") || "_None_", inline: false },
-          { name: "Boosts owned", value: boostLines.join("\n") || "_None_", inline: false },
-          { name: "Consumables", value: consumableLines.join("\n") || "_None_", inline: false },
-          { name: "Active boosts", value: activeLines.join("\n") || "_None_", inline: false }
+          { name: "Perks", value: joinInventoryFieldLines(perkLines), inline: false },
+          { name: "Items", value: joinInventoryFieldLines(itemLines), inline: false },
+          { name: "Boosts owned", value: joinInventoryFieldLines(boostLines), inline: false },
+          { name: "Consumables", value: joinInventoryFieldLines(consumableLines), inline: false },
+          { name: "Active boosts", value: joinInventoryFieldLines(activeLines), inline: false }
         ),
     ],
     components: rows,
