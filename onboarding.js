@@ -4821,7 +4821,13 @@ const SERVER_PRIVACY_CATEGORIES = {
   },
   [OSRS_VOICE_CATEGORY_ID]: {
     label: "Clan Chat",
-    default: { everyone: EVERYONE_DENY, allowRoleIds: CLAN_MEMBER_AND_ABOVE_ROLE_IDS, dynamicUnverifiedGate: true },
+    // The OSRS role is what gives Clan Friends (and anyone else who isn't
+    // yet a full Clan Member) visibility into the general OSRS category —
+    // but ONLY the general category default. Clan Chat itself, the
+    // Recruitment Drive, and the Rank List are each listed explicitly below
+    // WITHOUT the OSRS role, specifically so holding the OSRS role never
+    // unlocks those three — they stay Clan-Member-and-above only.
+    default: { everyone: EVERYONE_DENY, allowRoleIds: [...CLAN_MEMBER_AND_ABOVE_ROLE_IDS, OSRS_ROLE_ID], dynamicUnverifiedGate: true },
     channels: {
       // Named explicitly (rather than relying solely on category-child
       // discovery) because these three live outside what the bot can assume
@@ -4968,6 +4974,38 @@ function isPendingOrientation(member) {
 }
 
 /**
+ * Whether a member should hold the OSRS role — the role that gives
+ * visibility into the general OSRS category (NOT Clan Chat/Recruitment
+ * Drive/Rank List, which stay Clan-Member-and-above only regardless):
+ *   - a Clan Friend, as soon as they are one, or
+ *   - a Clan Member who has finished nickname verification (no longer
+ *     Unverified) — this mirrors what onConfirm2 already grants directly
+ *     at the moment nickname verification completes; this check exists so
+ *     the same outcome is also reachable via the role-change listener and
+ *     the heartbeat reconciler, for members whose state drifts or who
+ *     existed before this rule did.
+ */
+function isEligibleForOsrsRole(member) {
+  if (memberHasRole(member, CLAN_FRIEND_ROLE_ID)) return true;
+  if (memberHasRole(member, CLAN_MEMBER_ROLE_ID) && !memberHasRole(member, UNVERIFIED_ROLE_ID)) return true;
+  return false;
+}
+
+/**
+ * Additive only — never removes the OSRS role. The ask is "grant it once
+ * eligible", not "revoke it the moment some other role changes", so a Clan
+ * Friend who later becomes a (still-eligible) Clan Member, or any other
+ * edge case, is never stripped of access it already had.
+ */
+async function syncOsrsRoleForMember(member) {
+  if (!isEligibleForOsrsRole(member)) return;
+  if (memberHasRole(member, OSRS_ROLE_ID)) return;
+  await member.roles
+    .add(OSRS_ROLE_ID, "OSRS role — eligible via Clan Friend or verified Clan Member")
+    .catch((e) => console.error(`[ServerPrivacy] Could not grant OSRS role to ${member.id}: ${e.message}`));
+}
+
+/**
  * Grants/revokes ONE member's personal View Channel ALLOW override. For
  * gates where the baseline (no override at all) is already hidden, and the
  * override's only job is to temporarily REVEAL the channel — e.g. the
@@ -5067,6 +5105,7 @@ async function reconcileAllMembersChannelAccess(guild) {
     try {
       await syncClanChatAccessForMember(member);
       await syncOrientationAccessForMember(member);
+      await syncOsrsRoleForMember(member);
     } catch (err) {
       console.error(`[ServerPrivacy] Could not reconcile ${member.id}: ${err.message}`);
     }
@@ -5136,6 +5175,11 @@ async function processOnboardingCompletion(guild, userId) {
       console.log(`[Onboarding] ${userId} finished Discord onboarding WITHOUT clan role -> Unverified removed, no ping.`);
     }
 
+    // A Clan Friend who just finished onboarding gets the OSRS role right
+    // away — that's what unlocks the general OSRS category for them (Clan
+    // Chat/Recruitment Drive/Rank List stay off-limits regardless).
+    await syncOsrsRoleForMember(member);
+
     // Lock Clan Chat for a fresh Unverified Clan Member right away rather than
     // waiting for the next heartbeat — they shouldn't see it for even a moment.
     await syncClanChatAccessForMember(member).catch((e) =>
@@ -5163,6 +5207,9 @@ async function handleMemberUpdate(oldMember, newMember) {
     }
     if (relevantChanged([STAFF_ROLE_ID, JR_STAFF_ROLE_ID, LEADER_ROLE_ID, VERIFIED_STAFF_ROLE_ID, VERIFIED_LEADER_ROLE_ID])) {
       await syncOrientationAccessForMember(newMember);
+    }
+    if (relevantChanged([CLAN_FRIEND_ROLE_ID, CLAN_MEMBER_ROLE_ID, UNVERIFIED_ROLE_ID])) {
+      await syncOsrsRoleForMember(newMember);
     }
   } catch (err) {
     console.error(`[ServerPrivacy] reconcile on role change failed for ${newMember.id}:`, err.message);
@@ -6908,6 +6955,8 @@ module.exports = {
   applyServerPrivacyCategory,
   isPendingNicknameVerification,
   isPendingOrientation,
+  isEligibleForOsrsRole,
+  syncOsrsRoleForMember,
   isServerPrivacySyncDue,
   applyServerPrivacyConfig,
   runServerPrivacySync,
@@ -6916,4 +6965,6 @@ module.exports = {
   setMemberChannelBlock,
   syncClanChatAccessForMember,
   syncOrientationAccessForMember,
+  reconcileAllMembersChannelAccess,
+  processOnboardingCompletion,
 };
