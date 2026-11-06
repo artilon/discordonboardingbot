@@ -118,28 +118,33 @@ function buildPanelComponents(panelKey, pageIndex, pageCount) {
 
 // ── Database panel ───────────────────────────────────────────────────────────
 /**
- * One line per member: rank, HM held, and every quest type they've completed.
+ * The member database, styled as a leaderboard: ranked #1 downward by total
+ * HM EARNED over the member's lifetime (not current balance — someone who's
+ * spent a lot in the shop shouldn't look like they've contributed less).
+ * Each line still shows everything the plain database view did (HM held,
+ * HM earned, and every quest type completed) — this only changes the sort
+ * order and adds the rank number, it's still the same underlying record.
  * Reads the `hm_member_totals` view so the numbers can't drift from the ledger.
  */
 async function renderDatabase(guildId) {
   const supabase = getSupabase();
-  if (!supabase) return [emptyPage("📊 Honour Marks Database", "Database unavailable.")];
+  if (!supabase) return [emptyPage("🏆 Honour Marks Leaderboard", "Database unavailable.")];
 
   const { data, error } = await supabase
     .from("hm_member_totals")
     .select("*")
     .eq("guild_id", guildId);
 
-  if (error) return [emptyPage("📊 Honour Marks Database", `Couldn't load: ${error.message}`)];
+  if (error) return [emptyPage("🏆 Honour Marks Leaderboard", `Couldn't load: ${error.message}`)];
 
   const rows = (data || [])
     .filter((r) => r.rsn)
-    .sort((a, b) => (Number(b.balance) || 0) - (Number(a.balance) || 0));
+    .sort((a, b) => (Number(b.total_earned) || 0) - (Number(a.total_earned) || 0));
 
   if (!rows.length) {
     return [
       emptyPage(
-        "📊 Honour Marks Database",
+        "🏆 Honour Marks Leaderboard",
         "_No registered members yet._\n\nUse `/register` to link your RuneScape name and appear here."
       ),
     ];
@@ -147,13 +152,16 @@ async function renderDatabase(guildId) {
 
   const prestiged = await getPrestigedSet(rows.map((r) => r.user_id));
 
-  const lines = rows.map((r) => {
+  // Rank numbers are assigned here, before chunking into pages, so they
+  // keep counting up correctly across page boundaries (#1 on page 1, but
+  // whatever comes next — #26, say — correctly continues on page 2).
+  const lines = rows.map((r, i) => {
     const total = (Number(r.solo_daily) || 0) + (Number(r.solo_weekly) || 0) +
       (Number(r.solo_monthly) || 0) + (Number(r.duo) || 0) + (Number(r.trio) || 0) + (Number(r.quad) || 0);
     const prestigeTag = prestiged.has(r.user_id) ? ` ${PRESTIGE_EMOJI}` : "";
     return (
-      `**${r.rsn}**${prestigeTag} — ${HM_EMOJI} \`${(Number(r.balance) || 0).toLocaleString()}\` held • ` +
-      `\`${(Number(r.total_earned) || 0).toLocaleString()}\` earned total\n` +
+      `**#${i + 1} — ${r.rsn}**${prestigeTag} — ${HM_EMOJI} \`${(Number(r.total_earned) || 0).toLocaleString()}\` earned • ` +
+      `\`${(Number(r.balance) || 0).toLocaleString()}\` held\n` +
       `┗ Quests \`${total}\` • D \`${r.solo_daily || 0}\` · W \`${r.solo_weekly || 0}\` · M \`${r.solo_monthly || 0}\` · ` +
       `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\``
     );
@@ -168,14 +176,15 @@ async function renderDatabase(guildId) {
 
   const header =
     `**Members:** \`${rows.length}\` • **HM in circulation:** \`${totalHm.toLocaleString()}\` • ` +
-    `**Quests completed:** \`${totalQuests}\`\n\n`;
+    `**Quests completed:** \`${totalQuests}\`\n` +
+    `Ranked by total HM earned — most earned at the top.\n\n`;
 
   const chunks = chunkLines(lines, header);
 
   return chunks.map((chunk, i) => {
     const embed = new EmbedBuilder()
       .setColor(COLOR.main)
-      .setTitle(i === 0 ? "📊 Honour Marks Database" : "📊 Honour Marks Database (cont'd)")
+      .setTitle(i === 0 ? "🏆 Honour Marks Leaderboard" : "🏆 Honour Marks Leaderboard (cont'd)")
       .setDescription((i === 0 ? header : "") + chunk.join("\n"))
       .setThumbnail(HM_ICON_URL)
       .setFooter({ text: `Odinheim • ${chunks.length > 1 ? `Part ${i + 1}/${chunks.length} • ` : ""}Updated` })
@@ -1233,9 +1242,10 @@ function buildGuideSections(setup = {}) {
         `**\`/hm refresh\`** — forces every Honour Marks panel (quest board, LFG board, shop, database, this ` +
         `guide) to redraw immediately instead of waiting for the next automatic refresh. Handy if something ` +
         `looks out of date.\n\n` +
-        `**${dbCh}** — a read-only, live-updating leaderboard showing every registered member's balance and ` +
-        `quest completion counts at a glance. It updates automatically as people complete quests; you don't ` +
-        `need to do anything special to appear on it beyond registering and finishing at least one quest.\n\n` +
+        `**${dbCh}** — a read-only, live-updating leaderboard ranked by total HM earned (most at the top), ` +
+        `showing every registered member's HM and quest completion counts at a glance. It updates ` +
+        `automatically as people complete quests; you don't need to do anything special to appear on it ` +
+        `beyond registering and finishing at least one quest.\n\n` +
         `**Every Honour Marks channel is read-only for humans** — you can't post, start a thread, or react in ` +
         `${questsCh}, ${shopCh}, ${dbCh}, or this guide channel. Every single action in this whole system ` +
         `happens through a button or dropdown on a panel, never by typing in the channel.`,
@@ -1270,8 +1280,8 @@ function buildGuideSections(setup = {}) {
         `automatically refunded if the action you tried to use them for fails. If you believe one was lost ` +
         `anyway, bring it to a staff member with the details so they can check the log.\n\n` +
         `**"Where do I see everyone else's progress?"** The quest board lists every currently active solo and ` +
-        `team quest clan-wide, and ${dbCh} shows a running leaderboard of completions and balances for every ` +
-        `registered member.\n\n` +
+        `team quest clan-wide, and ${dbCh} shows a running leaderboard, ranked by total HM earned, of ` +
+        `completions and balances for every registered member.\n\n` +
         `Still stuck on something this guide didn't cover? Ask in the server — if it comes up more than once, ` +
         `it probably belongs on this page.`,
     },
