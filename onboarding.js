@@ -51,6 +51,7 @@ const {
   GuildMemberFlags,
   MessageFlags,
   ModalBuilder,
+  OverwriteType,
   PermissionFlagsBits,
   StringSelectMenuBuilder,
   TextInputBuilder,
@@ -94,6 +95,29 @@ const ROSTER_UPLOAD_ROLE_IDS = [
 const STAFF_ALERT_CHANNEL_ID = "1561481869197840504";
 const RANK_LIST_CHANNEL_ID   = "1561482413341679757";
 const RANK_LOG_CHANNEL_ID    = "1561484125016428605";
+
+// ================= SERVER PRIVACY (channel/category visibility) =================
+// Roles granted during Discord's own native onboarding flow (not by the bot).
+const CLAN_FRIEND_ROLE_ID    = "1559320122223493151";
+const SOCIAL_CHATTER_ROLE_ID = "1546419961638035477";
+
+// Categories this bot manages access to. OSRS_VOICE_CATEGORY_ID (defined further
+// below) doubles as the "Clan Chat" category — the OSRS temp voice channels live
+// in the same category as the rest of general clan chat.
+const WELCOME_CATEGORY_ID     = "1546571345859575868";
+const STAFF_AREA_CATEGORY_ID  = "1546415658458292394";
+const SOCIAL_HUB_CATEGORY_ID  = "1546412771598532628";
+const SERVER_LOGS_CATEGORY_ID = "1546419055064522812";
+
+// Individual channels inside the categories above that need their own rule
+// rather than the category's default.
+const STAFF_CHAT_CHANNEL_ID   = "1546416935217139722";
+const LEADER_CHANNEL_ID       = "1546416683684593724";
+const OWNER_CHAT_CHANNEL_ID   = "1560000052435619901";
+
+// #server-logs is restricted to this one Discord account specifically, not a
+// role — so it stays private even if more people are ever given the Owner role.
+const SERVER_LOGS_OWNER_USER_ID = "351190870416031744";
 
 // ================= TICKETING SYSTEM =================
 const TICKET_CONTACT_CHANNEL_ID    = "1546566171317506098"; // Permanent panel w/ the dropdown lives here
@@ -353,6 +377,7 @@ const SCAN_PAGES_PINGS     = 2; // 200 messages — finding a member's ping
 const config = {
   settleMs: 3000,
   rankSyncIntervalMs: 30 * 60 * 1000, // Check Supabase + tenure milestones every 30 minutes
+  serverPrivacySyncIntervalMs: 30 * 60 * 1000, // Recheck channel/category permissions every 30 minutes
   weeklyEventPollIntervalMs: WEEKLY_EVENT_POLL_INTERVAL_MS,
   osrsVoiceEmptyTimeoutMs: OSRS_VOICE_EMPTY_TIMEOUT_MS,
   osrsVoiceInitialEmptyTimeoutMs: OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS,
@@ -496,6 +521,18 @@ async function getChannelById(channelId, label = "Channel") {
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel || !channel.isTextBased()) {
     console.error(`[${label}] Channel ${channelId} not found or not text-based.`);
+    return null;
+  }
+  return channel;
+}
+
+// Like getChannelById, but for categories/voice channels that aren't text-based
+// (getChannelById intentionally rejects those so text-only code never gets one
+// handed to it by mistake).
+async function getAnyChannelById(channelId, label = "Channel") {
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel) {
+    console.error(`[${label}] Channel ${channelId} not found.`);
     return null;
   }
   return channel;
@@ -4717,6 +4754,273 @@ async function handleMemberAdd(member) {
   }
 }
 
+// ---- Channel/category access rules ----
+//
+// The goal: new members only ever see the Welcome category until they're a
+// nickname-verified Clan Member, and the rest of the server's access tiers
+// (Clan Chat, Staff Area, Social Hub, Server Logs) are each locked to the
+// right roles. Honour Marks' own category is intentionally NOT managed here —
+// that bot already runs its own /setup system for hm-role / hm-guide /
+// hm-quests / hm-shop / hm-database / hm-staff / hm-log.
+//
+// Why this can't be plain role-based overwrites alone: Discord's permission
+// engine lets an explicit ALLOW from one of a member's roles beat an explicit
+// DENY from another of their roles. A member who just picked "Clan Member" in
+// Discord's own onboarding flow has BOTH the Clan Member role AND the
+// Unverified role at the same time until they set their nickname with the
+// bot — so "Clan Member can view Clan Chat" would already let them in
+// immediately, before they've done anything. Same shape for the Leader/Staff
+// orientation channel: accepting orientation only ever ADDS the Verified
+// role, it never removes the base Staff/Jr. Staff/Leader role (see the
+// comment above ORIENTATION_BUTTONS), so "visible until verified" needs the
+// same trick. The fix is a per-member permission override the bot adds and
+// removes itself as a member's relevant roles change — those overrides win
+// over any role-based result, in either direction.
+//
+// Static, role-based rules below are reconciled on a heartbeat (self-healing
+// — corrects anything changed by hand, and automatically locks down any new
+// channel someone adds to a managed category). Per-member overrides are
+// applied instantly at the moment a relevant role changes, with that same
+// heartbeat as a safety net in case an event is ever missed.
+
+const EVERYONE_OPEN = "open"; // @everyone can view this channel
+const EVERYONE_DENY = "deny"; // @everyone cannot view; only the listed roles/users can
+
+const CLAN_MEMBER_AND_ABOVE_ROLE_IDS = [
+  CLAN_MEMBER_ROLE_ID,
+  JR_STAFF_ROLE_ID,
+  STAFF_ROLE_ID,
+  LEADER_ROLE_ID,
+  VERIFIED_STAFF_ROLE_ID,
+  VERIFIED_LEADER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  OWNER_ROLE_ID,
+];
+const VERIFIED_STAFF_AND_ABOVE_ROLE_IDS = [VERIFIED_STAFF_ROLE_ID, VERIFIED_LEADER_ROLE_ID, CO_OWNER_ROLE_ID, OWNER_ROLE_ID];
+const VERIFIED_LEADER_AND_ABOVE_ROLE_IDS = [VERIFIED_LEADER_ROLE_ID, CO_OWNER_ROLE_ID, OWNER_ROLE_ID];
+const OWNER_AND_CO_OWNER_ROLE_IDS = [CO_OWNER_ROLE_ID, OWNER_ROLE_ID];
+
+/**
+ * One entry per category this bot manages. `default` applies to every channel
+ * Discord currently lists under that category — fetched live, so a brand new
+ * channel dragged into it is automatically covered without a code change.
+ * `channels` overrides specific channel IDs with their own rule.
+ * `dynamicUnverifiedGate` / `dynamicOrientationGate` mark the spots that
+ * additionally get the per-member logic described above layered on top.
+ */
+const SERVER_PRIVACY_CATEGORIES = {
+  [WELCOME_CATEGORY_ID]: {
+    label: "Welcome",
+    default: { everyone: EVERYONE_OPEN, allowRoleIds: [] },
+    channels: {
+      // Only Clan Member — Clan Friends and anyone who hasn't picked a role
+      // yet never see the nickname-setup channel.
+      [ONBOARDING_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: [CLAN_MEMBER_ROLE_ID] },
+    },
+  },
+  [OSRS_VOICE_CATEGORY_ID]: {
+    label: "Clan Chat",
+    default: { everyone: EVERYONE_DENY, allowRoleIds: CLAN_MEMBER_AND_ABOVE_ROLE_IDS, dynamicUnverifiedGate: true },
+    channels: {},
+  },
+  [STAFF_AREA_CATEGORY_ID]: {
+    label: "Staff Area",
+    default: { everyone: EVERYONE_DENY, allowRoleIds: VERIFIED_STAFF_AND_ABOVE_ROLE_IDS },
+    channels: {
+      [ORIENTATION_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: OWNER_AND_CO_OWNER_ROLE_IDS, dynamicOrientationGate: true },
+      [STAFF_CHAT_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: VERIFIED_STAFF_AND_ABOVE_ROLE_IDS },
+      [STAFF_ALERT_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: VERIFIED_STAFF_AND_ABOVE_ROLE_IDS },
+      [LEADER_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: VERIFIED_LEADER_AND_ABOVE_ROLE_IDS },
+      [OWNER_CHAT_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: OWNER_AND_CO_OWNER_ROLE_IDS },
+    },
+  },
+  [SOCIAL_HUB_CATEGORY_ID]: {
+    label: "Social Hub",
+    default: { everyone: EVERYONE_DENY, allowRoleIds: [SOCIAL_CHATTER_ROLE_ID] },
+    channels: {},
+  },
+  [SERVER_LOGS_CATEGORY_ID]: {
+    label: "Server Logs",
+    default: { everyone: EVERYONE_DENY, allowRoleIds: [], allowUserIds: [SERVER_LOGS_OWNER_USER_ID] },
+    channels: {},
+  },
+};
+
+/** Builds the role/user overwrite rows for one static rule. */
+function buildStaticOverwriteRows(guild, rule) {
+  const rows = [];
+  const everyoneId = guild.roles.everyone.id;
+  const botId = guild.members.me?.id || client.user?.id;
+
+  rows.push({
+    id: everyoneId,
+    type: OverwriteType.Role,
+    ...(rule.everyone === EVERYONE_OPEN
+      ? { allow: [PermissionFlagsBits.ViewChannel] }
+      : { deny: [PermissionFlagsBits.ViewChannel] }),
+  });
+
+  if (botId) rows.push({ id: botId, type: OverwriteType.Member, allow: [PermissionFlagsBits.ViewChannel] });
+
+  for (const roleId of rule.allowRoleIds || []) {
+    if (roleId) rows.push({ id: roleId, type: OverwriteType.Role, allow: [PermissionFlagsBits.ViewChannel] });
+  }
+  for (const userId of rule.allowUserIds || []) {
+    if (userId) rows.push({ id: userId, type: OverwriteType.Member, allow: [PermissionFlagsBits.ViewChannel] });
+  }
+  return rows;
+}
+
+/**
+ * Applies a static rule to one channel, replacing its role/bot overwrites
+ * wholesale (so drift always gets corrected) while leaving any OTHER
+ * per-member overwrite already on the channel untouched — those belong to the
+ * dynamic verification gates managed elsewhere and must survive this reset.
+ */
+async function applyStaticRuleToChannel(channel, rule) {
+  const staticRows = buildStaticOverwriteRows(channel.guild, rule);
+  const staticIds = new Set(staticRows.map((r) => r.id));
+
+  const preserved = channel.permissionOverwrites.cache
+    .filter((ow) => ow.type === OverwriteType.Member && !staticIds.has(ow.id))
+    .map((ow) => ({ id: ow.id, type: OverwriteType.Member, allow: ow.allow.bitfield, deny: ow.deny.bitfield }));
+
+  await channel.permissionOverwrites.set([...staticRows, ...preserved], "Automatic server privacy sync");
+}
+
+async function applyServerPrivacyCategory(guild, categoryId, rule) {
+  const category = await guild.channels.fetch(categoryId).catch(() => null);
+  if (!category) {
+    console.warn(`[ServerPrivacy] Category ${categoryId} (${rule.label}) not found — skipping.`);
+    return;
+  }
+  const children = category.children?.cache ? [...category.children.cache.values()] : [];
+  const targets = [category, ...children];
+  for (const channel of targets) {
+    const channelRule = rule.channels[channel.id] || rule.default;
+    try {
+      await applyStaticRuleToChannel(channel, channelRule);
+    } catch (err) {
+      console.error(`[ServerPrivacy] Could not update #${channel.name || channel.id}: ${err.message}`);
+    }
+  }
+}
+
+async function applyServerPrivacyConfig(guild) {
+  for (const [categoryId, rule] of Object.entries(SERVER_PRIVACY_CATEGORIES)) {
+    await applyServerPrivacyCategory(guild, categoryId, rule);
+  }
+}
+
+// ---- Dynamic per-member overrides ----
+
+function isPendingNicknameVerification(member) {
+  return memberHasRole(member, CLAN_MEMBER_ROLE_ID) && memberHasRole(member, UNVERIFIED_ROLE_ID);
+}
+
+function isPendingOrientation(member) {
+  const pendingLeader = memberHasRole(member, LEADER_ROLE_ID) && !memberHasRole(member, VERIFIED_LEADER_ROLE_ID);
+  const pendingStaff =
+    (memberHasRole(member, STAFF_ROLE_ID) || memberHasRole(member, JR_STAFF_ROLE_ID)) &&
+    !memberHasRole(member, VERIFIED_STAFF_ROLE_ID);
+  return pendingLeader || pendingStaff;
+}
+
+/** Grants/revokes ONE member's personal View Channel override, skipping the API call if it's already correct. */
+async function setMemberChannelAccess(channel, memberId, viewAllowed, reason) {
+  const current = channel.permissionOverwrites.cache.get(memberId);
+  if (viewAllowed) {
+    if (current && current.allow.has(PermissionFlagsBits.ViewChannel) && !current.deny.has(PermissionFlagsBits.ViewChannel)) return;
+    await channel.permissionOverwrites
+      .edit(memberId, { ViewChannel: true }, { reason })
+      .catch((e) => console.error(`[ServerPrivacy] Could not grant ${memberId} access to #${channel.name || channel.id}: ${e.message}`));
+  } else {
+    if (!current) return;
+    await channel.permissionOverwrites
+      .delete(memberId, reason)
+      .catch((e) => console.error(`[ServerPrivacy] Could not clear ${memberId}'s override on #${channel.name || channel.id}: ${e.message}`));
+  }
+}
+
+async function syncClanChatAccessForMember(member) {
+  const category = await member.guild.channels.fetch(OSRS_VOICE_CATEGORY_ID).catch(() => null);
+  if (!category) return;
+  const shouldSee = !isPendingNicknameVerification(member);
+  const children = category.children?.cache ? [...category.children.cache.values()] : [];
+  const targets = [category, ...children];
+  for (const channel of targets) {
+    await setMemberChannelAccess(channel, member.id, shouldSee, "Clan Chat unlocks once the nickname step is complete");
+  }
+}
+
+async function syncOrientationAccessForMember(member) {
+  const channel = await getAnyChannelById(ORIENTATION_CHANNEL_ID, "ServerPrivacy");
+  if (!channel) return;
+  await setMemberChannelAccess(channel, member.id, isPendingOrientation(member), "Orientation channel stays visible until the role is accepted");
+}
+
+/** Corrects every current member's dynamic overrides — the drift-safety-net half of the heartbeat sync. */
+async function reconcileAllMembersChannelAccess(guild) {
+  let members;
+  try {
+    members = await guild.members.fetch();
+  } catch (err) {
+    console.error("[ServerPrivacy] Could not fetch guild members for reconciliation:", err.message);
+    return;
+  }
+  for (const member of members.values()) {
+    if (member.user?.bot) continue;
+    try {
+      await syncClanChatAccessForMember(member);
+      await syncOrientationAccessForMember(member);
+    } catch (err) {
+      console.error(`[ServerPrivacy] Could not reconcile ${member.id}: ${err.message}`);
+    }
+  }
+}
+
+const SERVER_PRIVACY_SYNC_HEARTBEAT_MS = 60 * 1000;
+let serverPrivacySyncInFlight = false;
+let lastServerPrivacySyncFinishedAt = 0;
+let serverPrivacySyncTimer = null;
+
+// Same pure/testable "is it time to run another sync" shape as isRankSyncDue.
+function isServerPrivacySyncDue(now = Date.now(), lastSyncAt = lastServerPrivacySyncFinishedAt, inFlight = serverPrivacySyncInFlight) {
+  if (inFlight) return false;
+  if (!lastSyncAt) return true;
+  return now - lastSyncAt >= config.serverPrivacySyncIntervalMs;
+}
+
+async function runServerPrivacySync() {
+  if (serverPrivacySyncInFlight) return;
+  serverPrivacySyncInFlight = true;
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      await applyServerPrivacyConfig(guild);
+      await reconcileAllMembersChannelAccess(guild);
+    }
+  } catch (err) {
+    console.error("[ServerPrivacy] Sync failed:", err.message);
+  } finally {
+    lastServerPrivacySyncFinishedAt = Date.now();
+    serverPrivacySyncInFlight = false;
+  }
+}
+
+function startServerPrivacyLoop() {
+  if (serverPrivacySyncTimer) clearInterval(serverPrivacySyncTimer);
+  if (config.serverPrivacySyncIntervalMs > 0) {
+    console.log(
+      `[ServerPrivacy] Heartbeat sync loop started — channel permissions recheck automatically at least every ${config.serverPrivacySyncIntervalMs / 60000} minutes.`
+    );
+    serverPrivacySyncTimer = setInterval(() => {
+      if (!isServerPrivacySyncDue()) return;
+      runServerPrivacySync().catch((e) => console.error("[ServerPrivacy] Scheduled sync error:", e.message));
+    }, SERVER_PRIVACY_SYNC_HEARTBEAT_MS);
+    if (typeof serverPrivacySyncTimer.unref === "function") serverPrivacySyncTimer.unref();
+  }
+}
+
 // Runs once Discord says the member finished its onboarding.
 const completionInFlight = new Set();
 async function processOnboardingCompletion(guild, userId) {
@@ -4737,6 +5041,12 @@ async function processOnboardingCompletion(guild, userId) {
       await member.roles.remove(UNVERIFIED_ROLE_ID, "Finished Discord onboarding without Clan Member role");
       console.log(`[Onboarding] ${userId} finished Discord onboarding WITHOUT clan role -> Unverified removed, no ping.`);
     }
+
+    // Lock Clan Chat for a fresh Unverified Clan Member right away rather than
+    // waiting for the next heartbeat — they shouldn't see it for even a moment.
+    await syncClanChatAccessForMember(member).catch((e) =>
+      console.error(`[ServerPrivacy] Could not sync Clan Chat access for ${userId}: ${e.message}`)
+    );
   } finally {
     completionInFlight.delete(userId);
   }
@@ -4744,9 +5054,25 @@ async function processOnboardingCompletion(guild, userId) {
 
 async function handleMemberUpdate(oldMember, newMember) {
   if (newMember.user?.bot) return;
-  if (!completedOnboarding(newMember)) return;
-  if (!newMember.roles.cache.has(UNVERIFIED_ROLE_ID)) return;
-  await processOnboardingCompletion(newMember.guild, newMember.id);
+
+  if (completedOnboarding(newMember) && newMember.roles.cache.has(UNVERIFIED_ROLE_ID)) {
+    await processOnboardingCompletion(newMember.guild, newMember.id);
+  }
+
+  // Keep the dynamic per-member channel overrides in sync with any role
+  // change — covers a staff member manually editing roles in Discord, not
+  // just the bot's own flows above.
+  const relevantChanged = (roleIds) => roleIds.some((id) => oldMember.roles.cache.has(id) !== newMember.roles.cache.has(id));
+  try {
+    if (relevantChanged([CLAN_MEMBER_ROLE_ID, UNVERIFIED_ROLE_ID])) {
+      await syncClanChatAccessForMember(newMember);
+    }
+    if (relevantChanged([STAFF_ROLE_ID, JR_STAFF_ROLE_ID, LEADER_ROLE_ID, VERIFIED_STAFF_ROLE_ID, VERIFIED_LEADER_ROLE_ID])) {
+      await syncOrientationAccessForMember(newMember);
+    }
+  } catch (err) {
+    console.error(`[ServerPrivacy] reconcile on role change failed for ${newMember.id}:`, err.message);
+  }
 }
 
 async function handleMemberRemove(member) {
@@ -4892,6 +5218,10 @@ async function onConfirm2(interaction, encoded) {
   try {
     await member.roles.add(OSRS_ROLE_ID, "Onboarding — nickname set via bot");
     await member.roles.remove(UNVERIFIED_ROLE_ID, "Onboarding — nickname set via bot");
+    // Unlock Clan Chat immediately — don't make them wait for the next heartbeat.
+    await syncClanChatAccessForMember(member).catch((e) =>
+      console.error(`[ServerPrivacy] Could not unlock Clan Chat for ${interaction.user.id}: ${e.message}`)
+    );
   } catch (err) {
     console.error(`[Roles] Role update failed for ${interaction.user.id}: ${err.message}`);
     return interaction.editReply({
@@ -4983,6 +5313,10 @@ async function onOrientationAccept(interaction) {
 
   try {
     await member.roles.add(cfg.grantRoleId, `Orientation — accepted ${cfg.label} role`);
+    // Hide the orientation channel for them right away — no need to wait for the heartbeat.
+    await syncOrientationAccessForMember(member).catch((e) =>
+      console.error(`[ServerPrivacy] Could not hide orientation channel for ${interaction.user.id}: ${e.message}`)
+    );
   } catch (err) {
     console.error(`[Orientation] Could not give role ${cfg.grantRoleId} to ${interaction.user.id}: ${err.message}`);
     return interaction.editReply({
@@ -6220,6 +6554,12 @@ client.once(Events.ClientReady, async () => {
   } catch (err) {
     console.error("[RecruitmentDrive] Initial setup failed:", err.message);
   }
+  try {
+    await runServerPrivacySync();
+    startServerPrivacyLoop();
+  } catch (err) {
+    console.error("[ServerPrivacy] Initial sync failed:", err.message);
+  }
 });
 
 client.on(Events.GuildMemberAdd, (member) => {
@@ -6454,4 +6794,27 @@ module.exports = {
   onRecruitmentUploadButton,
   onRecruitmentConfirmBonus,
   handleRecruitmentDriveMessage,
+  // Server Privacy exports
+  CLAN_FRIEND_ROLE_ID,
+  SOCIAL_CHATTER_ROLE_ID,
+  WELCOME_CATEGORY_ID,
+  STAFF_AREA_CATEGORY_ID,
+  SOCIAL_HUB_CATEGORY_ID,
+  SERVER_LOGS_CATEGORY_ID,
+  STAFF_CHAT_CHANNEL_ID,
+  LEADER_CHANNEL_ID,
+  OWNER_CHAT_CHANNEL_ID,
+  SERVER_LOGS_OWNER_USER_ID,
+  SERVER_PRIVACY_CATEGORIES,
+  EVERYONE_OPEN,
+  EVERYONE_DENY,
+  buildStaticOverwriteRows,
+  isPendingNicknameVerification,
+  isPendingOrientation,
+  isServerPrivacySyncDue,
+  applyServerPrivacyConfig,
+  runServerPrivacySync,
+  startServerPrivacyLoop,
+  syncClanChatAccessForMember,
+  syncOrientationAccessForMember,
 };
