@@ -220,6 +220,66 @@ function boostBonusLabel(multiplier) {
   return `${mult}×`;
 }
 
+// ── Inventory display ───────────────────────────────────────────────────────
+/**
+ * The Inventory view used to list every owned Perk/Item/Consumable as just a
+ * name and tier, forcing a member to go back to the shop to remember what
+ * the thing they already bought actually DOES. These build the one-line
+ * descriptions the Inventory view shows for each owned entry, reusing the
+ * exact same effect text the shop already shows when it's purchased.
+ */
+
+/** Joins lines for one Inventory embed field, staying safely under Discord's
+ *  1,024-character-per-field limit. A member who's filled out every perk and
+ *  item across all 7 trees could otherwise produce a field long enough that
+ *  Discord rejects the reply outright — this degrades to "…and N more"
+ *  instead of an error. */
+function joinInventoryFieldLines(lines) {
+  if (!lines.length) return "_None_";
+  let out = "";
+  for (let i = 0; i < lines.length; i++) {
+    const next = out ? `${out}\n${lines[i]}` : lines[i];
+    if (next.length > 1000) return `${out}\n…and ${lines.length - i} more`;
+    out = next;
+  }
+  return out;
+}
+
+/** `• 🌿 Gathering — T3: +15% HM from every Gathering quest you finish, forever` */
+function perkInventoryLine(tree, tier) {
+  const label = TREE_BY_KEY[tree]?.label || tree;
+  const emoji = TREE_BY_KEY[tree]?.emoji || "";
+  return `• ${emoji} ${label} — T${tier}: +${perkBonusPercent(tier)}% HM from every ${label} quest you finish, forever`;
+}
+
+/** `• Gathering — Quest & Threshold Reduction T3 (Gilded Spade): <effect text>` */
+function itemInventoryLine(tree, slot, tier) {
+  const entry = ITEM_CATALOG[tree]?.[slot]?.[tier - 1];
+  const label = TREE_BY_KEY[tree]?.label || tree;
+  const name = entry?.name || slot;
+  const effect = entry?.effect || "Effect unavailable.";
+  return `• ${label} — ${ITEM_SLOT_LABEL[slot] || slot} T${tier} (${name}): ${effect}`;
+}
+
+/** `• 🎟️ Quest Skip Token ×2 — <desc text>` */
+function consumableInventoryLine(key, quantity) {
+  const spec = CONSUMABLES[key];
+  return `• ${spec?.emoji || "🎫"} ${spec?.label || key} ×${quantity} — ${spec?.desc || "Effect unavailable."}`;
+}
+
+/** `• Gathering — T2: multiplies Gathering quest-completion Rank XP by 1.5× for 2 week(s) once activated — not active yet ×1` */
+function boostOwnedInventoryLine(tree, boostTier, quantity) {
+  const spec = BOOST_TIERS.find((t) => t.tier === boostTier);
+  const label = TREE_BY_KEY[tree]?.label || tree;
+  return `• ${label} — T${boostTier}: multiplies ${label} quest-completion Rank XP by ${boostBonusLabel(spec?.multiplier)} for ${spec?.weeks || "?"} week(s) once activated — not active yet ×${quantity}`;
+}
+
+/** `• Gathering — multiplies quest-completion Rank XP by 1.5×, ends <t:...:R>` */
+function boostActiveInventoryLine(tree, multiplier, expiresAt) {
+  const label = TREE_BY_KEY[tree]?.label || tree;
+  return `• ${label} — multiplies quest-completion Rank XP by ${boostBonusLabel(multiplier)}, ends <t:${Math.floor(new Date(expiresAt).getTime() / 1000)}:R>`;
+}
+
 // ── Reads ────────────────────────────────────────────────────────────────────
 async function getBalance(userId) {
   const supabase = getSupabase();
@@ -634,6 +694,8 @@ module.exports = {
   PERK_TIERS, BOOST_TIERS, CONSUMABLES,
   ITEM_CATALOG, ITEM_SLOT, ITEM_SLOT_LABEL,
   perkBonusPercent, boostBonusLabel,
+  joinInventoryFieldLines, perkInventoryLine, itemInventoryLine, consumableInventoryLine,
+  boostOwnedInventoryLine, boostActiveInventoryLine,
   getBalance, getPerks, getPerkTier, getItems, getItemTier, getItemTiers,
   getInventory, getActiveBoosts, getBoostMultiplier,
   tryDebit, buyPerk, buyItem, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
