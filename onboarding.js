@@ -114,6 +114,7 @@ const SERVER_LOGS_CATEGORY_ID = "1546419055064522812";
 const STAFF_CHAT_CHANNEL_ID   = "1546416935217139722";
 const LEADER_CHANNEL_ID       = "1546416683684593724";
 const OWNER_CHAT_CHANNEL_ID   = "1560000052435619901";
+const CLAN_CHAT_CHANNEL_ID    = "1561154983120863303";
 
 // #server-logs is restricted to this one Discord account specifically, not a
 // role — so it stays private even if more people are ever given the Owner role.
@@ -4821,7 +4822,15 @@ const SERVER_PRIVACY_CATEGORIES = {
   [OSRS_VOICE_CATEGORY_ID]: {
     label: "Clan Chat",
     default: { everyone: EVERYONE_DENY, allowRoleIds: CLAN_MEMBER_AND_ABOVE_ROLE_IDS, dynamicUnverifiedGate: true },
-    channels: {},
+    channels: {
+      // Named explicitly (rather than relying solely on category-child
+      // discovery) because these three live outside what the bot can assume
+      // is this category's live child list in every server configuration —
+      // see the comment on applyServerPrivacyCategory for why that matters.
+      [CLAN_CHAT_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: CLAN_MEMBER_AND_ABOVE_ROLE_IDS, dynamicUnverifiedGate: true },
+      [RECRUITMENT_DRIVE_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: CLAN_MEMBER_AND_ABOVE_ROLE_IDS, dynamicUnverifiedGate: true },
+      [RANK_LIST_CHANNEL_ID]: { everyone: EVERYONE_DENY, allowRoleIds: CLAN_MEMBER_AND_ABOVE_ROLE_IDS, dynamicUnverifiedGate: true },
+    },
   },
   [STAFF_AREA_CATEGORY_ID]: {
     label: "Staff Area",
@@ -4888,7 +4897,39 @@ async function applyStaticRuleToChannel(channel, rule) {
   await channel.permissionOverwrites.set([...staticRows, ...preserved], "Automatic server privacy sync");
 }
 
+/**
+ * Applies one category's rules. Two passes, deliberately not relying on
+ * category-child discovery alone:
+ *
+ *   1. Every channel explicitly named in `rule.channels` is fetched and
+ *      corrected DIRECTLY by its own ID first. A channel can be listed here
+ *      without actually turning up in `category.children.cache` — Discord's
+ *      own permission-sync state for a channel, or it simply living under a
+ *      different parent than assumed, both mean it would otherwise never get
+ *      touched and would keep whatever permissions it already had forever.
+ *      That silent gap is exactly what let a handful of named channels keep
+ *      their old, wrong permissions even after this system went live.
+ *   2. The category itself plus any of its current children that AREN'T
+ *      already covered by step 1 gets the category's `default` rule — this
+ *      is what automatically locks down a brand new channel someone adds.
+ */
 async function applyServerPrivacyCategory(guild, categoryId, rule) {
+  const handled = new Set();
+
+  for (const [channelId, channelRule] of Object.entries(rule.channels)) {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      console.warn(`[ServerPrivacy] Channel ${channelId} (${rule.label}) not found — skipping.`);
+      continue;
+    }
+    handled.add(channel.id);
+    try {
+      await applyStaticRuleToChannel(channel, channelRule);
+    } catch (err) {
+      console.error(`[ServerPrivacy] Could not update #${channel.name || channel.id}: ${err.message}`);
+    }
+  }
+
   const category = await guild.channels.fetch(categoryId).catch(() => null);
   if (!category) {
     console.warn(`[ServerPrivacy] Category ${categoryId} (${rule.label}) not found — skipping.`);
@@ -4897,9 +4938,9 @@ async function applyServerPrivacyCategory(guild, categoryId, rule) {
   const children = category.children?.cache ? [...category.children.cache.values()] : [];
   const targets = [category, ...children];
   for (const channel of targets) {
-    const channelRule = rule.channels[channel.id] || rule.default;
+    if (handled.has(channel.id)) continue;
     try {
-      await applyStaticRuleToChannel(channel, channelRule);
+      await applyStaticRuleToChannel(channel, rule.default);
     } catch (err) {
       console.error(`[ServerPrivacy] Could not update #${channel.name || channel.id}: ${err.message}`);
     }
@@ -4926,10 +4967,16 @@ function isPendingOrientation(member) {
   return pendingLeader || pendingStaff;
 }
 
-/** Grants/revokes ONE member's personal View Channel override, skipping the API call if it's already correct. */
-async function setMemberChannelAccess(channel, memberId, viewAllowed, reason) {
+/**
+ * Grants/revokes ONE member's personal View Channel ALLOW override. For
+ * gates where the baseline (no override at all) is already hidden, and the
+ * override's only job is to temporarily REVEAL the channel — e.g. the
+ * orientation channel, which has no static allow for the base Staff/Jr.
+ * Staff/Leader roles at all. Skips the API call if it's already correct.
+ */
+async function setMemberChannelAllow(channel, memberId, allowed, reason) {
   const current = channel.permissionOverwrites.cache.get(memberId);
-  if (viewAllowed) {
+  if (allowed) {
     if (current && current.allow.has(PermissionFlagsBits.ViewChannel) && !current.deny.has(PermissionFlagsBits.ViewChannel)) return;
     await channel.permissionOverwrites
       .edit(memberId, { ViewChannel: true }, { reason })
@@ -4942,21 +4989,68 @@ async function setMemberChannelAccess(channel, memberId, viewAllowed, reason) {
   }
 }
 
+/**
+ * Grants/revokes ONE member's personal View Channel DENY override. For gates
+ * where the baseline role-level result would otherwise ALLOW them — e.g.
+ * Clan Chat, which statically allows the Clan Member role itself — so the
+ * override's job is to explicitly BLOCK this one member despite that
+ * role-level allow. This must be an explicit deny, not just the absence of
+ * an override: a member with no override at all simply inherits their
+ * role's allow, which is exactly the case for someone who just got the
+ * Clan Member role but hasn't set their nickname yet. Skips the API call if
+ * it's already correct.
+ */
+async function setMemberChannelBlock(channel, memberId, blocked, reason) {
+  const current = channel.permissionOverwrites.cache.get(memberId);
+  if (blocked) {
+    if (current && current.deny.has(PermissionFlagsBits.ViewChannel) && !current.allow.has(PermissionFlagsBits.ViewChannel)) return;
+    await channel.permissionOverwrites
+      .edit(memberId, { ViewChannel: false }, { reason })
+      .catch((e) => console.error(`[ServerPrivacy] Could not block ${memberId} from #${channel.name || channel.id}: ${e.message}`));
+  } else {
+    if (!current) return;
+    await channel.permissionOverwrites
+      .delete(memberId, reason)
+      .catch((e) => console.error(`[ServerPrivacy] Could not clear ${memberId}'s override on #${channel.name || channel.id}: ${e.message}`));
+  }
+}
+
 async function syncClanChatAccessForMember(member) {
+  const rule = SERVER_PRIVACY_CATEGORIES[OSRS_VOICE_CATEGORY_ID];
+  const shouldBlock = isPendingNicknameVerification(member);
+  const reason = "Clan Chat unlocks once the nickname step is complete";
+  const seen = new Set();
+  const targets = [];
+
   const category = await member.guild.channels.fetch(OSRS_VOICE_CATEGORY_ID).catch(() => null);
-  if (!category) return;
-  const shouldSee = !isPendingNicknameVerification(member);
-  const children = category.children?.cache ? [...category.children.cache.values()] : [];
-  const targets = [category, ...children];
+  if (category) {
+    targets.push(category);
+    seen.add(category.id);
+    const children = category.children?.cache ? [...category.children.cache.values()] : [];
+    for (const child of children) {
+      targets.push(child);
+      seen.add(child.id);
+    }
+  }
+
+  // Same reasoning as applyServerPrivacyCategory: a channel explicitly marked
+  // for this gate must get it even if it doesn't actually turn up as a live
+  // child of the category.
+  for (const [channelId, channelRule] of Object.entries(rule.channels)) {
+    if (seen.has(channelId) || !channelRule.dynamicUnverifiedGate) continue;
+    const channel = await getAnyChannelById(channelId, "ServerPrivacy");
+    if (channel) targets.push(channel);
+  }
+
   for (const channel of targets) {
-    await setMemberChannelAccess(channel, member.id, shouldSee, "Clan Chat unlocks once the nickname step is complete");
+    await setMemberChannelBlock(channel, member.id, shouldBlock, reason);
   }
 }
 
 async function syncOrientationAccessForMember(member) {
   const channel = await getAnyChannelById(ORIENTATION_CHANNEL_ID, "ServerPrivacy");
   if (!channel) return;
-  await setMemberChannelAccess(channel, member.id, isPendingOrientation(member), "Orientation channel stays visible until the role is accepted");
+  await setMemberChannelAllow(channel, member.id, isPendingOrientation(member), "Orientation channel stays visible until the role is accepted");
 }
 
 /** Corrects every current member's dynamic overrides — the drift-safety-net half of the heartbeat sync. */
@@ -6804,17 +6898,22 @@ module.exports = {
   STAFF_CHAT_CHANNEL_ID,
   LEADER_CHANNEL_ID,
   OWNER_CHAT_CHANNEL_ID,
+  CLAN_CHAT_CHANNEL_ID,
   SERVER_LOGS_OWNER_USER_ID,
   SERVER_PRIVACY_CATEGORIES,
   EVERYONE_OPEN,
   EVERYONE_DENY,
   buildStaticOverwriteRows,
+  applyStaticRuleToChannel,
+  applyServerPrivacyCategory,
   isPendingNicknameVerification,
   isPendingOrientation,
   isServerPrivacySyncDue,
   applyServerPrivacyConfig,
   runServerPrivacySync,
   startServerPrivacyLoop,
+  setMemberChannelAllow,
+  setMemberChannelBlock,
   syncClanChatAccessForMember,
   syncOrientationAccessForMember,
 };
