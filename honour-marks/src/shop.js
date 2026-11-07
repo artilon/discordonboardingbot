@@ -185,9 +185,15 @@ const EXPANSION_COSTS_PCT = [2000, 6000, 18000];
 const EXPANSION_IS_PCT = { raids: true, minigames: true };
 
 function buildCatalogFor(tree, label) {
+  // Raids never go below a hard KC floor no matter how much Reduction
+  // stacks (see SOLO_RAID_MIN_KC in quests.js) — called out here so the
+  // purchase screen itself says so, not just the Items guide page.
+  const raidFloorNote = tree === "raids"
+    ? " Raid quests can never drop below 2 KC (Daily), 4 KC (Weekly), or 8 KC (Monthly), no matter how much stacks on top of this."
+    : "";
   const reduction = REDUCTION_NAMES[tree].map((name, i) => ({
     tier: i + 1, name, cost: REDUCTION_COSTS[i],
-    effect: `-${ITEM_PCT_BY_TIER[i + 1]}% XP/KC/clears/completions required for ${label} quests (Solo & Team, stacks across the whole team).`,
+    effect: `-${ITEM_PCT_BY_TIER[i + 1]}% XP/KC/clears/completions required for ${label} quests (Solo & Team, stacks across the whole team).${raidFloorNote}`,
   }));
   const clanChatXp = CLAN_CHAT_XP_NAMES[tree].map((name, i) => ({
     tier: i + 1, name, cost: CLAN_CHAT_XP_COSTS[i],

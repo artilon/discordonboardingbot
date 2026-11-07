@@ -121,6 +121,14 @@ const SOLO_REQUIREMENTS = {
   minigame: { daily: { kc: 5 },              weekly: { kc: 15 },                monthly: { kc: 40 } },
 };
 
+// Hard floors on a SOLO Raid quest's KC requirement, by quest length —
+// Quest & Threshold Reduction (and any future item/Perk/Boost that lowers a
+// requirement) can never push a raid quest below these, no matter how much
+// stacks on top of the base. Explicit, user-requested minimums: a raid is
+// real content that takes real time regardless of discount, so "basically
+// free" isn't a floor that should ever be reachable.
+const SOLO_RAID_MIN_KC = { daily: 2, weekly: 4, monthly: 8 };
+
 // A solo SKILL quest (Gathering/Production/Combat/Utility), at any of the
 // three quest types, now also asks for a difficulty — Easy just one skill,
 // Extreme stacks up to four — the same "difficulty picks the TARGET COUNT"
@@ -352,9 +360,13 @@ function buildSoloTargets(tree, questType, picks = null, baseline = null, effect
   const spec = soloTargetPool(tree, questType, 0, difficulty);
   if (!spec) return { skills: {}, bosses: {} };
   const { kind, pool } = spec;
-  const { count, value } = effects
+  const { count, value: rawValue } = effects
     ? applyItemEffects(kind, spec.count, spec.value, effects, pool.length)
     : spec;
+  // A raid's requirement is never allowed to drop below its hard floor for
+  // that quest length, no matter how much Reduction stacks on top of it —
+  // see SOLO_RAID_MIN_KC.
+  const value = kind === "raid" ? Math.max(rawValue, SOLO_RAID_MIN_KC[questType] || 1) : rawValue;
   const targets = { skills: {}, bosses: {} };
 
   let chosen = Array.isArray(picks) ? [...new Set(picks)].filter((p) => pool.includes(p)).slice(0, count) : [];
@@ -629,7 +641,16 @@ async function aggregateTeamEffects(roster, tree) {
  */
 function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength = Infinity, options = {}) {
   const reductionPct = effects.reductionPct || 0;
-  let value = Math.max(1, Math.round(baseValue * (1 - reductionPct / 100)));
+  // Math.round() silently did nothing for small KC/clear/completion counts —
+  // e.g. a Raid's base Daily requirement of 3 KC at -10% is 2.7, which
+  // Math.round() sends right back to 3. A member who paid real HM for a
+  // Reduction item then saw literally zero change on anything but the
+  // biggest skill-XP quests. Math.floor() always rounds in the member's
+  // favour, and since reductionPct > 0 strictly lowers the raw product below
+  // the (integer) baseValue, flooring it is guaranteed to land at
+  // baseValue - 1 or lower — the item now always does *something* it was
+  // paid to do, on every category, not just the ones with large base values.
+  let value = Math.max(1, reductionPct > 0 ? Math.floor(baseValue * (1 - reductionPct / 100)) : Math.round(baseValue));
   let count = baseCount;
   let rewardScale = 1;
 
@@ -643,7 +664,13 @@ function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength =
       rewardScale = baseCount > 0 ? count / baseCount : 1;
     }
   } else if (effects.expansionPct) {
-    value = Math.round(value * (1 + effects.expansionPct / 100));
+    // Same rounding problem, mirrored: Math.round() could leave a Raids/
+    // Minigames Expansion purchase raising the reward (rewardScale always
+    // applies) while leaving the actual requirement completely unchanged —
+    // e.g. 3 KC +10% = 3.3, which used to round right back down to 3. Ceil
+    // guarantees the requirement actually goes up by at least 1 whenever the
+    // item is owned, matching what the Shop tells members they're paying for.
+    value = Math.ceil(value * (1 + effects.expansionPct / 100));
     rewardScale = 1 + effects.expansionPct / 100;
   }
 
@@ -1219,7 +1246,7 @@ module.exports = {
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
   SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY, PARTY_DIFFICULTIES, PARTY_SIZES, LFG_EXPIRY_HOURS,
   SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES, SOLO_SKILL_XP,
-  QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD, SOLO_QUEST_PERIOD_CAP,
+  QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD, SOLO_QUEST_PERIOD_CAP, SOLO_RAID_MIN_KC,
   buildSoloTargets, buildPartyTargets, soloTargetPool, partyTargetPool, treeKind,
   soloHmReward, partyHmReward,
   dayStamp, weekStamp, monthStamp, resetStampFor,
