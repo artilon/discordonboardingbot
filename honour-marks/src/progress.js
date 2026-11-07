@@ -1,6 +1,6 @@
 "use strict";
 const { getSupabase } = require("./db");
-const { fetchHiscores, diffProgress } = require("./jagex");
+const { fetchHiscores, diffProgress, bossKeys } = require("./jagex");
 const {
   getMember, getActiveSoloQuests, creditHm, bumpCounts, awardRankXp,
 } = require("./quests");
@@ -172,9 +172,16 @@ async function checkPartyQuest(quest) {
   for (const [boss] of Object.entries(targets.bosses || {})) {
     let total = 0;
     for (const uid of quest.members) {
-      const base = quest.baseline?.[uid]?.bosses?.[boss]?.kills || 0;
-      const now = perMember[uid].bosses?.[boss]?.kills || 0;
-      total += Math.max(0, now - base);
+      // Same grouping diffProgress() applies for solo quests — e.g. a target
+      // of "tombs_of_amascut" must also count that member's Expert Mode ToA
+      // kills, since Jagex tracks each raid difficulty as its own separate
+      // hiscores entry. Without this, a teammate who only ever did Expert
+      // Mode contributed NOTHING to a team raid quest's shared total.
+      for (const k of bossKeys(boss)) {
+        const base = quest.baseline?.[uid]?.bosses?.[k]?.kills || 0;
+        const now = perMember[uid].bosses?.[k]?.kills || 0;
+        total += Math.max(0, now - base);
+      }
     }
     summed.bosses[boss] = total;
   }
