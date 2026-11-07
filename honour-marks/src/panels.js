@@ -968,7 +968,9 @@ function buildGuideSections(setup = {}) {
         `quest actually works instead of just paying more ${HM_EMOJI} HM. Every category has all **3 slots**, ` +
         `**3 tiers each**, bought in order, 9 purchases total per category:\n\n` +
         `**📉 Slot 1 — Quest & Threshold Reduction** — lowers the XP/KC/clears/completions a quest in that ` +
-        `category asks for: -2% at T1, -5% at T2, -10% at T3. Prices: 600 / 1,400 / 5,000 HM.\n\n` +
+        `category asks for: -2% at T1, -5% at T2, -10% at T3. Prices: 600 / 1,400 / 5,000 HM. ` +
+        `**Raids have a hard floor this can never go below**, no matter how much Reduction stacks on a ` +
+        `team: **2 KC** for a Daily raid quest, **4 KC** for Weekly, **8 KC** for Monthly.\n\n` +
         `**💬 Slot 2 — Clan Chat XP Bonus** — raises the **Rank XP** (not HM — that's what Perks already do) a ` +
         `quest in that category pays: +2% / +5% / +10%. Prices: 900 / 1,750 / 10,062 HM.\n\n` +
         `**📜 Slot 3 — Quest Expansion** — this one works differently depending on the category:\n` +
