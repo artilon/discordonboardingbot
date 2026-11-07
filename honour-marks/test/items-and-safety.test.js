@@ -303,7 +303,10 @@ async function registerMember(userId, rsn) {
 
     const row = fake.db.hm_quests.find((r) => r.user_id === "u-expand-pct");
     const [kc] = Object.values(row.targets.bosses);
-    assert.strictEqual(kc, Math.round(3 * 1.1), "base 3 kc +10% = 3.3 -> rounds to 3");
+    // Regression: this used to be Math.round(3 * 1.1) === 3 — i.e. paying for
+    // the item raised the reward but silently left the requirement
+    // unchanged. Ceil() guarantees a visible +1 KC on top of the base 3.
+    assert.strictEqual(kc, 4, "base 3 kc +10% = 3.3 -> ceils to 4, a real visible increase");
     assert.strictEqual(row.hm_reward, Math.round(50 * 1.1));
     assert.strictEqual(row.rank_xp_reward, Math.round(100 * 1.1));
   });
@@ -330,8 +333,11 @@ async function registerMember(userId, rsn) {
     const row = fake.db.hm_party_quests.find((r) => r.members.includes("p1-stack"));
     assert.strictEqual(Object.keys(row.targets.bosses).length, 1, "duo boss base count is 1 and nothing expanded it");
     const [kc] = Object.values(row.targets.bosses);
-    // duo boss base kc = 150, team reduction = 2+5 = 7% off
-    assert.strictEqual(kc, Math.round(150 * 0.93));
+    // duo boss base kc = 150, team reduction = 2+5 = 7% off. Reduction now
+    // floors (always rounds in the member's favour, see
+    // item-effects-rounding.test.js) rather than Math.round, so 150 * 0.93
+    // = 139.5 lands on 139, not 140.
+    assert.strictEqual(kc, 139);
     assert.strictEqual(row.rank_xp_reward, Math.round(750 * 1.02), "team clan-chat-xp sum = 2%, only p1 owns it");
   });
 

@@ -629,7 +629,16 @@ async function aggregateTeamEffects(roster, tree) {
  */
 function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength = Infinity, options = {}) {
   const reductionPct = effects.reductionPct || 0;
-  let value = Math.max(1, Math.round(baseValue * (1 - reductionPct / 100)));
+  // Math.round() silently did nothing for small KC/clear/completion counts —
+  // e.g. a Raid's base Daily requirement of 3 KC at -10% is 2.7, which
+  // Math.round() sends right back to 3. A member who paid real HM for a
+  // Reduction item then saw literally zero change on anything but the
+  // biggest skill-XP quests. Math.floor() always rounds in the member's
+  // favour, and since reductionPct > 0 strictly lowers the raw product below
+  // the (integer) baseValue, flooring it is guaranteed to land at
+  // baseValue - 1 or lower — the item now always does *something* it was
+  // paid to do, on every category, not just the ones with large base values.
+  let value = Math.max(1, reductionPct > 0 ? Math.floor(baseValue * (1 - reductionPct / 100)) : Math.round(baseValue));
   let count = baseCount;
   let rewardScale = 1;
 
@@ -643,7 +652,13 @@ function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength =
       rewardScale = baseCount > 0 ? count / baseCount : 1;
     }
   } else if (effects.expansionPct) {
-    value = Math.round(value * (1 + effects.expansionPct / 100));
+    // Same rounding problem, mirrored: Math.round() could leave a Raids/
+    // Minigames Expansion purchase raising the reward (rewardScale always
+    // applies) while leaving the actual requirement completely unchanged —
+    // e.g. 3 KC +10% = 3.3, which used to round right back down to 3. Ceil
+    // guarantees the requirement actually goes up by at least 1 whenever the
+    // item is owned, matching what the Shop tells members they're paying for.
+    value = Math.ceil(value * (1 + effects.expansionPct / 100));
     rewardScale = 1 + effects.expansionPct / 100;
   }
 
