@@ -25,6 +25,17 @@ const RANK_TIERS = [
 
 const PROGRESS_SEGMENTS = 10;
 
+/**
+ * `▰▰▰▱▱▱▱▱▱▱` — a generic 0..1 ratio rendered as the same 10-segment bar
+ * used for rank progress below. Shared so every other HM progress bar
+ * (active quests, the Clan Pool) looks identical to the rank one.
+ */
+function buildProgressBar(ratio) {
+  const clamped = Math.max(0, Math.min(1, Number(ratio) || 0));
+  const filled = Math.round(clamped * PROGRESS_SEGMENTS);
+  return "▰".repeat(filled) + "▱".repeat(PROGRESS_SEGMENTS - filled);
+}
+
 function getRankIndex(name) {
   if (!name) return 0;
   const idx = RANK_TIERS.findIndex((t) => t.name.toLowerCase() === String(name).toLowerCase());
@@ -57,8 +68,7 @@ function formatRankProgress(xp) {
   const span = next.xpNeeded - tier.xpNeeded;
   const into = Math.max(0, numeric - tier.xpNeeded);
   const ratio = span > 0 ? Math.min(1, into / span) : 1;
-  const filled = Math.round(ratio * PROGRESS_SEGMENTS);
-  const bar = "▰".repeat(filled) + "▱".repeat(PROGRESS_SEGMENTS - filled);
+  const bar = buildProgressBar(ratio);
   const pct = span > 0 ? Math.min(100, Math.floor((into / span) * 100)) : 100;
   const remaining = Math.max(0, next.xpNeeded - numeric);
 
@@ -67,6 +77,8 @@ function formatRankProgress(xp) {
 
 module.exports = {
   RANK_TIERS,
+  PROGRESS_SEGMENTS,
+  buildProgressBar,
   getRankIndex,
   getRankForXp,
   getNextRankTier,

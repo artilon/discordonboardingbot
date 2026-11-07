@@ -4,7 +4,7 @@ const {
   StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
 } = require("discord.js");
 const { getSupabase, getConfigValue, setConfigValue } = require("./db");
-const { getRankForXp, formatRankProgress, RANK_TIERS } = require("./ranks");
+const { getRankForXp, formatRankProgress, buildProgressBar, RANK_TIERS } = require("./ranks");
 const {
   TREES, TREE_BY_KEY, PARTY_SIZES, PARTY_DIFFICULTY, SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES, SOLO_SKILL_XP,
   LFG_EXPIRY_HOURS, MAX_ACTIVE_PARTY_QUESTS, SOLO_QUEST_PERIOD_CAP, treeKind, getMember,
@@ -14,7 +14,7 @@ const { checkPartyQuest } = require("./progress");
 const { PRESTIGE_COST, PRESTIGE_HM_BONUS_PCT, PRESTIGE_RANK_XP_BONUS_PCT, PRESTIGE_EMOJI, isPrestiged, getPrestigedSet } = require("./shop");
 const {
   CLAN_QUEST_LABELS, CLAN_QUEST_EMOJI, CLAN_BOOST_PCT, CLAN_BOOST_LABELS,
-  ensureClanQuest, getActiveClanBoost,
+  ensureClanQuest, getActiveClanBoost, peekClanQuestProgress,
 } = require("./clanpool");
 
 /** Pretty label for a hand-picked target key (skill or boss/raid/minigame). */
@@ -281,7 +281,8 @@ async function formatSoloQuestGroup(userId, quests) {
       continue;
     }
     const progress = diffProgress(q.baseline, snap, q.targets);
-    lines.push(`      ┗ ${formatProgressParts(progress.parts)} — **${Math.floor(progress.totalPct)}%** • ends ${expiresAt}`);
+    const bar = buildProgressBar(progress.totalPct / 100);
+    lines.push(`      ┗ ${bar} **${Math.floor(progress.totalPct)}%** • ${formatProgressParts(progress.parts)} • ends ${expiresAt}`);
   }
   return lines.join("\n");
 }
@@ -304,7 +305,8 @@ async function formatTeamQuestLine(q) {
     return `${head}\n   ┗ _progress unavailable right now_ • ends ${expiresAt}`;
   }
   const { progress } = evaluated;
-  return `${head}\n   ┗ Team progress: ${formatProgressParts(progress.parts)} — **${Math.floor(progress.totalPct)}%** • ends ${expiresAt}`;
+  const bar = buildProgressBar(progress.totalPct / 100);
+  return `${head}\n   ┗ Team progress: ${bar} **${Math.floor(progress.totalPct)}%** • ${formatProgressParts(progress.parts)} • ends ${expiresAt}`;
 }
 
 async function renderQuestBoard(guildId, setup = {}) {
@@ -482,8 +484,14 @@ async function renderClanPool(guildId) {
     const label = CLAN_QUEST_LABELS[quest.quest_type] || quest.quest_type;
     const emoji = CLAN_QUEST_EMOJI[quest.quest_type] || "🏆";
     const baselineCount = Object.keys(quest.baselines || {}).length;
+    const target = Number(quest.target) || 0;
+    const progress = await peekClanQuestProgress(guildId, quest).catch(() => 0);
+    const ratio = target > 0 ? Math.min(1, progress / target) : 0;
+    const bar = buildProgressBar(ratio);
+    const pct = Math.min(100, Math.floor(ratio * 100));
     lines.push(
-      `${emoji} **${label}** — target **${Number(quest.target).toLocaleString()}**\n` +
+      `${emoji} **${label}** — target **${target.toLocaleString()}**\n` +
+      `┗ ${bar} **${pct}%** — \`${progress.toLocaleString()} / ${target.toLocaleString()}\`\n` +
       `┗ Tracking **${baselineCount}** registered member${baselineCount === 1 ? "" : "s"}. ` +
       `Everyone's gains since the quest started count toward the shared total.`
     );
