@@ -544,6 +544,10 @@ const getStaffAlertChannel = () => getChannelById(STAFF_ALERT_CHANNEL_ID, "Staff
 const getRankListChannel   = () => getChannelById(RANK_LIST_CHANNEL_ID, "RankList");
 const getRankLogChannel    = () => getChannelById(RANK_LOG_CHANNEL_ID, "RankLog");
 const getWeeklyRecapChannel = () => getChannelById(WEEKLY_RECAP_CHANNEL_ID, "WeeklyRecap");
+// Same channel as the Weekly Recap (1546413698979995678) — it doubles as the
+// clan's general public announcements channel, which is also where a
+// Rank-Up congratulations post belongs.
+const getClanAnnouncementsChannel = () => getChannelById(WEEKLY_RECAP_CHANNEL_ID, "ClanAnnouncements");
 
 // Collect up to `pages` x 100 recent messages (newest first).
 async function fetchRecentMessages(channel, pages) {
@@ -4169,6 +4173,26 @@ async function logRankUpConfirmedToDiscord({ rsn, oldRank, newRank, totalXp, sta
   await channel.send({ embeds: [embed] }).catch((e) => console.warn("[RankLog] Failed to post rank-up log:", e.message));
 }
 
+// Public, no-ping celebration post for a confirmed Rank-Up (Rank-Up only —
+// a Member-Left confirmation never posts here). Names the member by RSN,
+// not a Discord @mention, so there's no way for this to notify anyone;
+// allowedMentions is still locked down as a defensive second layer in case
+// an RSN ever contained mention-like text.
+function buildRankUpCongratsAnnouncement(rsn, newRank) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.ok)
+    .setDescription(`🎉 Congratulations to **${rsn}** on ranking up to ${formatRankName(newRank)}!`);
+  return { embeds: [embed], allowedMentions: { parse: [] } };
+}
+
+async function postRankUpCongratsAnnouncement(rsn, newRank) {
+  const channel = await getClanAnnouncementsChannel();
+  if (!channel) return;
+  await channel
+    .send(buildRankUpCongratsAnnouncement(rsn, newRank))
+    .catch((e) => console.warn("[RankUpCongrats] Failed to post congrats announcement:", e.message));
+}
+
 async function logMemberLeftToDiscord(member, staffUser = null) {
   const nowUnix = Math.floor(Date.now() / 1000);
   const xp = Number(member.xp) || 0;
@@ -6526,6 +6550,8 @@ async function onRankUpConfirm2(interaction, encodedRsn, targetRank) {
     staffUser: interaction.user,
   });
 
+  await postRankUpCongratsAnnouncement(rsn, promotedTo);
+
   await ensureRankListMessage().catch((e) => console.warn("[RankList] refresh failed:", e.message));
 
   // Auto-delete the alert message once the 2nd confirmation is marked as confirmed
@@ -6878,6 +6904,9 @@ module.exports = {
   buildRankListPayload,
   buildRankUpAlertStep1,
   buildRankUpAlertStep2,
+  buildRankUpCongratsAnnouncement,
+  postRankUpCongratsAnnouncement,
+  onRankUpConfirm2,
   buildMemberLeftAlertStep1,
   buildMemberLeftAlertStep2,
   ensureRankListMessage,
