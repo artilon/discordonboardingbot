@@ -544,6 +544,10 @@ const getStaffAlertChannel = () => getChannelById(STAFF_ALERT_CHANNEL_ID, "Staff
 const getRankListChannel   = () => getChannelById(RANK_LIST_CHANNEL_ID, "RankList");
 const getRankLogChannel    = () => getChannelById(RANK_LOG_CHANNEL_ID, "RankLog");
 const getWeeklyRecapChannel = () => getChannelById(WEEKLY_RECAP_CHANNEL_ID, "WeeklyRecap");
+// Same channel as the Weekly Recap (1546413698979995678) — it doubles as the
+// clan's general public announcements channel, which is also where a
+// Rank-Up congratulations post belongs.
+const getClanAnnouncementsChannel = () => getChannelById(WEEKLY_RECAP_CHANNEL_ID, "ClanAnnouncements");
 
 // Collect up to `pages` x 100 recent messages (newest first).
 async function fetchRecentMessages(channel, pages) {
@@ -2526,6 +2530,30 @@ function buildWeeklyRecapEmbed(window, data) {
   return { embeds: [embed] };
 }
 
+// The very first recap window ever (or the first one after any gap where no
+// prior snapshot exists for anyone) has nothing to diff against, so it can
+// only capture a baseline, not show real gains. That used to return silently
+// with nothing posted anywhere a member could see — from the clan's
+// perspective, indistinguishable from the feature being completely broken.
+// This posts a short, explicit heads-up instead, so "is this thing even
+// running?" has a visible answer the same week tracking actually starts.
+function buildBaselineAnnouncementEmbed(window, memberCount) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("📊 Weekly Clan Recap — Tracking Started")
+    .setDescription(
+      `Captured this week's starting OSRS hiscores snapshot for **${memberCount}** active clan member` +
+      `${memberCount === 1 ? "" : "s"} (week ending **${window.weekKey}**, Sunday 5:00 PM Central).\n\n` +
+      `There's nothing to compare it against yet, so there's no leaderboard this week — next **Sunday at ` +
+      `5:00 PM Central**, the first full Weekly Recap (XP gains, boss kills, raid completions, Rank XP, and ` +
+      `Honour Marks) will post right here.`
+    )
+    .setFooter({ text: "Odinheim Heimdall — Weekly Recap" })
+    .setTimestamp(new Date());
+
+  return { embeds: [embed] };
+}
+
 async function runWeeklyRecap(window, now = new Date()) {
   const supabase = getSupabase();
   if (!supabase) return null;
@@ -2552,7 +2580,10 @@ async function runWeeklyRecap(window, now = new Date()) {
     return null;
   }
   const members = (memberRows || []).filter((m) => m && String(m.rsn || "").trim());
-  if (members.length === 0) return null;
+  if (members.length === 0) {
+    console.warn(`[WeeklyRecap] No active clan members with an RSN set for week ${window.weekKey} — skipping.`);
+    return null;
+  }
 
   const prevByRsn = await loadPreviousRecapSnapshots(supabase, window.weekKey);
   const isFirstRun = prevByRsn.size === 0;
@@ -2629,6 +2660,12 @@ async function runWeeklyRecap(window, now = new Date()) {
 
   if (isFirstRun) {
     console.log(`[WeeklyRecap] Baseline captured for week ${window.weekKey}; first full recap will post next week.`);
+    const channel = await getWeeklyRecapChannel();
+    if (channel) {
+      await channel
+        .send(buildBaselineAnnouncementEmbed(window, members.length))
+        .catch((e) => console.error("[WeeklyRecap] Failed to post baseline announcement:", e.message));
+    }
     return null;
   }
 
@@ -4134,6 +4171,26 @@ async function logRankUpConfirmedToDiscord({ rsn, oldRank, newRank, totalXp, sta
     );
 
   await channel.send({ embeds: [embed] }).catch((e) => console.warn("[RankLog] Failed to post rank-up log:", e.message));
+}
+
+// Public, no-ping celebration post for a confirmed Rank-Up (Rank-Up only —
+// a Member-Left confirmation never posts here). Names the member by RSN,
+// not a Discord @mention, so there's no way for this to notify anyone;
+// allowedMentions is still locked down as a defensive second layer in case
+// an RSN ever contained mention-like text.
+function buildRankUpCongratsAnnouncement(rsn, newRank) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.ok)
+    .setDescription(`🎉 Congratulations to **${rsn}** on ranking up to ${formatRankName(newRank)}!`);
+  return { embeds: [embed], allowedMentions: { parse: [] } };
+}
+
+async function postRankUpCongratsAnnouncement(rsn, newRank) {
+  const channel = await getClanAnnouncementsChannel();
+  if (!channel) return;
+  await channel
+    .send(buildRankUpCongratsAnnouncement(rsn, newRank))
+    .catch((e) => console.warn("[RankUpCongrats] Failed to post congrats announcement:", e.message));
 }
 
 async function logMemberLeftToDiscord(member, staffUser = null) {
@@ -6493,6 +6550,8 @@ async function onRankUpConfirm2(interaction, encodedRsn, targetRank) {
     staffUser: interaction.user,
   });
 
+  await postRankUpCongratsAnnouncement(rsn, promotedTo);
+
   await ensureRankListMessage().catch((e) => console.warn("[RankList] refresh failed:", e.message));
 
   // Auto-delete the alert message once the 2nd confirmation is marked as confirmed
@@ -6845,6 +6904,9 @@ module.exports = {
   buildRankListPayload,
   buildRankUpAlertStep1,
   buildRankUpAlertStep2,
+  buildRankUpCongratsAnnouncement,
+  postRankUpCongratsAnnouncement,
+  onRankUpConfirm2,
   buildMemberLeftAlertStep1,
   buildMemberLeftAlertStep2,
   ensureRankListMessage,
@@ -6911,6 +6973,7 @@ module.exports = {
   sumActivityGain,
   computeHonourMarksLeaderboard,
   buildWeeklyRecapEmbed,
+  buildBaselineAnnouncementEmbed,
   runWeeklyRecap,
   startWeeklyRecapLoop,
   // Recruitment Drive exports
