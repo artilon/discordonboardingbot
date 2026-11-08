@@ -2526,6 +2526,30 @@ function buildWeeklyRecapEmbed(window, data) {
   return { embeds: [embed] };
 }
 
+// The very first recap window ever (or the first one after any gap where no
+// prior snapshot exists for anyone) has nothing to diff against, so it can
+// only capture a baseline, not show real gains. That used to return silently
+// with nothing posted anywhere a member could see — from the clan's
+// perspective, indistinguishable from the feature being completely broken.
+// This posts a short, explicit heads-up instead, so "is this thing even
+// running?" has a visible answer the same week tracking actually starts.
+function buildBaselineAnnouncementEmbed(window, memberCount) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.gold)
+    .setTitle("📊 Weekly Clan Recap — Tracking Started")
+    .setDescription(
+      `Captured this week's starting OSRS hiscores snapshot for **${memberCount}** active clan member` +
+      `${memberCount === 1 ? "" : "s"} (week ending **${window.weekKey}**, Sunday 5:00 PM Central).\n\n` +
+      `There's nothing to compare it against yet, so there's no leaderboard this week — next **Sunday at ` +
+      `5:00 PM Central**, the first full Weekly Recap (XP gains, boss kills, raid completions, Rank XP, and ` +
+      `Honour Marks) will post right here.`
+    )
+    .setFooter({ text: "Odinheim Heimdall — Weekly Recap" })
+    .setTimestamp(new Date());
+
+  return { embeds: [embed] };
+}
+
 async function runWeeklyRecap(window, now = new Date()) {
   const supabase = getSupabase();
   if (!supabase) return null;
@@ -2552,7 +2576,10 @@ async function runWeeklyRecap(window, now = new Date()) {
     return null;
   }
   const members = (memberRows || []).filter((m) => m && String(m.rsn || "").trim());
-  if (members.length === 0) return null;
+  if (members.length === 0) {
+    console.warn(`[WeeklyRecap] No active clan members with an RSN set for week ${window.weekKey} — skipping.`);
+    return null;
+  }
 
   const prevByRsn = await loadPreviousRecapSnapshots(supabase, window.weekKey);
   const isFirstRun = prevByRsn.size === 0;
@@ -2629,6 +2656,12 @@ async function runWeeklyRecap(window, now = new Date()) {
 
   if (isFirstRun) {
     console.log(`[WeeklyRecap] Baseline captured for week ${window.weekKey}; first full recap will post next week.`);
+    const channel = await getWeeklyRecapChannel();
+    if (channel) {
+      await channel
+        .send(buildBaselineAnnouncementEmbed(window, members.length))
+        .catch((e) => console.error("[WeeklyRecap] Failed to post baseline announcement:", e.message));
+    }
     return null;
   }
 
@@ -6911,6 +6944,7 @@ module.exports = {
   sumActivityGain,
   computeHonourMarksLeaderboard,
   buildWeeklyRecapEmbed,
+  buildBaselineAnnouncementEmbed,
   runWeeklyRecap,
   startWeeklyRecapLoop,
   // Recruitment Drive exports
