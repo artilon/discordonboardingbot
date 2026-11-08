@@ -2595,7 +2595,11 @@ async function runWeeklyRecap(window, now = new Date()) {
   const pvmers = [];
   const raiders = [];
   const rankXpEarners = [];
-  const skillTotals = new Map(OSRS_SKILLS.map((s) => [s.name, 0]));
+  // Hitpoints is excluded from "Most Trained Skill" only (not from the Top 5
+  // XP Gainers total below) — every combat style trains it passively, so it
+  // would win this almost every single week regardless of what anyone was
+  // actually training, making the highlight meaningless.
+  const skillTotals = new Map(OSRS_SKILLS.filter((s) => s.name !== "Hitpoints").map((s) => [s.name, 0]));
   const bossTotals = new Map(PVM_BOSS_ENTRIES.map((b) => [b.name, 0]));
   const raidTotals = new Map(RAID_BOSS_ENTRIES.map((b) => [b.name, 0]));
   const minigameTotals = new Map(OSRS_MINIGAMES.map((m) => [m.name, 0]));
@@ -2624,8 +2628,8 @@ async function runWeeklyRecap(window, now = new Date()) {
     let memberXpGained = 0;
     for (const s of OSRS_SKILLS) {
       const gained = sumSkillGain(prevSkills, snapshot.skills, s.name);
-      memberXpGained += gained;
-      if (gained > 0) skillTotals.set(s.name, (skillTotals.get(s.name) || 0) + gained);
+      memberXpGained += gained; // Hitpoints XP still counts toward total XP gained.
+      if (gained > 0 && s.name !== "Hitpoints") skillTotals.set(s.name, (skillTotals.get(s.name) || 0) + gained);
     }
     if (memberXpGained > 0) xpGainers.push({ name: rsn, amount: memberXpGained });
 

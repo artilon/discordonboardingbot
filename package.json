@@ -5,7 +5,7 @@
   "main": "onboarding.js",
   "scripts": {
     "start": "node onboarding.js",
-    "test": "node test/recruitment-drive.test.js && node test/automatic-tenure-xp.test.js && node test/server-privacy.test.js && node test/server-privacy-channel-coverage.test.js && node test/server-privacy-osrs-role.test.js && node test/weekly-recap-baseline-announcement.test.js && node test/rank-up-congrats-announcement.test.js"
+    "test": "node test/recruitment-drive.test.js && node test/automatic-tenure-xp.test.js && node test/server-privacy.test.js && node test/server-privacy-channel-coverage.test.js && node test/server-privacy-osrs-role.test.js && node test/weekly-recap-baseline-announcement.test.js && node test/rank-up-congrats-announcement.test.js && node test/weekly-recap-excludes-hitpoints.test.js"
   },
   "engines": {
     "node": ">=22"
