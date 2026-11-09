@@ -58,7 +58,7 @@ function makeFakeSupabase({ members, snapshotRows }) {
           lt: (_col, weekKey) => ({
             order: () => ({
               limit: async () => ({
-                data: state.snapshotRows.filter((r) => r.week_key < weekKey),
+                data: state.snapshotRows.filter((r) => r.week_key < weekKey).sort((a, b) => (a.week_key < b.week_key ? 1 : -1)),
                 error: null,
               }),
             }),

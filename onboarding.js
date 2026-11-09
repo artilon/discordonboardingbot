@@ -2595,7 +2595,11 @@ async function runWeeklyRecap(window, now = new Date()) {
   const pvmers = [];
   const raiders = [];
   const rankXpEarners = [];
-  const skillTotals = new Map(OSRS_SKILLS.map((s) => [s.name, 0]));
+  // Hitpoints is excluded from "Most Trained Skill" only (not from the Top 5
+  // XP Gainers total below) — every combat style trains it passively, so it
+  // would win this almost every single week regardless of what anyone was
+  // actually training, making the highlight meaningless.
+  const skillTotals = new Map(OSRS_SKILLS.filter((s) => s.name !== "Hitpoints").map((s) => [s.name, 0]));
   const bossTotals = new Map(PVM_BOSS_ENTRIES.map((b) => [b.name, 0]));
   const raidTotals = new Map(RAID_BOSS_ENTRIES.map((b) => [b.name, 0]));
   const minigameTotals = new Map(OSRS_MINIGAMES.map((m) => [m.name, 0]));
@@ -2624,8 +2628,8 @@ async function runWeeklyRecap(window, now = new Date()) {
     let memberXpGained = 0;
     for (const s of OSRS_SKILLS) {
       const gained = sumSkillGain(prevSkills, snapshot.skills, s.name);
-      memberXpGained += gained;
-      if (gained > 0) skillTotals.set(s.name, (skillTotals.get(s.name) || 0) + gained);
+      memberXpGained += gained; // Hitpoints XP still counts toward total XP gained.
+      if (gained > 0 && s.name !== "Hitpoints") skillTotals.set(s.name, (skillTotals.get(s.name) || 0) + gained);
     }
     if (memberXpGained > 0) xpGainers.push({ name: rsn, amount: memberXpGained });
 
@@ -3691,9 +3695,44 @@ function buildRankTableSummary() {
   }).join(" • ");
 }
 
+/**
+ * Builds the set of every current human guild member's in-Discord display
+ * name (their nickname if set, else their global/username), lowercased and
+ * trimmed, so the Rank List can flag clan members who don't have a matching
+ * Discord presence.
+ *
+ * Returns `null` (never an empty Set) when the guild member list couldn't be
+ * fetched at all, so callers can tell "nobody matched" apart from "we
+ * couldn't check" and skip marking anyone rather than risk false positives.
+ */
+async function getDiscordDisplayNameSet() {
+  if (!client.guilds?.cache || client.guilds.cache.size === 0) return null;
+  const names = new Set();
+  let fetchedAny = false;
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const members = await guild.members.fetch();
+      for (const member of members.values()) {
+        if (member.user?.bot) continue;
+        const name = String(member.displayName || member.user?.username || "").trim().toLowerCase();
+        if (name) names.add(name);
+      }
+      fetchedAny = true;
+    } catch (err) {
+      console.error("[RankList] Could not fetch guild members for nickname matching:", err.message);
+    }
+  }
+  return fetchedAny ? names : null;
+}
+
 function buildRankListPayload(members = [], asOfDate = new Date(), options = {}) {
   const rangeKey = options.range || config.growthChartRange || "all";
   const growthSnapshots = options.growthSnapshots || [];
+  // Set of lowercased Discord display names (nickname or username) currently
+  // in the server, used to flag clan members with no matching Discord
+  // presence. `null` means "unknown" (couldn't be fetched) — in that case we
+  // deliberately mark nobody rather than risk false asterisks.
+  const discordNames = options.discordNicknames || null;
 
   const activeMembers = members
     .filter((m) => m.active !== false)
@@ -3721,7 +3760,8 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     `**Honour Marks quests:** flat XP, never multiplied\n` +
     `**Rank** = Tenure XP + Quest XP\n\n` +
     `**Rank Tiers:**\n${buildRankTableSummary()}\n\n` +
-    `**Active Clan Members:** \`${activeMembers.length}\` • **Last Synced:** <t:${nowUnix}:R>`;
+    `**Active Clan Members:** \`${activeMembers.length}\` • **Last Synced:** <t:${nowUnix}:R>` +
+    (discordNames ? `\n\\* = no matching Discord server member found for this name` : "");
 
   const lines = activeMembers.map((m, idx) => {
     // Rank is driven by the COMBINED total (tenure + flat quest XP)...
@@ -3750,8 +3790,17 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
         ? `Tenure \`${tenureXp.toLocaleString()}\` + Quests \`${bonusXp.toLocaleString()}\` • `
         : "";
 
+    // Flags clan members who don't currently have a matching Discord server
+    // member (by nickname/display name) with a trailing `\*` — escaped so it
+    // always renders as a literal asterisk instead of being swallowed into
+    // markdown italics by some other `*` later in the embed. Only marks
+    // anyone when we actually have live Discord data (discordNames !== null).
+    const rsnKey = String(m.rsn || "").trim().toLowerCase();
+    const noDiscordMatch = discordNames !== null && rsnKey && !discordNames.has(rsnKey);
+    const nameDisplay = noDiscordMatch ? `${m.rsn}\\*` : m.rsn;
+
     return (
-      `**${idx + 1}. ${m.rsn}** — ${formatRankName(confirmedRank)} • \`${xp.toLocaleString()} XP\`\n` +
+      `**${idx + 1}. ${nameDisplay}** — ${formatRankName(confirmedRank)} • \`${xp.toLocaleString()} XP\`\n` +
       `┗ Joined \`${joinedStr}\` • ${formatTenureDuration(days)} • ${split}${progress}${pendingTag}`
     );
   });
@@ -3895,6 +3944,8 @@ async function ensureRankListMessage(members, growthSnapshots) {
     snapshots = await syncGrowthHistoryToSupabase(supabase, list);
   }
 
+  const discordNicknames = await getDiscordDisplayNameSet();
+
   return ensureEmbedMessage({
     channelId: RANK_LIST_CHANNEL_ID,
     label: "RankList",
@@ -3908,6 +3959,7 @@ async function ensureRankListMessage(members, growthSnapshots) {
     payload: buildRankListPayload(list, new Date(), {
       range: config.growthChartRange,
       growthSnapshots: snapshots || [],
+      discordNicknames,
     }),
     what: "permanent clan growth chart & rank list",
   });
@@ -6902,6 +6954,7 @@ module.exports = {
   buildGrowthChartEmbedAndAttachment,
   syncGrowthHistoryToSupabase,
   buildRankListPayload,
+  getDiscordDisplayNameSet,
   buildRankUpAlertStep1,
   buildRankUpAlertStep2,
   buildRankUpCongratsAnnouncement,
