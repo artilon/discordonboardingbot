@@ -60,8 +60,12 @@ check("normal leaderboard mentions top recruiter", normalPayload.embeds[0].data.
 const finalSingleWinner = bot.buildRecruitmentLeaderboardEmbed(standings, { final: true });
 check("final leaderboard title says Final", finalSingleWinner.embeds[0].data.title.includes("Final"));
 check(
-  "final single-winner field names the winner",
-  finalSingleWinner.embeds[0].data.fields.some((f) => f.name === "Winner" && f.value.includes("<@111>"))
+  "final standings name the 1st place winner",
+  finalSingleWinner.embeds[0].data.fields.some((f) => f.name === "1st Place" && f.value.includes("<@111>"))
+);
+check(
+  "final standings name the 2nd place winner",
+  finalSingleWinner.embeds[0].data.fields.some((f) => f.name === "2nd Place" && f.value.includes("<@222>"))
 );
 
 const tiedStandings = [

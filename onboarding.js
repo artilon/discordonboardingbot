@@ -218,7 +218,8 @@ const WEEKLY_RECAP_ANCHOR_DATE  = { year: 2026, month: 11, day: 1 }; // First re
 // Recruitment Drive Event — everything (announcement, leaderboard, per-member
 // evidence threads) lives in this single channel.
 const RECRUITMENT_DRIVE_CHANNEL_ID   = "1567981016642097324";
-const RECRUITMENT_DRIVE_PRIZE_TEXT   = "2 Bonds";
+const RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT  = "3 Bonds"; // awarded to 1st place
+const RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT = "1 Bond";  // awarded to 2nd place
 const RECRUITMENT_UPLOAD_WINDOW_MS   = 10 * 60 * 1000; // 10 minutes to post a screenshot after clicking the button
 const RECRUITMENT_THREAD_AUTO_ARCHIVE_MINUTES = 10080; // 1 week — the max; new posts keep un-archiving it
 // Start/end instants (America/Chicago) are computed further down, right after
@@ -5936,7 +5937,9 @@ function buildRecruitmentDriveEmbed(phase) {
     .addFields(
       {
         name: "Prize",
-        value: `${RECRUITMENT_DRIVE_PRIZE_TEXT} go to whoever recruits the most new members to the clan during the event.`,
+        value:
+          `**1st place:** ${RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT} — for whoever recruits the most new members to the clan during the event.\n` +
+          `**2nd place:** ${RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT} — for whoever recruits the second-most.`,
       },
       {
         name: "How Points Work",
@@ -5977,6 +5980,32 @@ function buildRecruitmentDriveEmbed(phase) {
   return { embeds: [embed], components: [row] };
 }
 
+/**
+ * Splits final standings into 1st/2nd place groups (each possibly tied, or
+ * empty if there's nobody eligible). Shared by the final leaderboard embed
+ * and the end-of-event announcement so the two can never disagree about who
+ * actually won what.
+ */
+function getRecruitmentDrivePlacements(standings) {
+  const topScore = standings[0]?.points ?? 0;
+  const firstPlaceWinners = standings.filter((s) => s.points === topScore && topScore > 0);
+
+  // Second place only exists among members who scored *below* the top score
+  // — someone tied for 1st isn't also "2nd place". If there's a tie for 1st,
+  // leave 2nd place undetermined entirely: staff is already being asked to
+  // decide the 1st-place prize, and bumping someone to "2nd" while that's
+  // unresolved would be presumptuous.
+  let secondScore = 0;
+  let secondPlaceWinners = [];
+  if (firstPlaceWinners.length === 1) {
+    const remaining = standings.filter((s) => s.points < topScore);
+    secondScore = remaining[0]?.points ?? 0;
+    secondPlaceWinners = remaining.filter((s) => s.points === secondScore && secondScore > 0);
+  }
+
+  return { topScore, firstPlaceWinners, secondScore, secondPlaceWinners };
+}
+
 function buildRecruitmentLeaderboardEmbed(standings, opts = {}) {
   const embed = new EmbedBuilder()
     .setColor(opts.final ? COLOR.gold : COLOR.main)
@@ -5995,14 +6024,27 @@ function buildRecruitmentLeaderboardEmbed(standings, opts = {}) {
   }
 
   if (opts.final) {
-    const topScore = standings[0]?.points ?? 0;
-    const winners = standings.filter((s) => s.points === topScore && topScore > 0);
-    if (winners.length === 1) {
-      embed.addFields({ name: "Winner", value: `<@${winners[0].recruiterId}> takes home ${RECRUITMENT_DRIVE_PRIZE_TEXT}!` });
-    } else if (winners.length > 1) {
+    const { topScore, firstPlaceWinners, secondScore, secondPlaceWinners } = getRecruitmentDrivePlacements(standings);
+    if (firstPlaceWinners.length === 1) {
+      embed.addFields({
+        name: "1st Place",
+        value: `<@${firstPlaceWinners[0].recruiterId}> takes home ${RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT}!`,
+      });
+      if (secondPlaceWinners.length === 1) {
+        embed.addFields({
+          name: "2nd Place",
+          value: `<@${secondPlaceWinners[0].recruiterId}> takes home ${RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT}!`,
+        });
+      } else if (secondPlaceWinners.length > 1) {
+        embed.addFields({
+          name: "Tie For 2nd Place",
+          value: `${secondPlaceWinners.map((w) => `<@${w.recruiterId}>`).join(", ")} are tied for 2nd place with **${secondScore}** points each.`,
+        });
+      }
+    } else if (firstPlaceWinners.length > 1) {
       embed.addFields({
         name: "Tie For First",
-        value: `${winners.map((w) => `<@${w.recruiterId}>`).join(", ")} are tied for first place with **${topScore}** points each.`,
+        value: `${firstPlaceWinners.map((w) => `<@${w.recruiterId}>`).join(", ")} are tied for first place with **${topScore}** points each.`,
       });
     }
   }
@@ -6113,22 +6155,37 @@ async function postRecruitmentDriveFinalResults() {
     if (sent) recruitmentLeaderboardMessageId = sent.id;
   }
 
-  const topScore = standings[0]?.points ?? 0;
-  const winners = standings.filter((s) => s.points === topScore && topScore > 0);
-  if (winners.length > 1) {
+  const { topScore, firstPlaceWinners, secondScore, secondPlaceWinners } = getRecruitmentDrivePlacements(standings);
+  if (firstPlaceWinners.length > 1) {
     await channel
       .send({
         content:
-          `The Recruitment Drive has ended and it's a tie for first place between ${winners.map((w) => `<@${w.recruiterId}>`).join(", ")} ` +
-          `at **${topScore}** points each. <@&${LEADER_ROLE_ID}> <@&${CO_OWNER_ROLE_ID}> please decide how the ${RECRUITMENT_DRIVE_PRIZE_TEXT} prize should be handled.`,
+          `The Recruitment Drive has ended and it's a tie for first place between ${firstPlaceWinners.map((w) => `<@${w.recruiterId}>`).join(", ")} ` +
+          `at **${topScore}** points each. <@&${LEADER_ROLE_ID}> <@&${CO_OWNER_ROLE_ID}> please decide how the ${RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT} / ${RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT} prizes should be handled.`,
       })
       .catch(() => {});
-  } else if (winners.length === 1) {
+  } else if (firstPlaceWinners.length === 1) {
     await channel
       .send({
-        content: `The Recruitment Drive has ended! Congratulations to <@${winners[0].recruiterId}> for recruiting the most members and winning ${RECRUITMENT_DRIVE_PRIZE_TEXT}!`,
+        content: `The Recruitment Drive has ended! Congratulations to <@${firstPlaceWinners[0].recruiterId}> for recruiting the most members and winning ${RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT}!`,
       })
       .catch(() => {});
+
+    if (secondPlaceWinners.length === 1) {
+      await channel
+        .send({
+          content: `And congratulations to <@${secondPlaceWinners[0].recruiterId}> for taking 2nd place and winning ${RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT}!`,
+        })
+        .catch(() => {});
+    } else if (secondPlaceWinners.length > 1) {
+      await channel
+        .send({
+          content:
+            `It's a tie for 2nd place between ${secondPlaceWinners.map((w) => `<@${w.recruiterId}>`).join(", ")} ` +
+            `at **${secondScore}** points each. <@&${LEADER_ROLE_ID}> <@&${CO_OWNER_ROLE_ID}> please decide how the ${RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT} prize should be handled.`,
+        })
+        .catch(() => {});
+    }
   }
 }
 
@@ -7088,7 +7145,9 @@ module.exports = {
   startWeeklyRecapLoop,
   // Recruitment Drive exports
   RECRUITMENT_DRIVE_CHANNEL_ID,
-  RECRUITMENT_DRIVE_PRIZE_TEXT,
+  RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT,
+  RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT,
+  getRecruitmentDrivePlacements,
   RECRUITMENT_DRIVE_START_MS,
   RECRUITMENT_DRIVE_END_MS,
   RECRUITMENT_UPLOAD_WINDOW_MS,
