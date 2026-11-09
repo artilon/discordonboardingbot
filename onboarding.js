@@ -3705,21 +3705,39 @@ function buildRankTableSummary() {
  * fetched at all, so callers can tell "nobody matched" apart from "we
  * couldn't check" and skip marking anyone rather than risk false positives.
  */
+function addMemberDisplayNames(names, members) {
+  for (const member of members.values()) {
+    if (member.user?.bot) continue;
+    const name = String(member.displayName || member.user?.username || "").trim().toLowerCase();
+    if (name) names.add(name);
+  }
+}
+
 async function getDiscordDisplayNameSet() {
   if (!client.guilds?.cache || client.guilds.cache.size === 0) return null;
   const names = new Set();
   let fetchedAny = false;
   for (const guild of client.guilds.cache.values()) {
     try {
-      const members = await guild.members.fetch();
-      for (const member of members.values()) {
-        if (member.user?.bot) continue;
-        const name = String(member.displayName || member.user?.username || "").trim().toLowerCase();
-        if (name) names.add(name);
-      }
+      // A full member fetch (not just the gateway cache) so a brand-new
+      // member who hasn't triggered any other cache-filling event yet still
+      // counts as "has Discord" right away, instead of needing to wait for
+      // one. Explicit timeout: a busy moment right after a bulk roster
+      // import (lots of other Discord/Supabase calls in flight) shouldn't
+      // let one slow fetch silently blank every `*` marker on the list.
+      const members = await guild.members.fetch({ time: 30000 });
+      addMemberDisplayNames(names, members);
       fetchedAny = true;
     } catch (err) {
       console.error("[RankList] Could not fetch guild members for nickname matching:", err.message);
+      // Fall back to whatever's already cached from the gateway's member
+      // chunking — stale/incomplete is still far better than marking every
+      // single clan member as having no Discord presence.
+      if (guild.members.cache && guild.members.cache.size > 0) {
+        addMemberDisplayNames(names, guild.members.cache);
+        fetchedAny = true;
+        console.warn(`[RankList] Falling back to ${guild.members.cache.size} cached member(s) for ${guild.id} after fetch failure.`);
+      }
     }
   }
   return fetchedAny ? names : null;
@@ -4624,118 +4642,148 @@ async function consumePendingRankXp(supabase, members = []) {
   return summary;
 }
 
+// If a caller (e.g. a roster upload handler) calls syncClanRanks() while
+// another pass is already running, we don't want to silently drop their
+// request — that's exactly how a just-uploaded roster's Discord-nickname
+// matching (the Rank List's `*` marker) could end up stale until the next
+// 30-minute heartbeat. Instead, queue one more pass to run immediately after
+// the current one finishes, and resolve every caller once that queued pass
+// (which is guaranteed to see their data) completes.
+let rankSyncQueuedRerun = false;
+let rankSyncQueuedWaiters = [];
+
 async function syncClanRanks(asOfDate = new Date()) {
-  if (rankSyncInFlight) return;
+  if (rankSyncInFlight) {
+    return new Promise((resolve) => {
+      rankSyncQueuedRerun = true;
+      rankSyncQueuedWaiters.push(resolve);
+    });
+  }
   const supabase = getSupabase();
   if (!supabase) return;
 
   rankSyncInFlight = true;
   try {
-    await processRosterUpload(supabase);
-
-    const { data: members, error } = await supabase
-      .from("clan_members")
-      .select("*")
-      .order("xp", { ascending: false });
-
-    if (error || !members) {
-      if (error) console.error("[RankSync] Could not read clan_members:", error.message);
-      return;
-    }
-
-    // Pull any Honour Marks quest XP before we compute ranks, so a member who
-    // just completed a quest ranks up in this same pass instead of the next one.
-    await consumePendingRankXp(supabase, members);
-
-    for (const member of members) {
-      if (member.active !== false) {
-        const parsedJoin = parseJoinedDate(member.joined_date);
-        const effectiveJoinedDate =
-          parsedJoin && parsedJoin.iso < CLAN_CREATION_DATE ? CLAN_CREATION_DATE : member.joined_date;
-        const dateClamped = effectiveJoinedDate !== member.joined_date;
-        if (dateClamped) {
-          member.joined_date = effectiveJoinedDate;
-        }
-
-        // Active clan member: calculate tenure & award any new weekly/monthly/yearly milestones
-        //
-        // The tenure replay only ever sees the tenure stream — `calc.xp` is
-        // tenure XP alone. Quest XP is `bonus_xp`, added on afterwards. The two
-        // meet in exactly one place: the total written to `xp`.
-        const calc = calculateTenureProgression(effectiveJoinedDate, asOfDate, member);
-        const tenureXp = calc.xp;
-        const bonusXp = Math.max(0, Number(member.bonus_xp) || 0);
-        const totalXp = tenureXp + bonusXp;
-        const combinedRank = getRankForXp(totalXp);
-
-        const xpChanged = totalXp !== (Number(member.xp) || 0);
-        const tenureChanged = tenureXp !== (Number(member.tenure_xp) || 0);
-        const rankChanged = combinedRank.name !== member.eligible_rank;
-        const countersChanged =
-          calc.weeksAwarded !== (Number(member.weeks_awarded) || 0) ||
-          calc.monthsAwarded !== (Number(member.months_awarded) || 0) ||
-          calc.yearsAwarded !== (Number(member.years_awarded) || 0);
-
-        if (xpChanged || tenureChanged || rankChanged || countersChanged || dateClamped) {
-          const nowIso = new Date().toISOString();
-          await supabase
-            .from("clan_members")
-            .update({
-              joined_date: effectiveJoinedDate,
-              tenure_xp: tenureXp,
-              bonus_xp: bonusXp,
-              xp: totalXp,
-              eligible_rank: combinedRank.name,
-              weeks_awarded: calc.weeksAwarded,
-              months_awarded: calc.monthsAwarded,
-              years_awarded: calc.yearsAwarded,
-              updated_at: nowIso,
-            })
-            .eq("id", member.id);
-
-          member.tenure_xp = tenureXp;
-          member.bonus_xp = bonusXp;
-          member.xp = totalXp;
-          member.eligible_rank = combinedRank.name;
-          member.weeks_awarded = calc.weeksAwarded;
-          member.months_awarded = calc.monthsAwarded;
-          member.years_awarded = calc.yearsAwarded;
-
-          if (calc.newEvents.length > 0) {
-            await logXpAwardToDiscord(member.rsn, calc.newEvents, totalXp, combinedRank.name);
-          }
-        }
-
-        // Check if member is eligible for a rank-up above their confirmed in-game rank
-        const eligibleIdx = getRankIndex(member.eligible_rank);
-        const confirmedIdx = getRankIndex(member.confirmed_rank || "Bronze");
-        if (eligibleIdx > confirmedIdx) {
-          const payload = buildRankUpAlertStep1(member, member.eligible_rank);
-          await ensureStaffAlertMessage(supabase, member, "rank_up", payload);
-        }
-      } else {
-        // Member has left the clan
-        if (!member.left_logged) {
-          await logMemberLeftToDiscord(member, null);
-          await supabase
-            .from("clan_members")
-            .update({ left_logged: true, updated_at: new Date().toISOString() })
-            .eq("id", member.id);
-          member.left_logged = true;
-        }
-
-        if (!member.left_confirmed) {
-          const payload = buildMemberLeftAlertStep1(member);
-          await ensureStaffAlertMessage(supabase, member, "member_left", payload);
-        }
-      }
-    }
-
-    await ensureRankListMessage(members);
+    // Everything that can early-`return` lives in this inner pass so those
+    // returns don't also skip the queued-rerun drain below — they only exit
+    // runOneRankSyncPass(), not syncClanRanks() itself.
+    await runOneRankSyncPass(supabase, asOfDate);
   } finally {
     lastRankSyncFinishedAt = Date.now();
     rankSyncInFlight = false;
   }
+
+  if (rankSyncQueuedRerun) {
+    rankSyncQueuedRerun = false;
+    const waiters = rankSyncQueuedWaiters;
+    rankSyncQueuedWaiters = [];
+    await syncClanRanks(asOfDate);
+    waiters.forEach((resolve) => resolve());
+  }
+}
+
+async function runOneRankSyncPass(supabase, asOfDate) {
+  await processRosterUpload(supabase);
+
+  const { data: members, error } = await supabase
+    .from("clan_members")
+    .select("*")
+    .order("xp", { ascending: false });
+
+  if (error || !members) {
+    if (error) console.error("[RankSync] Could not read clan_members:", error.message);
+    return;
+  }
+
+  // Pull any Honour Marks quest XP before we compute ranks, so a member who
+  // just completed a quest ranks up in this same pass instead of the next one.
+  await consumePendingRankXp(supabase, members);
+
+  for (const member of members) {
+    if (member.active !== false) {
+      const parsedJoin = parseJoinedDate(member.joined_date);
+      const effectiveJoinedDate =
+        parsedJoin && parsedJoin.iso < CLAN_CREATION_DATE ? CLAN_CREATION_DATE : member.joined_date;
+      const dateClamped = effectiveJoinedDate !== member.joined_date;
+      if (dateClamped) {
+        member.joined_date = effectiveJoinedDate;
+      }
+
+      // Active clan member: calculate tenure & award any new weekly/monthly/yearly milestones
+      //
+      // The tenure replay only ever sees the tenure stream — `calc.xp` is
+      // tenure XP alone. Quest XP is `bonus_xp`, added on afterwards. The two
+      // meet in exactly one place: the total written to `xp`.
+      const calc = calculateTenureProgression(effectiveJoinedDate, asOfDate, member);
+      const tenureXp = calc.xp;
+      const bonusXp = Math.max(0, Number(member.bonus_xp) || 0);
+      const totalXp = tenureXp + bonusXp;
+      const combinedRank = getRankForXp(totalXp);
+
+      const xpChanged = totalXp !== (Number(member.xp) || 0);
+      const tenureChanged = tenureXp !== (Number(member.tenure_xp) || 0);
+      const rankChanged = combinedRank.name !== member.eligible_rank;
+      const countersChanged =
+        calc.weeksAwarded !== (Number(member.weeks_awarded) || 0) ||
+        calc.monthsAwarded !== (Number(member.months_awarded) || 0) ||
+        calc.yearsAwarded !== (Number(member.years_awarded) || 0);
+
+      if (xpChanged || tenureChanged || rankChanged || countersChanged || dateClamped) {
+        const nowIso = new Date().toISOString();
+        await supabase
+          .from("clan_members")
+          .update({
+            joined_date: effectiveJoinedDate,
+            tenure_xp: tenureXp,
+            bonus_xp: bonusXp,
+            xp: totalXp,
+            eligible_rank: combinedRank.name,
+            weeks_awarded: calc.weeksAwarded,
+            months_awarded: calc.monthsAwarded,
+            years_awarded: calc.yearsAwarded,
+            updated_at: nowIso,
+          })
+          .eq("id", member.id);
+
+        member.tenure_xp = tenureXp;
+        member.bonus_xp = bonusXp;
+        member.xp = totalXp;
+        member.eligible_rank = combinedRank.name;
+        member.weeks_awarded = calc.weeksAwarded;
+        member.months_awarded = calc.monthsAwarded;
+        member.years_awarded = calc.yearsAwarded;
+
+        if (calc.newEvents.length > 0) {
+          await logXpAwardToDiscord(member.rsn, calc.newEvents, totalXp, combinedRank.name);
+        }
+      }
+
+      // Check if member is eligible for a rank-up above their confirmed in-game rank
+      const eligibleIdx = getRankIndex(member.eligible_rank);
+      const confirmedIdx = getRankIndex(member.confirmed_rank || "Bronze");
+      if (eligibleIdx > confirmedIdx) {
+        const payload = buildRankUpAlertStep1(member, member.eligible_rank);
+        await ensureStaffAlertMessage(supabase, member, "rank_up", payload);
+      }
+    } else {
+      // Member has left the clan
+      if (!member.left_logged) {
+        await logMemberLeftToDiscord(member, null);
+        await supabase
+          .from("clan_members")
+          .update({ left_logged: true, updated_at: new Date().toISOString() })
+          .eq("id", member.id);
+        member.left_logged = true;
+      }
+
+      if (!member.left_confirmed) {
+        const payload = buildMemberLeftAlertStep1(member);
+        await ensureStaffAlertMessage(supabase, member, "member_left", payload);
+      }
+    }
+  }
+
+  await ensureRankListMessage(members);
 }
 
 let realtimeChannel = null;
@@ -4782,7 +4830,11 @@ function startRankingSyncLoop() {
         syncClanRanks().catch((e) => console.error("[RankSync] Realtime sync error:", e.message));
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "roster_upload" }, () => {
-        if (rankSyncInFlight) return;
+        // No in-flight guard here on purpose: a roster upload must never be
+        // silently dropped just because another sync happens to already be
+        // running. syncClanRanks() itself now coalesces concurrent calls —
+        // it queues one more guaranteed-fresh pass rather than no-op'ing —
+        // so it's always safe (and correct) to call it unconditionally here.
         syncClanRanks().catch((e) => console.error("[RankSync] Roster upload sync error:", e.message));
       })
       // The HM bot appends quest XP here. Reacting to inserts means the member
@@ -5640,9 +5692,13 @@ async function onGrowthRangeButton(interaction, rangeKey) {
     members = data || [];
     snapshots = await syncGrowthHistoryToSupabase(supabase, members);
   }
+  // Without this, switching the chart range would silently wipe every "no
+  // matching Discord member" asterisk from the list until the next sync.
+  const discordNicknames = await getDiscordDisplayNameSet();
   const payload = buildRankListPayload(members, new Date(), {
     range: rangeKey,
     growthSnapshots: snapshots,
+    discordNicknames,
   });
   await interaction.editReply(payload).catch((e) => console.warn("[GrowthChart] Could not update range view:", e.message));
 }
@@ -6963,6 +7019,7 @@ module.exports = {
   buildMemberLeftAlertStep1,
   buildMemberLeftAlertStep2,
   ensureRankListMessage,
+  onGrowthRangeButton,
   syncClanRanks,
   isRankSyncDue,
   startRankingSyncLoop,
