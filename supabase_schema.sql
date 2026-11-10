@@ -213,17 +213,29 @@ create table if not exists public.recruitment_drive_threads (
 );
 
 create table if not exists public.recruitment_drive_submissions (
-  id                     bigserial primary key,
-  recruiter_id           text not null,
-  recruiter_tag          text,
-  thread_id              text not null,
-  message_id             text,
-  screenshot_number      integer not null,
-  note                   text,
-  join_bonus_awarded     boolean not null default false,
-  join_bonus_awarded_by  text,
-  join_bonus_awarded_at  timestamptz,
-  created_at             timestamptz not null default now()
+  id                        bigserial primary key,
+  recruiter_id              text not null,
+  recruiter_tag             text,
+  thread_id                 text not null,
+  message_id                text,
+  screenshot_number         integer not null,
+  note                      text,
+  -- Screenshot verification (Step A) — gates whether this submission counts
+  -- toward the leaderboard at all. Must happen before the join bonus below.
+  verified                  boolean not null default false,
+  verified_by               text,
+  verified_by_tag           text,
+  verified_at               timestamptz,
+  -- Discord-join bonus (Step B) — a separate, double-confirmed follow-up that
+  -- only becomes available once the row above is verified.
+  join_bonus_awarded        boolean not null default false,
+  join_bonus_awarded_by     text,
+  join_bonus_awarded_by_tag text,
+  join_bonus_awarded_at     timestamptz,
+  -- Tracks the open Staff Alert "awaiting review" post for this submission
+  -- (if any) so it can be auto-cleared once verified via the thread embed.
+  alert_message_id          text,
+  created_at                timestamptz not null default now()
 );
 
 create index if not exists idx_recruitment_drive_submissions_recruiter on public.recruitment_drive_submissions (recruiter_id);

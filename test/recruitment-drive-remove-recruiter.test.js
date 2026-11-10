@@ -120,9 +120,12 @@ check("registerRemoveRecruiterCommand is exported for wiring into ClientReady", 
   const regular = makeMember(["some-random-role"]);
 
   // ---- Seed one recruiter with 2 submissions + a bonus, via the real recording helpers ----
-  await bot.recordRecruitmentSubmission({ recruiterId: "recruit-1", recruiterTag: "User-recruit-1#0001", threadId: thread.id, screenshotNumber: 1, note: "n1" });
+  const firstSubId = await bot.recordRecruitmentSubmission({ recruiterId: "recruit-1", recruiterTag: "User-recruit-1#0001", threadId: thread.id, screenshotNumber: 1, note: "n1" });
   const secondSubId = await bot.recordRecruitmentSubmission({ recruiterId: "recruit-1", recruiterTag: "User-recruit-1#0001", threadId: thread.id, screenshotNumber: 2, note: "n2" });
-  await bot.markRecruitmentBonusAwarded(secondSubId, "staff-1");
+  // Both screenshots need to be staff-verified before they count toward the leaderboard.
+  await bot.markRecruitmentSubmissionVerified(firstSubId, "staff-1", "Staff#0001");
+  await bot.markRecruitmentSubmissionVerified(secondSubId, "staff-1", "Staff#0001");
+  await bot.markRecruitmentBonusAwarded(secondSubId, "staff-1", "Staff#0001");
   bot.recruitmentMemoryStore.threads.set("recruit-1", thread.id);
 
   const standingsBefore = await bot.getRecruitmentStandings();
