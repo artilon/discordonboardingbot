@@ -393,6 +393,7 @@ const config = {
   osrsVoiceInitialEmptyTimeoutMs: OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS,
   multiplyMonthlyYearly: false,       // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
   growthChartRange: "all",            // "30d" | "6m" | "all"
+  rankListPage: 0,                    // 0-indexed; which 20-member page of the Rank List is shown
   supabase: null,                     // Initialized on startup or injected for tests
   hiscoreFetcher: null,               // Optional override for testing OSRS HiScores fetches
   twitchPollIntervalMs: 90 * 1000,    // Check Twitch for a live-status change every 90 seconds
@@ -426,6 +427,8 @@ const ID = {
   GROWTH_RANGE_30D:  "growth_range_30d",
   GROWTH_RANGE_6M:   "growth_range_6m",
   GROWTH_RANGE_ALL:  "growth_range_all",
+  RANK_LIST_PAGE_PREV: "rank_list_page_prev",
+  RANK_LIST_PAGE_NEXT: "rank_list_page_next",
   RANKUP_C1:         "rankup_c1",
   RANKUP_C2:         "rankup_c2",
   RANKUP_CANCEL:     "rankup_cancel",
@@ -3793,6 +3796,9 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     rangeKey
   );
 
+  // The header/legend is its own embed, always shown in full regardless of
+  // which page of members is currently displayed — only the member list
+  // itself paginates.
   const headerDesc =
     "** Clan Rank Progression & Member Standings**\n" +
     `**Tenure XP:** Weekly \`+${WEEKLY_BASE_XP.toLocaleString()} XP × tenure rank multiplier\` • ` +
@@ -3803,7 +3809,18 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     `**Active Clan Members:** \`${activeMembers.length}\` • **Last Synced:** <t:${nowUnix}:R>` +
     (discordNames ? `\n\\* = no matching Discord server member found for this name` : "");
 
-  const lines = activeMembers.map((m, idx) => {
+  // ---- Pagination: 20 members per page, navigated with Prev/Next buttons ----
+  const PAGE_SIZE = 20;
+  const totalPages = Math.max(1, Math.ceil(activeMembers.length / PAGE_SIZE));
+  let page = Number.isInteger(options.page) ? options.page : config.rankListPage || 0;
+  page = Math.min(Math.max(page, 0), totalPages - 1);
+  config.rankListPage = page; // shared state so a plain refresh/sync keeps showing the page staff was on
+
+  const pageStart = page * PAGE_SIZE;
+  const pageMembers = activeMembers.slice(pageStart, pageStart + PAGE_SIZE);
+
+  const lines = pageMembers.map((m, idxOnPage) => {
+    const idx = pageStart + idxOnPage; // global rank position, not just position on this page
     // Rank is driven by the COMBINED total (tenure + flat quest XP)...
     const xp = getTotalRankXp(m);
     const eligibleTier = getRankForXp(xp);
@@ -3845,43 +3862,45 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     );
   });
 
-  // Growth Chart Embed is always embeds[0] (directly above the Member List!)
-  const embeds = [growthEmbed];
+  // Growth Chart Embed is always embeds[0], the header/legend is always
+  // embeds[1], and the current page of the member list follows after that.
+  const infoEmbed = new EmbedBuilder().setColor(COLOR.main).setTitle("Clan Rank List & Tenure Standings").setDescription(headerDesc);
+  const embeds = [growthEmbed, infoEmbed];
+
+  const pageTitle = `Member Standings — Page ${page + 1} of ${totalPages}`;
   if (lines.length === 0) {
     embeds.push(
       new EmbedBuilder()
         .setColor(COLOR.main)
-        .setTitle("Clan Rank List & Tenure Standings")
-        .setDescription(`${headerDesc}\n\n*No active clan members found in the database yet.*`)
+        .setTitle(pageTitle)
+        .setDescription("*No active clan members found in the database yet.*")
     );
   } else {
-    // Split member lines across embeds so no embed description exceeds Discord's 4096-char limit
+    // This page's 20 members should almost always fit in one embed under
+    // Discord's 4096-char description limit — this chunking only kicks in
+    // as a safety net for unusually long names/notes, so this page's own
+    // content never silently gets cut off.
     const MAX_DESC = 3500;
-    let currentChunk = `${headerDesc}\n\n`;
-    let isFirst = true;
+    let currentChunk = "";
+    let isFirstChunk = true;
 
-    for (const line of lines) {
-      if (currentChunk.length + line.length + 2 > MAX_DESC && embeds.length < 9) {
-        embeds.push(
-          new EmbedBuilder()
-            .setColor(COLOR.main)
-            .setTitle(isFirst ? "Clan Rank List & Tenure Standings" : "Clan Rank List (Continued)")
-            .setDescription(currentChunk.trimEnd())
-        );
-        isFirst = false;
-        currentChunk = "";
-      }
-      currentChunk += `${line}\n`;
-    }
-
-    if (currentChunk.trim().length > 0) {
+    const flush = () => {
+      if (!currentChunk.trim()) return;
       embeds.push(
         new EmbedBuilder()
           .setColor(COLOR.main)
-          .setTitle(isFirst ? "Clan Rank List & Tenure Standings" : "Clan Rank List (Continued)")
+          .setTitle(isFirstChunk ? pageTitle : `${pageTitle} (Continued)`)
           .setDescription(currentChunk.trimEnd())
       );
+      isFirstChunk = false;
+      currentChunk = "";
+    };
+
+    for (const line of lines) {
+      if (currentChunk.length + line.length + 2 > MAX_DESC) flush();
+      currentChunk += `${line}\n`;
     }
+    flush();
   }
 
   const row = new ActionRowBuilder().addComponents(
@@ -3907,7 +3926,20 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
       .setStyle(rangeKey === "all" ? ButtonStyle.Success : ButtonStyle.Secondary)
   );
 
-  return { embeds, components: [row], files: [growthAttachment] };
+  const navRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(ID.RANK_LIST_PAGE_PREV)
+      .setLabel("◀ Prev 20")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(ID.RANK_LIST_PAGE_NEXT)
+      .setLabel("Next 20 ▶")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1)
+  );
+
+  return { embeds, components: [row, navRow], files: [growthAttachment] };
 }
 
 async function syncGrowthHistoryToSupabase(supabase, members = [], asOfDate = new Date()) {
@@ -3995,6 +4027,8 @@ async function ensureRankListMessage(members, growthSnapshots) {
       ID.GROWTH_RANGE_30D,
       ID.GROWTH_RANGE_6M,
       ID.GROWTH_RANGE_ALL,
+      ID.RANK_LIST_PAGE_PREV,
+      ID.RANK_LIST_PAGE_NEXT,
     ],
     payload: buildRankListPayload(list, new Date(), {
       range: config.growthChartRange,
@@ -5725,6 +5759,31 @@ async function onGrowthRangeButton(interaction, rangeKey) {
   await interaction.editReply(payload).catch((e) => console.warn("[GrowthChart] Could not update range view:", e.message));
 }
 
+async function onRankListPageButton(interaction, direction) {
+  config.rankListPage = (config.rankListPage || 0) + direction; // buildRankListPayload clamps this to a valid page
+  await interaction.deferUpdate();
+  const supabase = getSupabase();
+  let members = [];
+  let snapshots = [];
+  if (supabase) {
+    const { data } = await supabase
+      .from("clan_members")
+      .select("*")
+      .order("xp", { ascending: false });
+    members = data || [];
+    snapshots = await syncGrowthHistoryToSupabase(supabase, members);
+  }
+  // Same reasoning as onGrowthRangeButton — recompute Discord nicknames so
+  // flipping pages never wipes the "no matching Discord member" asterisks.
+  const discordNicknames = await getDiscordDisplayNameSet();
+  const payload = buildRankListPayload(members, new Date(), {
+    range: config.growthChartRange,
+    growthSnapshots: snapshots,
+    discordNicknames,
+  });
+  await interaction.editReply(payload).catch((e) => console.warn("[RankList] Could not update page view:", e.message));
+}
+
 // ---- Roster Upload via Discord Button / File Drop / Modal / Slash Command ----
 const pendingRosterUploads = new Map(); // userId -> { expiresAt, channelId, guildId }
 const ROSTER_UPLOAD_WINDOW_MS = 2 * 60 * 1000;
@@ -6869,6 +6928,8 @@ async function handleInteraction(interaction) {
       case ID.GROWTH_RANGE_30D:     return onGrowthRangeButton(interaction, "30d");
       case ID.GROWTH_RANGE_6M:      return onGrowthRangeButton(interaction, "6m");
       case ID.GROWTH_RANGE_ALL:     return onGrowthRangeButton(interaction, "all");
+      case ID.RANK_LIST_PAGE_PREV:  return onRankListPageButton(interaction, -1);
+      case ID.RANK_LIST_PAGE_NEXT:  return onRankListPageButton(interaction, 1);
       case ID.RANKUP_C1:            return onRankUpConfirm1(interaction, payload, extra);
       case ID.RANKUP_C2:            return onRankUpConfirm2(interaction, payload, extra);
       case ID.RANKUP_CANCEL:        return onRankUpCancel(interaction, payload, extra);
@@ -7321,6 +7382,7 @@ module.exports = {
   buildMemberLeftAlertStep2,
   ensureRankListMessage,
   onGrowthRangeButton,
+  onRankListPageButton,
   syncClanRanks,
   isRankSyncDue,
   startRankingSyncLoop,
