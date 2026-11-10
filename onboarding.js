@@ -393,6 +393,7 @@ const config = {
   osrsVoiceInitialEmptyTimeoutMs: OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS,
   multiplyMonthlyYearly: false,       // Weekly uses rank multiplier; Monthly & Yearly are flat bonuses
   growthChartRange: "all",            // "30d" | "6m" | "all"
+  rankListPage: 0,                    // 0-indexed; which 20-member page of the Rank List is shown
   supabase: null,                     // Initialized on startup or injected for tests
   hiscoreFetcher: null,               // Optional override for testing OSRS HiScores fetches
   twitchPollIntervalMs: 90 * 1000,    // Check Twitch for a live-status change every 90 seconds
@@ -426,6 +427,8 @@ const ID = {
   GROWTH_RANGE_30D:  "growth_range_30d",
   GROWTH_RANGE_6M:   "growth_range_6m",
   GROWTH_RANGE_ALL:  "growth_range_all",
+  RANK_LIST_PAGE_PREV: "rank_list_page_prev",
+  RANK_LIST_PAGE_NEXT: "rank_list_page_next",
   RANKUP_C1:         "rankup_c1",
   RANKUP_C2:         "rankup_c2",
   RANKUP_CANCEL:     "rankup_cancel",
@@ -459,6 +462,9 @@ const ID = {
   // Recruitment Drive Event custom IDs
   RECRUITMENT_UPLOAD_BTN:    "recruitment_upload_btn",
   RECRUITMENT_CONFIRM_BONUS: "recruitment_confirm_bonus",
+  RECRUITMENT_INFO_MODAL:        "recruitment_info_modal",
+  RECRUITMENT_NAME_INPUT:        "recruitment_name_input",
+  RECRUITMENT_JOINED_DISCORD_INPUT: "recruitment_joined_discord_input",
 };
 
 const COLOR = {
@@ -471,12 +477,20 @@ const COLOR = {
 
 // ================= CLIENT =================
 const client = new Client({
-  // GuildMembers is a privileged intent — it must be enabled in the Developer Portal
-  // (Bot tab -> Privileged Gateway Intents -> Server Members Intent).
+  // GuildMembers and MessageContent are both privileged intents — each one must be
+  // enabled in the Developer Portal (Bot tab -> Privileged Gateway Intents).
+  //
+  // MessageContent is required so the bot can actually see `message.attachments`
+  // (and `message.content`) on normal guild messages — e.g. the clan roster
+  // .csv/.txt file a Leader drops in a channel. Without it, Discord silently
+  // strips attachments/content from any guild message that doesn't @-mention the
+  // bot and isn't a DM, which made roster-file uploads look like the bot was
+  // just ignoring them.
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.GuildVoiceStates,
   ],
@@ -3790,6 +3804,9 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     rangeKey
   );
 
+  // The header/legend is its own embed, always shown in full regardless of
+  // which page of members is currently displayed — only the member list
+  // itself paginates.
   const headerDesc =
     "** Clan Rank Progression & Member Standings**\n" +
     `**Tenure XP:** Weekly \`+${WEEKLY_BASE_XP.toLocaleString()} XP × tenure rank multiplier\` • ` +
@@ -3800,7 +3817,18 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     `**Active Clan Members:** \`${activeMembers.length}\` • **Last Synced:** <t:${nowUnix}:R>` +
     (discordNames ? `\n\\* = no matching Discord server member found for this name` : "");
 
-  const lines = activeMembers.map((m, idx) => {
+  // ---- Pagination: 20 members per page, navigated with Prev/Next buttons ----
+  const PAGE_SIZE = 20;
+  const totalPages = Math.max(1, Math.ceil(activeMembers.length / PAGE_SIZE));
+  let page = Number.isInteger(options.page) ? options.page : config.rankListPage || 0;
+  page = Math.min(Math.max(page, 0), totalPages - 1);
+  config.rankListPage = page; // shared state so a plain refresh/sync keeps showing the page staff was on
+
+  const pageStart = page * PAGE_SIZE;
+  const pageMembers = activeMembers.slice(pageStart, pageStart + PAGE_SIZE);
+
+  const lines = pageMembers.map((m, idxOnPage) => {
+    const idx = pageStart + idxOnPage; // global rank position, not just position on this page
     // Rank is driven by the COMBINED total (tenure + flat quest XP)...
     const xp = getTotalRankXp(m);
     const eligibleTier = getRankForXp(xp);
@@ -3842,43 +3870,45 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     );
   });
 
-  // Growth Chart Embed is always embeds[0] (directly above the Member List!)
-  const embeds = [growthEmbed];
+  // Growth Chart Embed is always embeds[0], the header/legend is always
+  // embeds[1], and the current page of the member list follows after that.
+  const infoEmbed = new EmbedBuilder().setColor(COLOR.main).setTitle("Clan Rank List & Tenure Standings").setDescription(headerDesc);
+  const embeds = [growthEmbed, infoEmbed];
+
+  const pageTitle = `Member Standings — Page ${page + 1} of ${totalPages}`;
   if (lines.length === 0) {
     embeds.push(
       new EmbedBuilder()
         .setColor(COLOR.main)
-        .setTitle("Clan Rank List & Tenure Standings")
-        .setDescription(`${headerDesc}\n\n*No active clan members found in the database yet.*`)
+        .setTitle(pageTitle)
+        .setDescription("*No active clan members found in the database yet.*")
     );
   } else {
-    // Split member lines across embeds so no embed description exceeds Discord's 4096-char limit
+    // This page's 20 members should almost always fit in one embed under
+    // Discord's 4096-char description limit — this chunking only kicks in
+    // as a safety net for unusually long names/notes, so this page's own
+    // content never silently gets cut off.
     const MAX_DESC = 3500;
-    let currentChunk = `${headerDesc}\n\n`;
-    let isFirst = true;
+    let currentChunk = "";
+    let isFirstChunk = true;
 
-    for (const line of lines) {
-      if (currentChunk.length + line.length + 2 > MAX_DESC && embeds.length < 9) {
-        embeds.push(
-          new EmbedBuilder()
-            .setColor(COLOR.main)
-            .setTitle(isFirst ? "Clan Rank List & Tenure Standings" : "Clan Rank List (Continued)")
-            .setDescription(currentChunk.trimEnd())
-        );
-        isFirst = false;
-        currentChunk = "";
-      }
-      currentChunk += `${line}\n`;
-    }
-
-    if (currentChunk.trim().length > 0) {
+    const flush = () => {
+      if (!currentChunk.trim()) return;
       embeds.push(
         new EmbedBuilder()
           .setColor(COLOR.main)
-          .setTitle(isFirst ? "Clan Rank List & Tenure Standings" : "Clan Rank List (Continued)")
+          .setTitle(isFirstChunk ? pageTitle : `${pageTitle} (Continued)`)
           .setDescription(currentChunk.trimEnd())
       );
+      isFirstChunk = false;
+      currentChunk = "";
+    };
+
+    for (const line of lines) {
+      if (currentChunk.length + line.length + 2 > MAX_DESC) flush();
+      currentChunk += `${line}\n`;
     }
+    flush();
   }
 
   const row = new ActionRowBuilder().addComponents(
@@ -3904,7 +3934,20 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
       .setStyle(rangeKey === "all" ? ButtonStyle.Success : ButtonStyle.Secondary)
   );
 
-  return { embeds, components: [row], files: [growthAttachment] };
+  const navRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(ID.RANK_LIST_PAGE_PREV)
+      .setLabel("◀ Prev 20")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(ID.RANK_LIST_PAGE_NEXT)
+      .setLabel("Next 20 ▶")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1)
+  );
+
+  return { embeds, components: [row, navRow], files: [growthAttachment] };
 }
 
 async function syncGrowthHistoryToSupabase(supabase, members = [], asOfDate = new Date()) {
@@ -3992,6 +4035,8 @@ async function ensureRankListMessage(members, growthSnapshots) {
       ID.GROWTH_RANGE_30D,
       ID.GROWTH_RANGE_6M,
       ID.GROWTH_RANGE_ALL,
+      ID.RANK_LIST_PAGE_PREV,
+      ID.RANK_LIST_PAGE_NEXT,
     ],
     payload: buildRankListPayload(list, new Date(), {
       range: config.growthChartRange,
@@ -5722,6 +5767,31 @@ async function onGrowthRangeButton(interaction, rangeKey) {
   await interaction.editReply(payload).catch((e) => console.warn("[GrowthChart] Could not update range view:", e.message));
 }
 
+async function onRankListPageButton(interaction, direction) {
+  config.rankListPage = (config.rankListPage || 0) + direction; // buildRankListPayload clamps this to a valid page
+  await interaction.deferUpdate();
+  const supabase = getSupabase();
+  let members = [];
+  let snapshots = [];
+  if (supabase) {
+    const { data } = await supabase
+      .from("clan_members")
+      .select("*")
+      .order("xp", { ascending: false });
+    members = data || [];
+    snapshots = await syncGrowthHistoryToSupabase(supabase, members);
+  }
+  // Same reasoning as onGrowthRangeButton — recompute Discord nicknames so
+  // flipping pages never wipes the "no matching Discord member" asterisks.
+  const discordNicknames = await getDiscordDisplayNameSet();
+  const payload = buildRankListPayload(members, new Date(), {
+    range: config.growthChartRange,
+    growthSnapshots: snapshots,
+    discordNicknames,
+  });
+  await interaction.editReply(payload).catch((e) => console.warn("[RankList] Could not update page view:", e.message));
+}
+
 // ---- Roster Upload via Discord Button / File Drop / Modal / Slash Command ----
 const pendingRosterUploads = new Map(); // userId -> { expiresAt, channelId, guildId }
 const ROSTER_UPLOAD_WINDOW_MS = 2 * 60 * 1000;
@@ -5791,7 +5861,7 @@ async function onRosterUploadButton(interaction) {
     .setDescription(
       "Upload mode is active for the next **2 minutes**. Choose whichever method is easiest:\n\n" +
       `**Option 1 — Upload a \`.csv\` or \`.txt\` File (No Size Limit):**\n` +
-      `• Drop your exported \`.csv\` or \`.txt\` file in this channel and mention ${botMention} in the message (or drop the file in a **DM to ${botMention}**, or use \`/upload-roster\`).\n` +
+      `• Drop your exported \`.csv\` or \`.txt\` file in this channel (or in a **DM to ${botMention}**, or use \`/upload-roster\`). No need to @-mention me.\n` +
       `• I will automatically import the file into Supabase, update the chart & rank list, and **delete your upload message immediately**.\n\n` +
       `**Option 2 — Paste Roster Text:**\n` +
       `• Click **Paste Roster Text** below to paste lines like \`AztecSoul,Minion,17-Oct-2026\` directly.`
@@ -5917,12 +5987,14 @@ async function onUploadRosterSlashCommand(interaction) {
 // embed beneath it, and a bot-created thread per recruiting member holding
 // their numbered screenshot evidence.
 //
-// Discord buttons cannot open a native file-upload dialog, so the button
-// just opens a 10-minute submission window: the member posts their
-// screenshot (plus a short note) as a normal message in the channel, and the
-// bot grabs it, files it into their thread, deletes the original message,
-// and refreshes the leaderboard.
-const pendingRecruitmentUploads = new Map(); // userId -> { expiresAt }
+// Discord buttons cannot open a native file-upload dialog, so clicking
+// "Upload Screenshot" first opens a small 2-question modal (recruited
+// player's name, whether they've joined Discord yet), then opens a
+// 10-minute submission window: the member posts the screenshot as a plain
+// message in the channel (no caption needed — the modal already collected
+// that), and the bot grabs it, files it into their thread, deletes the
+// original message, and refreshes the leaderboard.
+const pendingRecruitmentUploads = new Map(); // userId -> { expiresAt, playerName, joinedDiscord }
 // In-memory fallback only used if Supabase isn't configured — nothing here
 // survives a restart in that case.
 const recruitmentMemoryStore = { threads: new Map(), submissions: [], nextId: 1 };
@@ -6414,6 +6486,36 @@ async function markRecruitmentBonusAwarded(submissionId, staffUserId) {
   }
 }
 
+function buildRecruitmentInfoModal() {
+  const modal = new ModalBuilder()
+    .setCustomId(ID.RECRUITMENT_INFO_MODAL)
+    .setTitle("Recruitment Drive Submission");
+
+  const nameInput = new TextInputBuilder()
+    .setCustomId(ID.RECRUITMENT_NAME_INPUT)
+    .setLabel("Name of the player you recruited")
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(1)
+    .setMaxLength(100)
+    .setRequired(true)
+    .setPlaceholder("PlayerName123");
+
+  const joinedDiscordInput = new TextInputBuilder()
+    .setCustomId(ID.RECRUITMENT_JOINED_DISCORD_INPUT)
+    .setLabel("Have they joined our Discord yet?")
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(1)
+    .setMaxLength(50)
+    .setRequired(true)
+    .setPlaceholder("yes or no");
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(nameInput),
+    new ActionRowBuilder().addComponents(joinedDiscordInput)
+  );
+  return modal;
+}
+
 async function onRecruitmentUploadButton(interaction) {
   const phase = getRecruitmentDrivePhase();
   if (phase === "scheduled") {
@@ -6427,15 +6529,30 @@ async function onRecruitmentUploadButton(interaction) {
     return interaction.reply({ content: "This event has ended. Thanks for taking part!", flags: MessageFlags.Ephemeral });
   }
 
-  pendingRecruitmentUploads.set(interaction.user.id, { expiresAt: Date.now() + RECRUITMENT_UPLOAD_WINDOW_MS });
+  return interaction.showModal(buildRecruitmentInfoModal());
+}
+
+async function onRecruitmentInfoModalSubmit(interaction) {
+  const phase = getRecruitmentDrivePhase();
+  if (phase !== "active") {
+    return interaction.reply({
+      content: phase === "scheduled" ? "This event hasn't started yet." : "This event has ended. Thanks for taking part!",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const playerName = interaction.fields.getTextInputValue(ID.RECRUITMENT_NAME_INPUT).trim();
+  const joinedDiscord = interaction.fields.getTextInputValue(ID.RECRUITMENT_JOINED_DISCORD_INPUT).trim();
+
+  pendingRecruitmentUploads.set(interaction.user.id, {
+    expiresAt: Date.now() + RECRUITMENT_UPLOAD_WINDOW_MS,
+    playerName,
+    joinedDiscord,
+  });
 
   return interaction.reply({
     content:
-      `Post your screenshot as a message right here in <#${RECRUITMENT_DRIVE_CHANNEL_ID}> within the next 10 minutes.\n\n` +
-      "In the **same message as the screenshot**, include:\n" +
-      "1. The name of the player you recruited\n" +
-      "2. Whether they've joined our Discord yet (yes/no)\n\n" +
-      "Example: `PlayerName123 - no, not on Discord yet`\n\n" +
+      `Got it! Now post your screenshot as a message right here in <#${RECRUITMENT_DRIVE_CHANNEL_ID}> within the next 10 minutes — just the image, no caption needed.\n\n` +
       "Heimdall will move it into your own thread in this channel and delete the original message automatically.",
     flags: MessageFlags.Ephemeral,
   });
@@ -6493,17 +6610,10 @@ async function handleRecruitmentDriveMessage(message) {
     return;
   }
 
-  const note = (message.content || "").trim();
-  if (!note) {
-    await message.delete().catch(() => {});
-    const temp = await message.channel
-      .send({
-        content: `<@${message.author.id}> Please include the recruited player's name and whether they've joined our Discord (yes/no) in the same message as your screenshot, then try again.`,
-      })
-      .catch(() => null);
-    if (temp) setTimeout(() => temp.delete().catch(() => {}), 15000);
-    return; // session stays open so they can retry within the window
-  }
+  // The player's name and Discord-join status were already collected by the
+  // "Upload Screenshot" modal (see onRecruitmentInfoModalSubmit) — no caption
+  // text is required in this message anymore, just the screenshot itself.
+  const note = `**Recruited:** ${session.playerName}\n**Joined Discord:** ${session.joinedDiscord}`;
 
   pendingRecruitmentUploads.delete(message.author.id);
 
@@ -6826,6 +6936,8 @@ async function handleInteraction(interaction) {
       case ID.GROWTH_RANGE_30D:     return onGrowthRangeButton(interaction, "30d");
       case ID.GROWTH_RANGE_6M:      return onGrowthRangeButton(interaction, "6m");
       case ID.GROWTH_RANGE_ALL:     return onGrowthRangeButton(interaction, "all");
+      case ID.RANK_LIST_PAGE_PREV:  return onRankListPageButton(interaction, -1);
+      case ID.RANK_LIST_PAGE_NEXT:  return onRankListPageButton(interaction, 1);
       case ID.RANKUP_C1:            return onRankUpConfirm1(interaction, payload, extra);
       case ID.RANKUP_C2:            return onRankUpConfirm2(interaction, payload, extra);
       case ID.RANKUP_CANCEL:        return onRankUpCancel(interaction, payload, extra);
@@ -6868,6 +6980,7 @@ async function handleInteraction(interaction) {
     if (interaction.customId === ID.MODAL) return onModalSubmit(interaction);
     if (interaction.customId === ID.ROSTER_MODAL) return onRosterModalSubmit(interaction);
     if (interaction.customId === ID.TICKET_DENY_MODAL) return onTicketDenyModalSubmit(interaction);
+    if (interaction.customId === ID.RECRUITMENT_INFO_MODAL) return onRecruitmentInfoModalSubmit(interaction);
     if (modalBase === ID.TICKET_COMPLIMENT_MODAL_GENERAL) return onTicketComplimentModalGeneral(interaction);
     if (modalBase === ID.TICKET_COMPLIMENT_MODAL_MEMBER) return onTicketComplimentModalMember(interaction, modalPayload);
   }
@@ -7277,6 +7390,7 @@ module.exports = {
   buildMemberLeftAlertStep2,
   ensureRankListMessage,
   onGrowthRangeButton,
+  onRankListPageButton,
   syncClanRanks,
   isRankSyncDue,
   startRankingSyncLoop,
@@ -7365,8 +7479,11 @@ module.exports = {
   refreshRecruitmentLeaderboard,
   postRecruitmentDriveFinalResults,
   onRecruitmentUploadButton,
+  onRecruitmentInfoModalSubmit,
+  buildRecruitmentInfoModal,
   onRecruitmentConfirmBonus,
   handleRecruitmentDriveMessage,
+  pendingRecruitmentUploads,
   // Twitch Live Alert exports
   fetchTwitchLiveStatus,
   buildTwitchLiveAlert,
