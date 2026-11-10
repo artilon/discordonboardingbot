@@ -3817,8 +3817,8 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     `**Active Clan Members:** \`${activeMembers.length}\` • **Last Synced:** <t:${nowUnix}:R>` +
     (discordNames ? `\n\\* = no matching Discord server member found for this name` : "");
 
-  // ---- Pagination: 20 members per page, navigated with Prev/Next buttons ----
-  const PAGE_SIZE = 20;
+  // ---- Pagination: 15 members per page, navigated with Prev/Next buttons ----
+  const PAGE_SIZE = 15;
   const totalPages = Math.max(1, Math.ceil(activeMembers.length / PAGE_SIZE));
   let page = Number.isInteger(options.page) ? options.page : config.rankListPage || 0;
   page = Math.min(Math.max(page, 0), totalPages - 1);
@@ -3884,11 +3884,11 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
         .setDescription("*No active clan members found in the database yet.*")
     );
   } else {
-    // This page's 20 members should almost always fit in one embed under
+    // This page's 15 members should almost always fit in one embed under
     // Discord's 4096-char description limit — this chunking only kicks in
     // as a safety net for unusually long names/notes, so this page's own
     // content never silently gets cut off.
-    const MAX_DESC = 3500;
+    const MAX_DESC = 3900;
     let currentChunk = "";
     let isFirstChunk = true;
 
@@ -3937,12 +3937,12 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
   const navRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(ID.RANK_LIST_PAGE_PREV)
-      .setLabel("◀ Prev 20")
+      .setLabel("◀ Prev 15")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(page <= 0),
     new ButtonBuilder()
       .setCustomId(ID.RANK_LIST_PAGE_NEXT)
-      .setLabel("Next 20 ▶")
+      .setLabel("Next 15 ▶")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(page >= totalPages - 1)
   );
