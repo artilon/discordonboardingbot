@@ -477,12 +477,20 @@ const COLOR = {
 
 // ================= CLIENT =================
 const client = new Client({
-  // GuildMembers is a privileged intent — it must be enabled in the Developer Portal
-  // (Bot tab -> Privileged Gateway Intents -> Server Members Intent).
+  // GuildMembers and MessageContent are both privileged intents — each one must be
+  // enabled in the Developer Portal (Bot tab -> Privileged Gateway Intents).
+  //
+  // MessageContent is required so the bot can actually see `message.attachments`
+  // (and `message.content`) on normal guild messages — e.g. the clan roster
+  // .csv/.txt file a Leader drops in a channel. Without it, Discord silently
+  // strips attachments/content from any guild message that doesn't @-mention the
+  // bot and isn't a DM, which made roster-file uploads look like the bot was
+  // just ignoring them.
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.GuildVoiceStates,
   ],
@@ -5853,7 +5861,7 @@ async function onRosterUploadButton(interaction) {
     .setDescription(
       "Upload mode is active for the next **2 minutes**. Choose whichever method is easiest:\n\n" +
       `**Option 1 — Upload a \`.csv\` or \`.txt\` File (No Size Limit):**\n` +
-      `• Drop your exported \`.csv\` or \`.txt\` file in this channel and mention ${botMention} in the message (or drop the file in a **DM to ${botMention}**, or use \`/upload-roster\`).\n` +
+      `• Drop your exported \`.csv\` or \`.txt\` file in this channel (or in a **DM to ${botMention}**, or use \`/upload-roster\`). No need to @-mention me.\n` +
       `• I will automatically import the file into Supabase, update the chart & rank list, and **delete your upload message immediately**.\n\n` +
       `**Option 2 — Paste Roster Text:**\n` +
       `• Click **Paste Roster Text** below to paste lines like \`AztecSoul,Minion,17-Oct-2026\` directly.`
