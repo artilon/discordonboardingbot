@@ -5,7 +5,7 @@
   "main": "onboarding.js",
   "scripts": {
     "start": "node onboarding.js",
-    "test": "node test/recruitment-drive.test.js && node test/automatic-tenure-xp.test.js && node test/server-privacy.test.js && node test/server-privacy-channel-coverage.test.js && node test/server-privacy-osrs-role.test.js && node test/weekly-recap-baseline-announcement.test.js && node test/rank-up-congrats-announcement.test.js && node test/weekly-recap-excludes-hitpoints.test.js && node test/rank-list-discord-nickname-marker.test.js && node test/rank-list-refresh-after-roster-upload.test.js && node test/recruitment-drive-two-tier-prize.test.js && node test/twitch-live-alert.test.js && node test/recruitment-drive-upload-flow.test.js && node test/rank-list-pagination.test.js && node test/message-content-intent.test.js && node test/recruitment-drive-remove-recruiter.test.js"
+    "test": "node test/recruitment-drive.test.js && node test/automatic-tenure-xp.test.js && node test/server-privacy.test.js && node test/server-privacy-channel-coverage.test.js && node test/server-privacy-osrs-role.test.js && node test/weekly-recap-baseline-announcement.test.js && node test/rank-up-congrats-announcement.test.js && node test/weekly-recap-excludes-hitpoints.test.js && node test/rank-list-discord-nickname-marker.test.js && node test/rank-list-refresh-after-roster-upload.test.js && node test/recruitment-drive-two-tier-prize.test.js && node test/twitch-live-alert.test.js && node test/recruitment-drive-upload-flow.test.js && node test/rank-list-pagination.test.js && node test/message-content-intent.test.js && node test/recruitment-drive-remove-recruiter.test.js && node test/recruitment-drive-verify-and-review-alert.test.js"
   },
   "engines": {
     "node": ">=22"

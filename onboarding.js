@@ -468,6 +468,15 @@ const ID = {
   RECRUITMENT_REMOVE_C1:         "recruitment_remove_c1",
   RECRUITMENT_REMOVE_C2:         "recruitment_remove_c2",
   RECRUITMENT_REMOVE_CANCEL:     "recruitment_remove_cancel",
+  // Screenshot verification + Discord-join-bonus double confirm
+  RECRUITMENT_VERIFY:            "recruitment_verify",
+  RECRUITMENT_BONUS_C1:          "recruitment_bonus_c1",
+  RECRUITMENT_BONUS_C2:          "recruitment_bonus_c2",
+  RECRUITMENT_BONUS_CANCEL:      "recruitment_bonus_cancel",
+  // Staff Alert channel "new screenshot" review tracker
+  RECRUITMENT_ALERT_C1:          "recruitment_alert_c1",
+  RECRUITMENT_ALERT_C2:          "recruitment_alert_c2",
+  RECRUITMENT_ALERT_CANCEL:      "recruitment_alert_cancel",
 };
 
 const COLOR = {
@@ -6211,6 +6220,12 @@ async function getRecruitmentStandings() {
 
   const byRecruiter = new Map();
   for (const s of submissions) {
+    // A submission only counts toward the leaderboard once staff have
+    // verified the screenshot — see onRecruitmentVerify(). This is also why
+    // a brand-new recruiter doesn't appear on the leaderboard at all until
+    // their first screenshot is verified.
+    if (!s.verified) continue;
+
     const key = s.recruiter_id;
     if (!byRecruiter.has(key)) {
       byRecruiter.set(key, { recruiterId: key, recruiterTag: s.recruiter_tag, recruits: 0, bonuses: 0, firstAt: s.created_at });
@@ -6455,6 +6470,7 @@ async function recordRecruitmentSubmission({ recruiterId, recruiterTag, threadId
     thread_id: threadId,
     screenshot_number: screenshotNumber,
     note,
+    verified: false,
     join_bonus_awarded: false,
     created_at: createdAt,
   });
@@ -6486,13 +6502,18 @@ async function getRecruitmentSubmissionById(submissionId) {
   return recruitmentMemoryStore.submissions.find((s) => String(s.id) === String(submissionId)) || null;
 }
 
-async function markRecruitmentBonusAwarded(submissionId, staffUserId) {
+async function markRecruitmentBonusAwarded(submissionId, staffUserId, staffTag) {
   const supabase = getSupabase();
   const awardedAt = new Date().toISOString();
   if (supabase) {
     const { error } = await supabase
       .from("recruitment_drive_submissions")
-      .update({ join_bonus_awarded: true, join_bonus_awarded_by: staffUserId, join_bonus_awarded_at: awardedAt })
+      .update({
+        join_bonus_awarded: true,
+        join_bonus_awarded_by: staffUserId,
+        join_bonus_awarded_by_tag: staffTag || null,
+        join_bonus_awarded_at: awardedAt,
+      })
       .eq("id", submissionId);
     if (error) console.error("[RecruitmentDrive] Could not mark bonus awarded:", error.message);
     return;
@@ -6501,8 +6522,55 @@ async function markRecruitmentBonusAwarded(submissionId, staffUserId) {
   if (row) {
     row.join_bonus_awarded = true;
     row.join_bonus_awarded_by = staffUserId;
+    row.join_bonus_awarded_by_tag = staffTag || null;
     row.join_bonus_awarded_at = awardedAt;
   }
+}
+
+/**
+ * Marks a submission's screenshot as staff-verified. This is the gate that
+ * actually awards the recruiter's base point (see getRecruitmentStandings) —
+ * posting a screenshot no longer awards a point by itself.
+ */
+async function markRecruitmentSubmissionVerified(submissionId, staffUserId, staffTag) {
+  const supabase = getSupabase();
+  const verifiedAt = new Date().toISOString();
+  if (supabase) {
+    const { error } = await supabase
+      .from("recruitment_drive_submissions")
+      .update({
+        verified: true,
+        verified_by: staffUserId,
+        verified_by_tag: staffTag || null,
+        verified_at: verifiedAt,
+      })
+      .eq("id", submissionId);
+    if (error) console.error("[RecruitmentDrive] Could not mark submission verified:", error.message);
+    return;
+  }
+  const row = recruitmentMemoryStore.submissions.find((s) => String(s.id) === String(submissionId));
+  if (row) {
+    row.verified = true;
+    row.verified_by = staffUserId;
+    row.verified_by_tag = staffTag || null;
+    row.verified_at = verifiedAt;
+  }
+}
+
+/**
+ * Tracks (or clears, when messageId is null) the Staff Alert channel
+ * "please review this screenshot" post for a submission, so it can be
+ * auto-deleted once staff verify the screenshot through any path.
+ */
+async function setRecruitmentSubmissionAlertMessageId(submissionId, messageId) {
+  const supabase = getSupabase();
+  if (supabase) {
+    const { error } = await supabase.from("recruitment_drive_submissions").update({ alert_message_id: messageId }).eq("id", submissionId);
+    if (error) console.warn("[RecruitmentDrive] Could not update alert message id:", error.message);
+    return;
+  }
+  const row = recruitmentMemoryStore.submissions.find((s) => String(s.id) === String(submissionId));
+  if (row) row.alert_message_id = messageId;
 }
 
 /**
@@ -6802,12 +6870,13 @@ async function onRecruitmentConfirmBonus(interaction, submissionId) {
     return interaction.reply({ content: "This bonus has already been confirmed.", flags: MessageFlags.Ephemeral });
   }
 
-  await markRecruitmentBonusAwarded(submissionId, interaction.user.id);
+  const staffTag = interaction.member?.displayName || interaction.user.username;
+  await markRecruitmentBonusAwarded(submissionId, interaction.user.id, staffTag);
 
   const confirmedRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`${ID.RECRUITMENT_CONFIRM_BONUS}:${submissionId}:done`)
-      .setLabel(`Discord Join Bonus Confirmed — ${interaction.member?.displayName || interaction.user.username}`)
+      .setLabel(`Discord Join Bonus Confirmed — ${staffTag}`)
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(true)
   );
@@ -6816,6 +6885,284 @@ async function onRecruitmentConfirmBonus(interaction, submissionId) {
   await refreshRecruitmentLeaderboard();
 
   return interaction.reply({ content: "Confirmed — the Discord join bonus point has been added to the leaderboard.", flags: MessageFlags.Ephemeral });
+}
+
+// ================= New screenshot flow: Verify (1 click) -> Join Bonus (double confirm) =================
+//
+// Posting a screenshot no longer awards a point by itself. Staff must press
+// "Verify Screenshot" first (one click — this is the thing that actually
+// awards the recruiter's base point and puts them on the leaderboard if this
+// is their first verified submission). Only after that does a follow-up
+// button appear asking whether the recruit also joined Discord, which itself
+// requires a double ("1 of 2" / "2 of 2") confirmation before the bonus point
+// is awarded — matching the double-confirmation pattern used elsewhere in
+// this bot (e.g. the Member Left alert).
+//
+// Legacy submissions posted before this feature existed keep using the old
+// single-button onRecruitmentConfirmBonus() handler above — their rows were
+// grandfathered to verified = true by the migration, so nothing breaks for
+// in-flight messages from before this deploy.
+
+/**
+ * Builds the button row(s) for a submission's thread post, driven entirely
+ * by the submission's persisted state (plus an optional transient
+ * `pendingBonusConfirm` override for the "are you sure" step, which isn't
+ * itself persisted until actually confirmed).
+ */
+function buildRecruitmentSubmissionComponents(submission, { pendingBonusConfirm = false } = {}) {
+  if (!submission.verified) {
+    return [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${ID.RECRUITMENT_VERIFY}:${submission.id}`)
+          .setLabel("Verify Screenshot (Staff Only)")
+          .setStyle(ButtonStyle.Success)
+      ),
+    ];
+  }
+
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${ID.RECRUITMENT_VERIFY}:${submission.id}:done`)
+        .setLabel(`Verified — ${submission.verified_by_tag || "Staff"}`)
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(true)
+    ),
+  ];
+
+  if (submission.join_bonus_awarded) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${ID.RECRUITMENT_BONUS_C2}:${submission.id}:done`)
+          .setLabel(`Discord Join Bonus Confirmed — ${submission.join_bonus_awarded_by_tag || "Staff"}`)
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true)
+      )
+    );
+  } else if (pendingBonusConfirm) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${ID.RECRUITMENT_BONUS_C2}:${submission.id}`)
+          .setLabel("Yes, Confirm Discord Join Bonus (2/2)")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`${ID.RECRUITMENT_BONUS_CANCEL}:${submission.id}`)
+          .setLabel("No, Go Back")
+          .setStyle(ButtonStyle.Danger)
+      )
+    );
+  } else {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${ID.RECRUITMENT_BONUS_C1}:${submission.id}`)
+          .setLabel("Did They Join Our Discord? (1/2)")
+          .setStyle(ButtonStyle.Primary)
+      )
+    );
+  }
+
+  return rows;
+}
+
+async function onRecruitmentVerify(interaction, submissionId) {
+  if (!hasAnyRole(interaction.member, RECRUITMENT_STAFF_ROLE_IDS)) {
+    return interaction.reply({
+      content: "Only Staff, Jr. Staff, Leaders, Co-Owners, or the Owner can verify this screenshot.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const submission = await getRecruitmentSubmissionById(submissionId);
+  if (!submission) {
+    return interaction.reply({ content: "Could not find this submission anymore.", flags: MessageFlags.Ephemeral });
+  }
+  if (submission.verified) {
+    return interaction.reply({ content: "This screenshot has already been verified.", flags: MessageFlags.Ephemeral });
+  }
+
+  const staffTag = interaction.member?.displayName || interaction.user.username;
+  await markRecruitmentSubmissionVerified(submissionId, interaction.user.id, staffTag);
+
+  // The screenshot is now verified through the thread directly — clear out
+  // the "please review" tracker alert in the Staff Alert channel if it's
+  // still open, so staff don't double-handle the same submission.
+  if (submission.alert_message_id) {
+    const alertChannel = await getStaffAlertChannel();
+    const alertMsg = alertChannel ? await alertChannel.messages.fetch(submission.alert_message_id).catch(() => null) : null;
+    if (alertMsg?.deletable !== false) {
+      await alertMsg?.delete().catch((e) => console.warn("[RecruitmentDrive] Could not auto-clear review alert:", e.message));
+    }
+    await setRecruitmentSubmissionAlertMessageId(submissionId, null);
+  }
+
+  await refreshRecruitmentLeaderboard();
+
+  const updatedSubmission = { ...submission, verified: true, verified_by_tag: staffTag, join_bonus_awarded: false };
+  await interaction.update({ components: buildRecruitmentSubmissionComponents(updatedSubmission) });
+}
+
+async function onRecruitmentBonusConfirm1(interaction, submissionId) {
+  if (!hasAnyRole(interaction.member, RECRUITMENT_STAFF_ROLE_IDS)) {
+    return interaction.reply({
+      content: "Only Staff, Jr. Staff, Leaders, Co-Owners, or the Owner can confirm this bonus.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const submission = await getRecruitmentSubmissionById(submissionId);
+  if (!submission) {
+    return interaction.reply({ content: "Could not find this submission anymore.", flags: MessageFlags.Ephemeral });
+  }
+  if (!submission.verified) {
+    return interaction.reply({ content: "Verify the screenshot first before confirming the Discord join bonus.", flags: MessageFlags.Ephemeral });
+  }
+  if (submission.join_bonus_awarded) {
+    return interaction.reply({ content: "This bonus has already been confirmed.", flags: MessageFlags.Ephemeral });
+  }
+
+  return interaction.update({ components: buildRecruitmentSubmissionComponents(submission, { pendingBonusConfirm: true }) });
+}
+
+async function onRecruitmentBonusConfirm2(interaction, submissionId) {
+  if (!hasAnyRole(interaction.member, RECRUITMENT_STAFF_ROLE_IDS)) {
+    return interaction.reply({
+      content: "Only Staff, Jr. Staff, Leaders, Co-Owners, or the Owner can confirm this bonus.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const submission = await getRecruitmentSubmissionById(submissionId);
+  if (!submission) {
+    return interaction.reply({ content: "Could not find this submission anymore.", flags: MessageFlags.Ephemeral });
+  }
+  if (submission.join_bonus_awarded) {
+    return interaction.reply({ content: "This bonus has already been confirmed.", flags: MessageFlags.Ephemeral });
+  }
+
+  const staffTag = interaction.member?.displayName || interaction.user.username;
+  await markRecruitmentBonusAwarded(submissionId, interaction.user.id, staffTag);
+  await refreshRecruitmentLeaderboard();
+
+  const updatedSubmission = { ...submission, join_bonus_awarded: true, join_bonus_awarded_by_tag: staffTag };
+  await interaction.update({ components: buildRecruitmentSubmissionComponents(updatedSubmission) });
+}
+
+async function onRecruitmentBonusCancel(interaction, submissionId) {
+  const submission = await getRecruitmentSubmissionById(submissionId);
+  if (!submission) {
+    return interaction.reply({ content: "Could not find this submission anymore.", flags: MessageFlags.Ephemeral });
+  }
+  return interaction.update({ components: buildRecruitmentSubmissionComponents(submission) });
+}
+
+// ================= Staff Alert channel: "new screenshot" review tracker =================
+//
+// A lightweight, parallel notification posted to the Staff Alert channel
+// every time a new screenshot comes in — NOT itself a verification action.
+// Its only job is to make sure staff notice new submissions even if they
+// aren't actively watching the busy Recruitment Drive channel, and to link
+// them straight to the real post so they can click Verify there. If the
+// screenshot gets verified through the thread first, this alert auto-clears
+// itself (see onRecruitmentVerify above).
+
+function buildRecruitmentScreenshotAlertStep1(submission, jumpUrl) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle(`New Recruitment Drive Screenshot — #${submission.screenshot_number}`)
+    .setDescription(
+      `**${submission.recruiter_tag}** submitted a new recruitment screenshot.\n\n` +
+      "This is just a heads-up, not the verification itself — click **Verify Screenshot** on the post below to " +
+      "actually award the point.\n\n" +
+      `**[Jump to the screenshot](${jumpUrl})**`
+    )
+    .addFields(
+      { name: "Recruiter", value: `<@${submission.recruiter_id}>`, inline: true },
+      { name: "Details", value: submission.note || "Unknown" }
+    )
+    .setFooter({ text: "Confirmation 1 of 2 • Auto-deletes after 2nd confirmation (or once verified from the thread)." });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_ALERT_C1}:${submission.id}`)
+      .setLabel("Acknowledge Reviewed (1/2)")
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+function buildRecruitmentScreenshotAlertStep2(submission, jumpUrl, clickedByUserId) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle(`Confirmation 2 of 2 — Screenshot #${submission.screenshot_number}`)
+    .setDescription(
+      `<@${clickedByUserId}> acknowledged reviewing **${submission.recruiter_tag}**'s screenshot.\n\n` +
+      "Confirming will log this and **auto-delete** this alert. This still does not verify the screenshot — " +
+      "that only happens via the Verify button on the post itself.\n\n" +
+      `**[Jump to the screenshot](${jumpUrl})**`
+    )
+    .setFooter({ text: "Confirmation 2 of 2 — Final Check" });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_ALERT_C2}:${submission.id}`)
+      .setLabel("Yes, Confirm Reviewed (2/2)")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_ALERT_CANCEL}:${submission.id}`)
+      .setLabel("No, Go Back")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+async function ensureRecruitmentScreenshotAlert(submission, jumpUrl) {
+  const alertChannel = await getStaffAlertChannel();
+  if (!alertChannel) return null;
+
+  const sent = await alertChannel.send(buildRecruitmentScreenshotAlertStep1(submission, jumpUrl)).catch((e) => {
+    console.error("[RecruitmentDrive] Could not send screenshot review alert:", e.message);
+    return null;
+  });
+  if (!sent) return null;
+
+  await setRecruitmentSubmissionAlertMessageId(submission.id, sent.id);
+  return sent.id;
+}
+
+function recruitmentSubmissionJumpUrl(guildId, threadId, messageId) {
+  return `https://discord.com/channels/${guildId}/${threadId}/${messageId}`;
+}
+
+async function onRecruitmentAlertConfirm1(interaction, submissionId) {
+  const submission = await getRecruitmentSubmissionById(submissionId);
+  if (!submission) {
+    return interaction.reply({ content: "Could not find this submission anymore.", flags: MessageFlags.Ephemeral });
+  }
+  const jumpUrl = recruitmentSubmissionJumpUrl(interaction.guildId, submission.thread_id, submission.message_id);
+  return interaction.update(buildRecruitmentScreenshotAlertStep2(submission, jumpUrl, interaction.user.id));
+}
+
+async function onRecruitmentAlertConfirm2(interaction, submissionId) {
+  await interaction.deferUpdate();
+  await setRecruitmentSubmissionAlertMessageId(submissionId, null);
+  if (interaction.message?.deletable !== false) {
+    await interaction.message?.delete().catch((e) => console.warn("[RecruitmentDrive] Could not delete review alert:", e.message));
+  }
+}
+
+async function onRecruitmentAlertCancel(interaction, submissionId) {
+  const submission = await getRecruitmentSubmissionById(submissionId);
+  if (!submission) {
+    return interaction.reply({ content: "Could not find this submission anymore.", flags: MessageFlags.Ephemeral });
+  }
+  const jumpUrl = recruitmentSubmissionJumpUrl(interaction.guildId, submission.thread_id, submission.message_id);
+  return interaction.update(buildRecruitmentScreenshotAlertStep1(submission, jumpUrl));
 }
 
 async function handleRecruitmentDriveMessage(message) {
@@ -6887,20 +7234,32 @@ async function handleRecruitmentDriveMessage(message) {
     )
     .setImage(`attachment://${fileName}`);
 
-  const bonusRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`${ID.RECRUITMENT_CONFIRM_BONUS}:${submissionId}`)
-      .setLabel("Confirm Discord Join Bonus (Staff Only)")
-      .setStyle(ButtonStyle.Success)
-  );
+  const components = buildRecruitmentSubmissionComponents({ id: submissionId, verified: false, join_bonus_awarded: false });
 
-  const sent = await thread.send({ embeds: [embed], files: [fileAttachment], components: [bonusRow] }).catch((e) => {
+  const sent = await thread.send({ embeds: [embed], files: [fileAttachment], components }).catch((e) => {
     console.error("[RecruitmentDrive] Could not post to thread:", e.message);
     return null;
   });
 
   if (sent) {
     await attachRecruitmentSubmissionMessageId(submissionId, sent.id);
+
+    // Also alert staff in the Staff Alert channel so new submissions get
+    // noticed even by staff who aren't actively watching the (often busy)
+    // Recruitment Drive channel. This is a review tracker only — it does NOT
+    // verify the screenshot itself; that still happens via the Verify button
+    // on the post above, which also auto-clears this alert if it's still open.
+    const jumpUrl = recruitmentSubmissionJumpUrl(message.guildId, thread.id, sent.id);
+    await ensureRecruitmentScreenshotAlert(
+      {
+        id: submissionId,
+        recruiter_id: message.author.id,
+        recruiter_tag: message.author.tag,
+        screenshot_number: screenshotNumber,
+        note,
+      },
+      jumpUrl
+    );
   }
 
   await message.delete().catch(() => {});
@@ -7196,6 +7555,13 @@ async function handleInteraction(interaction) {
       case ID.RECRUITMENT_REMOVE_C1:     return onRecruitmentRemoveConfirm1(interaction, payload);
       case ID.RECRUITMENT_REMOVE_C2:     return onRecruitmentRemoveConfirm2(interaction, payload);
       case ID.RECRUITMENT_REMOVE_CANCEL: return onRecruitmentRemoveCancel(interaction, payload);
+      case ID.RECRUITMENT_VERIFY:        return onRecruitmentVerify(interaction, payload);
+      case ID.RECRUITMENT_BONUS_C1:      return onRecruitmentBonusConfirm1(interaction, payload);
+      case ID.RECRUITMENT_BONUS_C2:      return onRecruitmentBonusConfirm2(interaction, payload);
+      case ID.RECRUITMENT_BONUS_CANCEL:  return onRecruitmentBonusCancel(interaction, payload);
+      case ID.RECRUITMENT_ALERT_C1:      return onRecruitmentAlertConfirm1(interaction, payload);
+      case ID.RECRUITMENT_ALERT_C2:      return onRecruitmentAlertConfirm2(interaction, payload);
+      case ID.RECRUITMENT_ALERT_CANCEL:  return onRecruitmentAlertCancel(interaction, payload);
       default:                      return;
     }
   }
@@ -7714,6 +8080,7 @@ module.exports = {
   getNextRecruitmentScreenshotNumber,
   recordRecruitmentSubmission,
   getRecruitmentSubmissionById,
+  attachRecruitmentSubmissionMessageId,
   markRecruitmentBonusAwarded,
   ensureRecruitmentDriveMessages,
   refreshRecruitmentLeaderboard,
@@ -7735,6 +8102,20 @@ module.exports = {
   onRecruitmentRemoveConfirm2,
   onRecruitmentRemoveCancel,
   registerRemoveRecruiterCommand,
+  markRecruitmentSubmissionVerified,
+  setRecruitmentSubmissionAlertMessageId,
+  buildRecruitmentSubmissionComponents,
+  onRecruitmentVerify,
+  onRecruitmentBonusConfirm1,
+  onRecruitmentBonusConfirm2,
+  onRecruitmentBonusCancel,
+  buildRecruitmentScreenshotAlertStep1,
+  buildRecruitmentScreenshotAlertStep2,
+  ensureRecruitmentScreenshotAlert,
+  recruitmentSubmissionJumpUrl,
+  onRecruitmentAlertConfirm1,
+  onRecruitmentAlertConfirm2,
+  onRecruitmentAlertCancel,
   // Twitch Live Alert exports
   fetchTwitchLiveStatus,
   buildTwitchLiveAlert,

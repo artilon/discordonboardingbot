@@ -111,21 +111,39 @@ check(
     note: "PlayerThree - no",
   });
 
+  // Posting a screenshot no longer awards a point by itself — it only counts
+  // toward the leaderboard once staff verify it (see onRecruitmentVerify).
   let standingsNow = await bot.getRecruitmentStandings();
+  check("an unverified submission does NOT put a new recruiter on the leaderboard yet", !standingsNow.some((s) => s.recruiterId === "user-A"));
+  check("a second unverified recruiter also doesn't appear yet", !standingsNow.some((s) => s.recruiterId === "user-B"));
+
+  const freshSubmission = await bot.getRecruitmentSubmissionById(id1);
+  check("a freshly recorded submission starts out unverified", freshSubmission.verified === false);
+
+  await bot.markRecruitmentSubmissionVerified(id1, "staff-1", "Staff#0001");
+  await bot.markRecruitmentSubmissionVerified(id2, "staff-1", "Staff#0001");
+  await bot.markRecruitmentSubmissionVerified(id3, "staff-1", "Staff#0001");
+
+  const verifiedSubmission = await bot.getRecruitmentSubmissionById(id1);
+  check("verifying flips the verified flag", verifiedSubmission.verified === true);
+  check("verifying records who verified it", verifiedSubmission.verified_by === "staff-1" && verifiedSubmission.verified_by_tag === "Staff#0001");
+
+  standingsNow = await bot.getRecruitmentStandings();
   const a = standingsNow.find((s) => s.recruiterId === "user-A");
   const b = standingsNow.find((s) => s.recruiterId === "user-B");
-  check("user-A has 2 recruits before any bonus", a.recruits === 2 && a.points === 2);
-  check("user-B has 1 recruit before any bonus", b.recruits === 1 && b.points === 1);
+  check("user-A has 2 recruits once both of their submissions are verified", a.recruits === 2 && a.points === 2);
+  check("user-B has 1 recruit once verified", b.recruits === 1 && b.points === 1);
   check("user-A outranks user-B", standingsNow[0].recruiterId === "user-A");
 
   const fetchedSubmission = await bot.getRecruitmentSubmissionById(id2);
   check("getRecruitmentSubmissionById finds the right row", fetchedSubmission && fetchedSubmission.note === "PlayerTwo - yes");
   check("bonus not yet awarded", fetchedSubmission.join_bonus_awarded === false);
 
-  await bot.markRecruitmentBonusAwarded(id2, "staff-1");
+  await bot.markRecruitmentBonusAwarded(id2, "staff-1", "Staff#0001");
   const afterBonus = await bot.getRecruitmentSubmissionById(id2);
   check("bonus flag flips to true", afterBonus.join_bonus_awarded === true);
   check("bonus records who awarded it", afterBonus.join_bonus_awarded_by === "staff-1");
+  check("bonus records the staff tag too", afterBonus.join_bonus_awarded_by_tag === "Staff#0001");
 
   standingsNow = await bot.getRecruitmentStandings();
   const aAfterBonus = standingsNow.find((s) => s.recruiterId === "user-A");
