@@ -459,6 +459,9 @@ const ID = {
   // Recruitment Drive Event custom IDs
   RECRUITMENT_UPLOAD_BTN:    "recruitment_upload_btn",
   RECRUITMENT_CONFIRM_BONUS: "recruitment_confirm_bonus",
+  RECRUITMENT_INFO_MODAL:        "recruitment_info_modal",
+  RECRUITMENT_NAME_INPUT:        "recruitment_name_input",
+  RECRUITMENT_JOINED_DISCORD_INPUT: "recruitment_joined_discord_input",
 };
 
 const COLOR = {
@@ -5917,12 +5920,14 @@ async function onUploadRosterSlashCommand(interaction) {
 // embed beneath it, and a bot-created thread per recruiting member holding
 // their numbered screenshot evidence.
 //
-// Discord buttons cannot open a native file-upload dialog, so the button
-// just opens a 10-minute submission window: the member posts their
-// screenshot (plus a short note) as a normal message in the channel, and the
-// bot grabs it, files it into their thread, deletes the original message,
-// and refreshes the leaderboard.
-const pendingRecruitmentUploads = new Map(); // userId -> { expiresAt }
+// Discord buttons cannot open a native file-upload dialog, so clicking
+// "Upload Screenshot" first opens a small 2-question modal (recruited
+// player's name, whether they've joined Discord yet), then opens a
+// 10-minute submission window: the member posts the screenshot as a plain
+// message in the channel (no caption needed — the modal already collected
+// that), and the bot grabs it, files it into their thread, deletes the
+// original message, and refreshes the leaderboard.
+const pendingRecruitmentUploads = new Map(); // userId -> { expiresAt, playerName, joinedDiscord }
 // In-memory fallback only used if Supabase isn't configured — nothing here
 // survives a restart in that case.
 const recruitmentMemoryStore = { threads: new Map(), submissions: [], nextId: 1 };
@@ -6414,6 +6419,36 @@ async function markRecruitmentBonusAwarded(submissionId, staffUserId) {
   }
 }
 
+function buildRecruitmentInfoModal() {
+  const modal = new ModalBuilder()
+    .setCustomId(ID.RECRUITMENT_INFO_MODAL)
+    .setTitle("Recruitment Drive Submission");
+
+  const nameInput = new TextInputBuilder()
+    .setCustomId(ID.RECRUITMENT_NAME_INPUT)
+    .setLabel("Name of the player you recruited")
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(1)
+    .setMaxLength(100)
+    .setRequired(true)
+    .setPlaceholder("PlayerName123");
+
+  const joinedDiscordInput = new TextInputBuilder()
+    .setCustomId(ID.RECRUITMENT_JOINED_DISCORD_INPUT)
+    .setLabel("Have they joined our Discord yet?")
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(1)
+    .setMaxLength(50)
+    .setRequired(true)
+    .setPlaceholder("yes or no");
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(nameInput),
+    new ActionRowBuilder().addComponents(joinedDiscordInput)
+  );
+  return modal;
+}
+
 async function onRecruitmentUploadButton(interaction) {
   const phase = getRecruitmentDrivePhase();
   if (phase === "scheduled") {
@@ -6427,15 +6462,30 @@ async function onRecruitmentUploadButton(interaction) {
     return interaction.reply({ content: "This event has ended. Thanks for taking part!", flags: MessageFlags.Ephemeral });
   }
 
-  pendingRecruitmentUploads.set(interaction.user.id, { expiresAt: Date.now() + RECRUITMENT_UPLOAD_WINDOW_MS });
+  return interaction.showModal(buildRecruitmentInfoModal());
+}
+
+async function onRecruitmentInfoModalSubmit(interaction) {
+  const phase = getRecruitmentDrivePhase();
+  if (phase !== "active") {
+    return interaction.reply({
+      content: phase === "scheduled" ? "This event hasn't started yet." : "This event has ended. Thanks for taking part!",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const playerName = interaction.fields.getTextInputValue(ID.RECRUITMENT_NAME_INPUT).trim();
+  const joinedDiscord = interaction.fields.getTextInputValue(ID.RECRUITMENT_JOINED_DISCORD_INPUT).trim();
+
+  pendingRecruitmentUploads.set(interaction.user.id, {
+    expiresAt: Date.now() + RECRUITMENT_UPLOAD_WINDOW_MS,
+    playerName,
+    joinedDiscord,
+  });
 
   return interaction.reply({
     content:
-      `Post your screenshot as a message right here in <#${RECRUITMENT_DRIVE_CHANNEL_ID}> within the next 10 minutes.\n\n` +
-      "In the **same message as the screenshot**, include:\n" +
-      "1. The name of the player you recruited\n" +
-      "2. Whether they've joined our Discord yet (yes/no)\n\n" +
-      "Example: `PlayerName123 - no, not on Discord yet`\n\n" +
+      `Got it! Now post your screenshot as a message right here in <#${RECRUITMENT_DRIVE_CHANNEL_ID}> within the next 10 minutes — just the image, no caption needed.\n\n` +
       "Heimdall will move it into your own thread in this channel and delete the original message automatically.",
     flags: MessageFlags.Ephemeral,
   });
@@ -6493,17 +6543,10 @@ async function handleRecruitmentDriveMessage(message) {
     return;
   }
 
-  const note = (message.content || "").trim();
-  if (!note) {
-    await message.delete().catch(() => {});
-    const temp = await message.channel
-      .send({
-        content: `<@${message.author.id}> Please include the recruited player's name and whether they've joined our Discord (yes/no) in the same message as your screenshot, then try again.`,
-      })
-      .catch(() => null);
-    if (temp) setTimeout(() => temp.delete().catch(() => {}), 15000);
-    return; // session stays open so they can retry within the window
-  }
+  // The player's name and Discord-join status were already collected by the
+  // "Upload Screenshot" modal (see onRecruitmentInfoModalSubmit) — no caption
+  // text is required in this message anymore, just the screenshot itself.
+  const note = `**Recruited:** ${session.playerName}\n**Joined Discord:** ${session.joinedDiscord}`;
 
   pendingRecruitmentUploads.delete(message.author.id);
 
@@ -6868,6 +6911,7 @@ async function handleInteraction(interaction) {
     if (interaction.customId === ID.MODAL) return onModalSubmit(interaction);
     if (interaction.customId === ID.ROSTER_MODAL) return onRosterModalSubmit(interaction);
     if (interaction.customId === ID.TICKET_DENY_MODAL) return onTicketDenyModalSubmit(interaction);
+    if (interaction.customId === ID.RECRUITMENT_INFO_MODAL) return onRecruitmentInfoModalSubmit(interaction);
     if (modalBase === ID.TICKET_COMPLIMENT_MODAL_GENERAL) return onTicketComplimentModalGeneral(interaction);
     if (modalBase === ID.TICKET_COMPLIMENT_MODAL_MEMBER) return onTicketComplimentModalMember(interaction, modalPayload);
   }
@@ -7365,8 +7409,11 @@ module.exports = {
   refreshRecruitmentLeaderboard,
   postRecruitmentDriveFinalResults,
   onRecruitmentUploadButton,
+  onRecruitmentInfoModalSubmit,
+  buildRecruitmentInfoModal,
   onRecruitmentConfirmBonus,
   handleRecruitmentDriveMessage,
+  pendingRecruitmentUploads,
   // Twitch Live Alert exports
   fetchTwitchLiveStatus,
   buildTwitchLiveAlert,
