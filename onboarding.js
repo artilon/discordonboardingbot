@@ -68,6 +68,14 @@ const SUPABASE_KEY =
   process.env.SUPABASE_KEY ||
   process.env.SUPABASE_ANON_KEY;
 
+// Twitch "went live" alert — all three must be set for it to activate.
+// TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET come from a free app registered at
+// https://dev.twitch.tv/console/apps (Client Type: Confidential). TWITCH_USERNAME
+// is just the channel name from twitch.tv/<name>, not a display name or URL.
+const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
+const TWITCH_USERNAME = process.env.TWITCH_USERNAME;
+
 const UNVERIFIED_ROLE_ID    = "1547278787815804928";
 const CLAN_MEMBER_ROLE_ID   = "1546403975656505354";
 const OSRS_ROLE_ID          = "1546412132822810744";
@@ -387,6 +395,16 @@ const config = {
   growthChartRange: "all",            // "30d" | "6m" | "all"
   supabase: null,                     // Initialized on startup or injected for tests
   hiscoreFetcher: null,               // Optional override for testing OSRS HiScores fetches
+  twitchPollIntervalMs: 90 * 1000,    // Check Twitch for a live-status change every 90 seconds
+  twitchStreamFetcher: null,          // Optional override for testing Twitch API fetches
+  // Remembers whether the last poll saw the channel live, and which stream's
+  // `id` we already alerted for — lets a continuous live session only ever
+  // trigger one alert, while a new session later the same day still gets
+  // its own. Deliberately in-memory only (not persisted to Supabase): if the
+  // bot restarts mid-stream, the next poll treats that same stream as new
+  // and may post one extra alert for it — an acceptable tradeoff for a
+  // single-channel feature that otherwise needs no new database table.
+  twitchLiveState: { wasLive: false, lastAlertedStreamId: null },
 };
 
 // Component custom IDs
@@ -6855,6 +6873,182 @@ async function handleInteraction(interaction) {
   }
 }
 
+// ================= TWITCH LIVE ALERT =================
+// Posts a no-ping "now live" announcement to the same channel as the Weekly
+// Recap and Rank-Up congrats messages whenever the configured Twitch channel
+// goes live. Polling-based (no public webhook endpoint required) — checks
+// every `config.twitchPollIntervalMs` (default 90s) via Twitch's Helix API.
+const TWITCH_COLOR = 0x9146ff; // Twitch brand purple
+
+let twitchAppAccessToken = null;
+let twitchAppAccessTokenExpiresAt = 0; // ms epoch
+
+/** Fetches (and caches) an app access token for Twitch's Helix API. */
+async function getTwitchAppAccessToken() {
+  if (twitchAppAccessToken && Date.now() < twitchAppAccessTokenExpiresAt - 60_000) {
+    return twitchAppAccessToken;
+  }
+  const res = await fetch("https://id.twitch.tv/oauth2/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: TWITCH_CLIENT_ID,
+      client_secret: TWITCH_CLIENT_SECRET,
+      grant_type: "client_credentials",
+    }),
+  });
+  if (!res.ok) throw new Error(`Twitch token request failed: ${res.status}`);
+  const data = await res.json();
+  twitchAppAccessToken = data.access_token;
+  twitchAppAccessTokenExpiresAt = Date.now() + (Number(data.expires_in) || 0) * 1000;
+  return twitchAppAccessToken;
+}
+
+/**
+ * Returns `{ live: false }` or `{ live: true, id, title, gameName, userName,
+ * startedAt, thumbnailUrl }` for the given Twitch username, or `null` if the
+ * request couldn't be made at all (not configured, or an actual error).
+ * `config.twitchStreamFetcher`, when set, replaces this entirely — same
+ * test-injection pattern as `config.hiscoreFetcher` for OSRS HiScores.
+ */
+async function fetchTwitchLiveStatus(username) {
+  if (typeof config.twitchStreamFetcher === "function") {
+    return config.twitchStreamFetcher(username);
+  }
+  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET || !username) return null;
+  const token = await getTwitchAppAccessToken();
+  const res = await fetch(`https://api.twitch.tv/helix/streams?user_login=${encodeURIComponent(username)}`, {
+    headers: {
+      "Client-Id": TWITCH_CLIENT_ID,
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) throw new Error(`Twitch streams request failed: ${res.status}`);
+  const data = await res.json();
+  const stream = data?.data?.[0];
+  if (!stream || stream.type !== "live") return { live: false };
+  return {
+    live: true,
+    id: stream.id,
+    title: stream.title || "",
+    gameName: stream.game_name || "",
+    userName: stream.user_name || username,
+    startedAt: stream.started_at || null,
+    thumbnailUrl: stream.thumbnail_url || "",
+  };
+}
+
+function buildTwitchLiveAlert(stream, username) {
+  const displayName = stream.userName || username;
+  const url = `https://twitch.tv/${username}`;
+  const embed = new EmbedBuilder()
+    .setColor(TWITCH_COLOR)
+    .setDescription(
+      `🔴 **${displayName}** is now live on Twitch!\n` +
+      `**${stream.title || "No title set"}**\n` +
+      url
+    );
+  if (stream.gameName) {
+    embed.addFields({ name: "Playing", value: stream.gameName, inline: true });
+  }
+  if (stream.thumbnailUrl) {
+    // The thumbnail URL is a template with literal {width}/{height} placeholders;
+    // a cache-busting query param keeps Discord from reusing a stale preview
+    // image from a previous stream.
+    const thumb = stream.thumbnailUrl.replace("{width}", "640").replace("{height}", "360");
+    embed.setImage(`${thumb}?t=${Date.now()}`);
+  }
+  return { embeds: [embed], allowedMentions: { parse: [] } };
+}
+
+async function postTwitchLiveAlert(stream, username) {
+  const channel = await getClanAnnouncementsChannel();
+  if (!channel) return;
+  await channel
+    .send(buildTwitchLiveAlert(stream, username))
+    .catch((e) => console.warn("[TwitchAlert] Failed to post live alert:", e.message));
+}
+
+/**
+ * Pure decision logic, kept separate from the network/posting side effects
+ * so it's directly unit-testable: given the previously remembered state and
+ * a fresh status fetch, decides whether this is a genuinely new "went live"
+ * event (as opposed to the same continuous session still being live) and
+ * what state to remember for the next poll.
+ */
+function decideTwitchAlert(prevState, status) {
+  if (!status || !status.live) {
+    return { shouldAlert: false, nextState: { wasLive: false, lastAlertedStreamId: prevState.lastAlertedStreamId } };
+  }
+  const isNewSession = !prevState.wasLive || status.id !== prevState.lastAlertedStreamId;
+  return {
+    shouldAlert: isNewSession,
+    nextState: { wasLive: true, lastAlertedStreamId: status.id },
+  };
+}
+
+let twitchPollInFlight = false;
+
+// `config.twitchStreamFetcher` (test-only) is a complete stand-in for the
+// real Twitch calls, so it bypasses the "are real credentials set" guard
+// below — otherwise this function could never be exercised in a test
+// environment that (correctly) has no real Twitch credentials configured.
+function isTwitchConfigured() {
+  return typeof config.twitchStreamFetcher === "function" || !!(TWITCH_USERNAME && TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET);
+}
+
+async function checkTwitchLiveStatus() {
+  if (twitchPollInFlight) return;
+  if (!isTwitchConfigured()) return;
+  twitchPollInFlight = true;
+  try {
+    const status = await fetchTwitchLiveStatus(TWITCH_USERNAME);
+    const { shouldAlert, nextState } = decideTwitchAlert(config.twitchLiveState, status);
+    config.twitchLiveState = nextState;
+    if (shouldAlert) {
+      await postTwitchLiveAlert(status, TWITCH_USERNAME);
+    }
+  } catch (err) {
+    console.error("[TwitchAlert] Could not check live status:", err.message);
+  } finally {
+    twitchPollInFlight = false;
+  }
+}
+
+/**
+ * Runs once at startup to silently record whether the channel happens to
+ * already be live (e.g. the bot just restarted mid-stream), WITHOUT posting
+ * an alert for that in-progress stream — only a stream that goes live while
+ * the bot is continuously running should ever trigger a post.
+ */
+async function primeTwitchLiveState() {
+  if (!isTwitchConfigured()) return;
+  try {
+    const status = await fetchTwitchLiveStatus(TWITCH_USERNAME);
+    if (status?.live) {
+      config.twitchLiveState = { wasLive: true, lastAlertedStreamId: status.id };
+      console.log(`[TwitchAlert] ${TWITCH_USERNAME} is already live at startup — won't alert for this in-progress stream, only the next one.`);
+    }
+  } catch (err) {
+    console.error("[TwitchAlert] Could not check initial live status:", err.message);
+  }
+}
+
+let twitchPollTimer = null;
+
+function startTwitchLiveLoop() {
+  if (!isTwitchConfigured()) {
+    console.warn("[TwitchAlert] TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET / TWITCH_USERNAME not fully set — live alerts disabled until configured.");
+    return;
+  }
+  if (twitchPollTimer) clearInterval(twitchPollTimer);
+  console.log(`[TwitchAlert] Polling Twitch for ${TWITCH_USERNAME}'s live status every ${config.twitchPollIntervalMs / 1000}s.`);
+  twitchPollTimer = setInterval(() => {
+    checkTwitchLiveStatus().catch((e) => console.error("[TwitchAlert] Poll error:", e.message));
+  }, config.twitchPollIntervalMs);
+  if (typeof twitchPollTimer.unref === "function") twitchPollTimer.unref();
+}
+
 // ================= WIRING =================
 client.once(Events.ClientReady, async () => {
   console.log(`[Heimdall] Logged in as ${client.user.tag}`);
@@ -6924,6 +7118,12 @@ client.once(Events.ClientReady, async () => {
     startServerPrivacyLoop();
   } catch (err) {
     console.error("[ServerPrivacy] Initial sync failed:", err.message);
+  }
+  try {
+    await primeTwitchLiveState();
+    startTwitchLiveLoop();
+  } catch (err) {
+    console.error("[TwitchAlert] Initial setup failed:", err.message);
   }
 });
 
@@ -7167,6 +7367,15 @@ module.exports = {
   onRecruitmentUploadButton,
   onRecruitmentConfirmBonus,
   handleRecruitmentDriveMessage,
+  // Twitch Live Alert exports
+  fetchTwitchLiveStatus,
+  buildTwitchLiveAlert,
+  postTwitchLiveAlert,
+  decideTwitchAlert,
+  checkTwitchLiveStatus,
+  primeTwitchLiveState,
+  startTwitchLiveLoop,
+  isTwitchConfigured,
   // Server Privacy exports
   CLAN_FRIEND_ROLE_ID,
   SOCIAL_CHATTER_ROLE_ID,
