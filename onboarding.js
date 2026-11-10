@@ -465,6 +465,9 @@ const ID = {
   RECRUITMENT_INFO_MODAL:        "recruitment_info_modal",
   RECRUITMENT_NAME_INPUT:        "recruitment_name_input",
   RECRUITMENT_JOINED_DISCORD_INPUT: "recruitment_joined_discord_input",
+  RECRUITMENT_REMOVE_C1:         "recruitment_remove_c1",
+  RECRUITMENT_REMOVE_C2:         "recruitment_remove_c2",
+  RECRUITMENT_REMOVE_CANCEL:     "recruitment_remove_cancel",
 };
 
 const COLOR = {
@@ -6003,6 +6006,22 @@ let recruitmentLeaderboardMessageId = null;
 let recruitmentDriveTimer = null;
 let lastRecruitmentPhase = null;
 
+// Same role gate as roster uploads — Owner, Co-Owner & Leaders only. Used to
+// restrict the staff-only /remove-recruiter command.
+function canManageRecruitmentDrive(member) {
+  return hasAnyRole(member, ROSTER_UPLOAD_ROLE_IDS);
+}
+
+function recruitmentManageDeniedEmbed() {
+  return new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle("This command isn't available to you")
+    .setDescription(
+      "Managing the Recruitment Drive leaderboard is restricted to **Leaders**, **Co-Owners**, and the **Owner**.\n\n" +
+      "If you think that's a mistake, please reach out to an Owner."
+    );
+}
+
 function getRecruitmentDrivePhase(now = Date.now()) {
   if (now < RECRUITMENT_DRIVE_START_MS) return "scheduled";
   if (now < RECRUITMENT_DRIVE_END_MS) return "active";
@@ -6486,6 +6505,215 @@ async function markRecruitmentBonusAwarded(submissionId, staffUserId) {
   }
 }
 
+/**
+ * Permanently wipes a recruiter's entire Recruitment Drive history: every
+ * submission (so their points drop off the leaderboard entirely), their
+ * thread-mapping row, and the Discord thread itself (with all its
+ * screenshots). Intended for people who leave the clan mid-event, or for
+ * clearing out test data — not a reversible "disqualify" flag.
+ */
+async function removeRecruiterFromDrive(recruiterId) {
+  const supabase = getSupabase();
+  let threadId = null;
+
+  if (supabase) {
+    const { data: threadRow } = await supabase
+      .from("recruitment_drive_threads")
+      .select("thread_id")
+      .eq("recruiter_id", recruiterId)
+      .maybeSingle();
+    threadId = threadRow?.thread_id || null;
+
+    const { error: subErr } = await supabase.from("recruitment_drive_submissions").delete().eq("recruiter_id", recruiterId);
+    if (subErr) console.error("[RecruitmentDrive] Could not delete submissions for removal:", subErr.message);
+
+    const { error: threadErr } = await supabase.from("recruitment_drive_threads").delete().eq("recruiter_id", recruiterId);
+    if (threadErr) console.error("[RecruitmentDrive] Could not delete thread mapping for removal:", threadErr.message);
+  } else {
+    threadId = recruitmentMemoryStore.threads.get(recruiterId) || null;
+    recruitmentMemoryStore.submissions = recruitmentMemoryStore.submissions.filter((s) => s.recruiter_id !== recruiterId);
+    recruitmentMemoryStore.threads.delete(recruiterId);
+  }
+
+  let threadDeleted = false;
+  if (threadId) {
+    const channel = await getChannelById(RECRUITMENT_DRIVE_CHANNEL_ID, "RecruitmentDrive");
+    const thread = channel ? await channel.threads.fetch(threadId).catch(() => null) : null;
+    if (thread) {
+      await thread.delete("Recruiter removed from the Recruitment Drive leaderboard").catch((e) => {
+        console.warn("[RecruitmentDrive] Could not delete recruiter's thread:", e.message);
+      });
+      threadDeleted = true;
+    }
+  }
+
+  await refreshRecruitmentLeaderboard();
+  return { threadDeleted };
+}
+
+function buildRecruitmentRemoveStep1Embed(target, stats) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.bad)
+    .setTitle(`Remove From Recruitment Drive Leaderboard — ${target.tag}`)
+    .setDescription(
+      `This will **permanently delete** all of **${target.tag}**'s Recruitment Drive submissions, their recruiting ` +
+      "thread (and every screenshot in it), and reset their leaderboard total to zero.\n\n" +
+      "**This cannot be undone.** Please verify and complete the double confirmation below."
+    )
+    .addFields(
+      { name: "Recruiter", value: `<@${target.id}>`, inline: true },
+      { name: "Recruits", value: `\`${stats.recruits}\``, inline: true },
+      { name: "Discord Join Bonuses", value: `\`${stats.bonuses}\``, inline: true },
+      { name: "Total Points", value: `\`${stats.points}\``, inline: true }
+    )
+    .setFooter({ text: "Confirmation 1 of 2 • This is irreversible." });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_REMOVE_C1}:${target.id}`)
+      .setLabel("Acknowledge Removal (1/2)")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+function buildRecruitmentRemoveStep2Embed(target, stats, clickedByUserId) {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle(`Confirmation 2 of 2 — Remove ${target.tag}`)
+    .setDescription(
+      `<@${clickedByUserId}> acknowledged removing **${target.tag}** from the Recruitment Drive leaderboard.\n\n` +
+      `Are you **sure**? This will permanently delete \`${stats.recruits}\` submission(s), their thread, and reset ` +
+      "their points to zero.\n\nConfirming cannot be undone."
+    )
+    .addFields(
+      { name: "Recruiter", value: `<@${target.id}>`, inline: true },
+      { name: "Recruits", value: `\`${stats.recruits}\``, inline: true },
+      { name: "Total Points", value: `\`${stats.points}\``, inline: true }
+    )
+    .setFooter({ text: "Confirmation 2 of 2 — Final Check" });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_REMOVE_C2}:${target.id}`)
+      .setLabel("Yes, Delete Permanently (2/2)")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`${ID.RECRUITMENT_REMOVE_CANCEL}:${target.id}`)
+      .setLabel("No, Go Back")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+async function getRecruitmentStatsFor(recruiterId) {
+  const standings = await getRecruitmentStandings();
+  return (
+    standings.find((s) => String(s.recruiterId) === String(recruiterId)) || {
+      recruiterId,
+      recruits: 0,
+      bonuses: 0,
+      points: 0,
+    }
+  );
+}
+
+async function onRemoveRecruiterSlashCommand(interaction) {
+  if (!canManageRecruitmentDrive(interaction.member)) {
+    return interaction.reply({ embeds: [recruitmentManageDeniedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+
+  const target = interaction.options.getUser("recruiter", true);
+  const stats = await getRecruitmentStatsFor(target.id);
+
+  if (!stats.recruits) {
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.warn)
+          .setTitle("Nothing To Remove")
+          .setDescription(`**${target.tag}** has no Recruitment Drive submissions on the leaderboard.`),
+      ],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  return interaction.reply({
+    ...buildRecruitmentRemoveStep1Embed(target, stats),
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function onRecruitmentRemoveConfirm1(interaction, recruiterId) {
+  if (!canManageRecruitmentDrive(interaction.member)) {
+    return interaction.reply({ embeds: [recruitmentManageDeniedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+  const target = await client.users.fetch(recruiterId).catch(() => null);
+  const tag = target?.tag || `<@${recruiterId}>`;
+  const stats = await getRecruitmentStatsFor(recruiterId);
+  return interaction.update(buildRecruitmentRemoveStep2Embed({ id: recruiterId, tag }, stats, interaction.user.id));
+}
+
+async function onRecruitmentRemoveConfirm2(interaction, recruiterId) {
+  if (!canManageRecruitmentDrive(interaction.member)) {
+    return interaction.reply({ embeds: [recruitmentManageDeniedEmbed()], flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferUpdate();
+
+  const target = await client.users.fetch(recruiterId).catch(() => null);
+  const tag = target?.tag || `<@${recruiterId}>`;
+  const statsBefore = await getRecruitmentStatsFor(recruiterId);
+
+  const { threadDeleted } = await removeRecruiterFromDrive(recruiterId);
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.ok)
+    .setTitle("Removed From Recruitment Drive Leaderboard")
+    .setDescription(
+      `**${tag}** has been permanently removed from the Recruitment Drive leaderboard.\n\n` +
+      `• \`${statsBefore.recruits}\` submission(s) deleted\n` +
+      `• Thread ${threadDeleted ? "deleted" : "not found (already gone)"}\n` +
+      "• Leaderboard refreshed"
+    );
+
+  return interaction.editReply({ embeds: [embed], components: [] });
+}
+
+async function onRecruitmentRemoveCancel(interaction, recruiterId) {
+  const target = await client.users.fetch(recruiterId).catch(() => null);
+  const tag = target?.tag || `<@${recruiterId}>`;
+  const stats = await getRecruitmentStatsFor(recruiterId);
+  return interaction.update(buildRecruitmentRemoveStep1Embed({ id: recruiterId, tag }, stats));
+}
+
+async function registerRemoveRecruiterCommand() {
+  if (!client.application) return;
+  const commandDef = {
+    name: "remove-recruiter",
+    description: "Permanently remove someone from the Recruitment Drive leaderboard (Owner, Co-Owners & Leaders only)",
+    // Hidden from everyone by default; server admins can grant it to specific
+    // roles under Server Settings -> Integrations -> this bot -> commands.
+    // The role check inside the handler is the real, authoritative gate.
+    defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
+    options: [
+      {
+        name: "recruiter",
+        description: "The clan member whose Recruitment Drive submissions should be wiped",
+        type: ApplicationCommandOptionType.User,
+        required: true,
+      },
+    ],
+  };
+
+  for (const guild of client.guilds.cache.values()) {
+    await guild.commands.create(commandDef).catch((e) => {
+      console.warn(`[RecruitmentDrive] Could not register /remove-recruiter in guild ${guild.id}:`, e.message);
+    });
+  }
+}
+
 function buildRecruitmentInfoModal() {
   const modal = new ModalBuilder()
     .setCustomId(ID.RECRUITMENT_INFO_MODAL)
@@ -6920,6 +7148,10 @@ async function handleInteraction(interaction) {
     return onUploadRosterSlashCommand(interaction);
   }
 
+  if (interaction.isChatInputCommand?.() && interaction.commandName === "remove-recruiter") {
+    return onRemoveRecruiterSlashCommand(interaction);
+  }
+
   if (interaction.isButton()) {
     const [base, payload, extra] = interaction.customId.split(":");
     switch (base) {
@@ -6961,6 +7193,9 @@ async function handleInteraction(interaction) {
       case ID.TICKET_COMPLIMENT_USER_CANCEL:   return onTicketComplimentUserCancel(interaction);
       case ID.RECRUITMENT_UPLOAD_BTN:    return onRecruitmentUploadButton(interaction);
       case ID.RECRUITMENT_CONFIRM_BONUS: return onRecruitmentConfirmBonus(interaction, payload);
+      case ID.RECRUITMENT_REMOVE_C1:     return onRecruitmentRemoveConfirm1(interaction, payload);
+      case ID.RECRUITMENT_REMOVE_C2:     return onRecruitmentRemoveConfirm2(interaction, payload);
+      case ID.RECRUITMENT_REMOVE_CANCEL: return onRecruitmentRemoveCancel(interaction, payload);
       default:                      return;
     }
   }
@@ -7169,6 +7404,11 @@ client.once(Events.ClientReady, async () => {
     await registerUploadRosterCommand();
   } catch (err) {
     console.error("[RosterUpload] registerUploadRosterCommand failed:", err.message);
+  }
+  try {
+    await registerRemoveRecruiterCommand();
+  } catch (err) {
+    console.error("[RecruitmentDrive] registerRemoveRecruiterCommand failed:", err.message);
   }
   try {
     await ensurePermanentMessage();
@@ -7484,6 +7724,17 @@ module.exports = {
   onRecruitmentConfirmBonus,
   handleRecruitmentDriveMessage,
   pendingRecruitmentUploads,
+  recruitmentMemoryStore,
+  canManageRecruitmentDrive,
+  removeRecruiterFromDrive,
+  buildRecruitmentRemoveStep1Embed,
+  buildRecruitmentRemoveStep2Embed,
+  getRecruitmentStatsFor,
+  onRemoveRecruiterSlashCommand,
+  onRecruitmentRemoveConfirm1,
+  onRecruitmentRemoveConfirm2,
+  onRecruitmentRemoveCancel,
+  registerRemoveRecruiterCommand,
   // Twitch Live Alert exports
   fetchTwitchLiveStatus,
   buildTwitchLiveAlert,
