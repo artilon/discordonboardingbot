@@ -1,0 +1,94 @@
+/*
+ * MessageAvatarStatus — indicator styling
+ *
+ * Colours mirror Discord's own member list dots and can be overridden from
+ * your theme / QuickCSS, e.g.
+ *
+ *   :root { --vc-mas-ring-color: var(--background-secondary); }
+ */
+
+/* The wrapper of a decorated avatar: the dot is positioned against it. */
+[data-vc-mas-host] {
+    position: relative;
+}
+
+.vc-mas-dot {
+    --vc-mas-dot-size: 12px;
+    --vc-mas-ring-width: 3px;
+    --vc-mas-offset: -2px;
+    --vc-mas-ring-color: var(--background-primary, #313338);
+
+    position: absolute;
+    z-index: 1;
+    display: block;
+    box-sizing: border-box;
+    width: var(--vc-mas-dot-size);
+    height: var(--vc-mas-dot-size);
+    border-radius: 50%;
+    background-color: var(--vc-mas-offline, #80848e);
+    box-shadow: 0 0 0 var(--vc-mas-ring-width) var(--vc-mas-ring-color);
+    pointer-events: none;
+    transition: background-color 120ms ease;
+}
+
+/* --- status colours (same palette as the member list) ------------------- */
+
+.vc-mas-dot[data-status="online"] { background-color: var(--vc-mas-online, #23a55a); }
+.vc-mas-dot[data-status="idle"] { background-color: var(--vc-mas-idle, #f0b232); }
+.vc-mas-dot[data-status="dnd"] { background-color: var(--vc-mas-dnd, #f23f43); }
+.vc-mas-dot[data-status="offline"] { background-color: var(--vc-mas-offline, #80848e); }
+.vc-mas-dot[data-status="streaming"] { background-color: var(--vc-mas-streaming, #593695); }
+
+/* Idle: crescent "moon" bite, so it is not just a yellow blob. */
+.vc-mas-dot[data-status="idle"]::after {
+    content: "";
+    position: absolute;
+    top: -6%;
+    right: -6%;
+    width: 62%;
+    height: 62%;
+    border-radius: 50%;
+    background-color: var(--vc-mas-ring-color);
+}
+
+/* Do Not Disturb: the little white dash. */
+.vc-mas-dot[data-status="dnd"]::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 22%;
+    right: 22%;
+    height: 2px;
+    border-radius: 1px;
+    background-color: #fff;
+    transform: translateY(-50%);
+}
+
+/* --- placement --------------------------------------------------------- */
+
+html[data-vc-mas-position="br"] .vc-mas-dot { right: var(--vc-mas-offset); bottom: var(--vc-mas-offset); }
+html[data-vc-mas-position="bl"] .vc-mas-dot { left: var(--vc-mas-offset); bottom: var(--vc-mas-offset); }
+html[data-vc-mas-position="tr"] .vc-mas-dot { right: var(--vc-mas-offset); top: var(--vc-mas-offset); }
+html[data-vc-mas-position="tl"] .vc-mas-dot { left: var(--vc-mas-offset); top: var(--vc-mas-offset); }
+
+/* --- size -------------------------------------------------------------- */
+
+html[data-vc-mas-size="small"] .vc-mas-dot {
+    --vc-mas-dot-size: 9px;
+    --vc-mas-ring-width: 2px;
+}
+
+html[data-vc-mas-size="large"] .vc-mas-dot {
+    --vc-mas-dot-size: 16px;
+    --vc-mas-ring-width: 3px;
+}
+
+/* --- settings driven by the plugin ------------------------------------- */
+
+html[data-vc-mas-hide-offline] .vc-mas-dot[data-status="offline"] {
+    display: none;
+}
+
+html[data-vc-mas-tooltip="true"] .vc-mas-dot {
+    pointer-events: auto;
+}
