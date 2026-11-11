@@ -7315,9 +7315,13 @@ async function handleMessageCreate(message) {
     return;
   }
 
-  // Delete the uploaded file message from the guild channel so the channel stays clean
+  // Delete the uploaded file message from the guild channel so the channel stays clean.
+  // Logged on failure (instead of silently swallowed) so a stuck message is
+  // diagnosable from the logs rather than just mysteriously reappearing.
   if (message.guildId && message.deletable !== false) {
-    await message.delete().catch(() => {});
+    await message.delete().catch((e) =>
+      console.warn(`[RosterUpload] Could not delete the uploaded roster message (channel ${message.channelId}, message ${message.id}):`, e.message)
+    );
   }
 
   const rows = parseRosterText(rawText);
