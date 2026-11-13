@@ -285,7 +285,10 @@ const OSRS_BOSSES = [
   { name: "Tombs of Amascut",                   hiscoreNames: ["Tombs of Amascut", "Tombs of Amascut: Expert Mode"] },
   {
     name: "The Fractured Archives",
-    hiscoreNames: ["The Fractured Archives", "The Fractured Archives: Hard Mode", "The Fractured Archives: Challenge Mode", "Fractured Archives"],
+    // The live Hiscores reports this one as singular ("The Fractured
+    // Archive"), not plural like its in-game display name -- confirmed
+    // directly against the real index_lite.json response.
+    hiscoreNames: ["The Fractured Archives", "The Fractured Archive", "The Fractured Archives: Hard Mode", "The Fractured Archives: Challenge Mode", "Fractured Archives"],
     unlockAfter: FRACTURED_ARCHIVES_UNLOCK_DATE,
   },
   // God Wars Dungeon
@@ -2399,6 +2402,10 @@ const EXTRA_KC_HISCORE_NAMES = [
   "Mimic",
   "Skotizo",
   "Thermonuclear Smoke Devil",
+  // Newer additions (confirmed present on the live Hiscores as of Oct 2026).
+  "Mad Angel",
+  "Maggot King",
+  "Shellbane Gryphon",
 ];
 
 // Every individual (ungrouped) Hiscores activity name !kc can resolve to.
@@ -2491,13 +2498,56 @@ const KC_ALIASES = {
   grotesque: "Grotesque Guardians",
   thermy: "Thermonuclear Smoke Devil",
   tsd: "Thermonuclear Smoke Devil",
+  barrows: "Barrows Chests", // the Hiscores reports this one as "Barrows Chests", not bare "Barrows"
+  angel: "Mad Angel",
+  madangel: "Mad Angel",
+  maggot: "Maggot King",
+  maggotking: "Maggot King",
+  gryphon: "Shellbane Gryphon",
+  shellbane: "Shellbane Gryphon",
 };
+
+// Matches a Hiscores skill/activity name against our resolved canonical
+// name, tolerating a leading "The " on either side. Found via a live bug
+// report: "!kc hueycoatl" resolved the boss correctly (our own alias table
+// has both "The Hueycoatl" and bare "Hueycoatl" on file, matching the
+// typed-out word to the bare form) but then failed to find a match against
+// the real Hiscores data, which reports it as "The Hueycoatl" -- a plain
+// normalizeHiscoreName() comparison doesn't bridge that gap. Several other
+// current bosses have the exact same "The X" vs "X" inconsistency (Jagex's
+// naming isn't fully consistent), so this is a general comparator rather
+// than a one-off fix for just Hueycoatl.
+function hiscoreMatchKey(name) {
+  return normalizeHiscoreName(name).replace(/^the\s+/, "");
+}
+
+// Lets a shortened or slightly-off typed token still resolve, as long as
+// doing so is unambiguous. `aliasMap` is e.g. KC_ALIASES (short nickname ->
+// exact target name); `fullNames` is every "real" full name it could also
+// be typed out as (e.g. ALL_KC_HISCORE_NAMES). A typed token resolves if
+// it's a prefix of EXACTLY ONE alias key or full name -- if it's a prefix
+// of two or more different targets (e.g. "dag" could mean any of the three
+// Dagannoth Kings), it's rejected rather than guessing wrong, same as an
+// unrecognized token.
+function resolveViaUnambiguousPrefix(norm, aliasMap, fullNames) {
+  if (norm.length < 3) return null; // too short to safely guess from
+  const candidates = new Set();
+  for (const [key, target] of Object.entries(aliasMap)) {
+    if (key.startsWith(norm)) candidates.add(target);
+  }
+  for (const name of fullNames) {
+    if (normalizeStatToken(name).startsWith(norm)) candidates.add(name);
+  }
+  return candidates.size === 1 ? [...candidates][0] : null;
+}
 
 function resolveBossHiscoreName(input) {
   const norm = normalizeStatToken(input);
   if (!norm) return null;
   if (KC_ALIASES[norm]) return KC_ALIASES[norm];
-  return ALL_KC_HISCORE_NAMES.find((n) => normalizeStatToken(n) === norm) || null;
+  const exact = ALL_KC_HISCORE_NAMES.find((n) => normalizeStatToken(n) === norm);
+  if (exact) return exact;
+  return resolveViaUnambiguousPrefix(norm, KC_ALIASES, ALL_KC_HISCORE_NAMES);
 }
 
 const SKILL_ALIASES = {
@@ -2536,7 +2586,8 @@ function resolveSkillHiscoreName(input) {
   if (norm === "overall" || norm === "total") return "Overall";
   if (SKILL_ALIASES[norm]) return SKILL_ALIASES[norm];
   const direct = OSRS_SKILLS.find((s) => normalizeStatToken(s.name) === norm);
-  return direct ? direct.name : null;
+  if (direct) return direct.name;
+  return resolveViaUnambiguousPrefix(norm, SKILL_ALIASES, OSRS_SKILLS.map((s) => s.name));
 }
 
 /** Parses a message's raw content into one of our three stat commands, or null if it isn't one. */
@@ -2591,10 +2642,17 @@ async function fetchRuneProfilePets(rsn) {
     if (res.status === 404) return { ok: false, notFound: true };
     if (!res.ok) return { ok: false, notFound: false, error: `RuneProfile request failed: ${res.status}` };
     const data = await res.json();
-    // Pets live as a page named "Pets" somewhere under the tabs (normally
-    // "Other", but we scan every tab so this keeps working even if
-    // RuneProfile ever reorganizes it).
-    const petsPage = (data?.tabs || []).flatMap((t) => t.pages || []).find((p) => normalizeHiscoreName(p.name) === "pets");
+    // Every pet in the game is aggregated onto one page named "All Pets"
+    // (confirmed against a live RuneProfile account: it lives under the
+    // "Other" tab, alongside each pet ALSO appearing on its own boss/skill's
+    // page — e.g. "Pet chaos elemental" shows up on both "Chaos Elemental"
+    // and "All Pets"). We match "All Pets" specifically rather than any
+    // page whose name merely contains "pet", since page names like
+    // "Barbarian Assault" or "Nex" don't mention pets at all but still
+    // nest a pet item inside them, and we only want the de-duplicated
+    // all-up list. We scan every tab (not just "Other") so this keeps
+    // working even if RuneProfile ever reorganizes it.
+    const petsPage = (data?.tabs || []).flatMap((t) => t.pages || []).find((p) => normalizeHiscoreName(p.name) === "all pets");
     const pets = petsPage ? (petsPage.items || []).filter((i) => Number(i.quantity) > 0).map((i) => i.name) : [];
     return { ok: true, notFound: false, pets };
   } catch (e) {
@@ -2700,7 +2758,7 @@ async function handleOsrsStatsCommand(message) {
   }
 
   if (isLvl) {
-    const entry = (hiscoreData.skills || []).find((s) => normalizeHiscoreName(s.name) === normalizeHiscoreName(canonicalName));
+    const entry = (hiscoreData.skills || []).find((s) => hiscoreMatchKey(s.name) === hiscoreMatchKey(canonicalName));
     const level = entry ? Number(entry.level) : 0;
     if (!entry || level <= 0) {
       await sendOsrsStatsNotice(message.channel, message.author.id, `**${parsed.rsn}** doesn't have a recorded ${canonicalName} level yet.`);
@@ -2718,9 +2776,14 @@ async function handleOsrsStatsCommand(message) {
   }
 
   // kc
-  const entry = (hiscoreData.activities || []).find((a) => normalizeHiscoreName(a.name) === normalizeHiscoreName(canonicalName));
+  const entry = (hiscoreData.activities || []).find((a) => hiscoreMatchKey(a.name) === hiscoreMatchKey(canonicalName));
   const kc = entry ? Number(entry.score) : -1;
-  if (!entry || kc < 0) {
+  // A boss/activity a player has never done is reported by the real
+  // Hiscores as score: 0 alongside rank: -1 -- NOT a negative score (that
+  // was a wrong assumption; confirmed against live data). Since appearing
+  // on the Hiscores at all (rank > 0) always requires at least 1 kill,
+  // score <= 0 reliably means "no recorded kills" in every real case.
+  if (!entry || kc <= 0) {
     await message.channel
       .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** hasn't recorded any kills at **${canonicalName}** yet (unranked).`)], allowedMentions: { parse: [] } })
       .catch(() => {});
@@ -8575,11 +8638,14 @@ module.exports = {
   // OSRS in-chat stat command exports (!lvl / !kc / !pets)
   OSRS_STATS_CHANNEL_ID,
   normalizeStatToken,
+  hiscoreMatchKey,
+  resolveViaUnambiguousPrefix,
   resolveSkillHiscoreName,
   resolveBossHiscoreName,
   SKILL_ALIASES,
   KC_ALIASES,
   ALL_KC_HISCORE_NAMES,
+  EXTRA_KC_HISCORE_NAMES,
   parseOsrsStatsCommand,
   fetchRuneProfilePets,
   buildRuneProfileSetupEmbed,

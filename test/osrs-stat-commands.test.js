@@ -71,6 +71,27 @@ const SAMPLE_HISCORES = {
   ],
 };
 
+// A real (trimmed) capture of a live account's Hiscores response, used to
+// reproduce a reported bug: "!kc hueycoatl" resolved the boss fine but then
+// claimed "hasn't recorded any kills" for a player who actually has 1,367.
+// Also exercises the real Hiscores' "The X" naming inconsistency (compare
+// "The Hueycoatl" and "The Royal Titans" against "Barrows Chests", which is
+// a genuinely different kind of name mismatch, not a "The " prefix one) and
+// confirms genuinely-separate co-located bosses (Callisto vs Artio,
+// Nightmare vs Phosani's Nightmare) are never conflated with each other.
+const REAL_WORLD_HISCORES = {
+  skills: [{ id: 0, name: "Overall", rank: 146470, level: 2275, xp: 409184231 }],
+  activities: [
+    { id: 24, name: "Artio", rank: -1, score: 1 },
+    { id: 28, name: "Callisto", rank: -1, score: 0 },
+    { id: 25, name: "Barrows Chests", rank: 46564, score: 833 },
+    { id: 58, name: "Nightmare", rank: -1, score: 2 },
+    { id: 59, name: "Phosani's Nightmare", rank: -1, score: 0 },
+    { id: 72, name: "The Hueycoatl", rank: 1226, score: 1367 },
+    { id: 74, name: "The Royal Titans", rank: 8390, score: 802 },
+  ],
+};
+
 (async () => {
   // ================= parseOsrsStatsCommand =================
   {
@@ -98,6 +119,39 @@ const SAMPLE_HISCORES = {
     check("a boss outside the Boss-of-the-Week rotation (Cerberus) is still resolvable for !kc", bot.resolveBossHiscoreName("cerberus") === "Cerberus");
     check("alias for a boss outside the BOTW rotation ('hydra' -> Alchemical Hydra) resolves", bot.resolveBossHiscoreName("hydra") === "Alchemical Hydra");
     check("unknown boss resolves to null", bot.resolveBossHiscoreName("bananas") === null);
+  }
+
+  // ================= unambiguous prefix / shortened-typing fallback =================
+  // Players shouldn't have to know the bot's exact curated alias spelling --
+  // a shortened or slightly-truncated form of a real name or alias should
+  // still resolve, as long as it's unambiguous. An ambiguous shortening
+  // (one that could mean more than one different boss) must still refuse
+  // rather than silently guessing the wrong one.
+  {
+    check("a truncated boss name ('zily' -> Commander Zilyana) resolves", bot.resolveBossHiscoreName("zily") === "Commander Zilyana");
+    check("a truncated boss name missing its last letter ('zilyan') resolves", bot.resolveBossHiscoreName("zilyan") === "Commander Zilyana");
+    check("a truncated alias ('cerbe' for the 'cerb' alias) resolves", bot.resolveBossHiscoreName("cerbe") === "Cerberus");
+    check("a truncated alias ('vor' for the 'vork' alias) resolves to Vorkath", bot.resolveBossHiscoreName("vor") === "Vorkath");
+    check("a truncated real name ('grot' for Grotesque Guardians) resolves", bot.resolveBossHiscoreName("grot") === "Grotesque Guardians");
+    check("a truncated real name ('zulr' for Zulrah) resolves", bot.resolveBossHiscoreName("zulr") === "Zulrah");
+    check("an ambiguous shortening ('dag', which could mean Prime/Rex/Supreme) safely refuses rather than guessing", bot.resolveBossHiscoreName("dag") === null);
+    check("a too-short fragment (below the 3-character floor) is rejected rather than guessed", bot.resolveBossHiscoreName("zu") === null);
+
+    check("a truncated skill name ('wood' -> Woodcutting) resolves", bot.resolveSkillHiscoreName("wood") === "Woodcutting");
+    check("a truncated skill alias ('fir' for the implicit Firemaking name) resolves", bot.resolveSkillHiscoreName("fir") === "Firemaking");
+    check("a too-short skill fragment is rejected rather than guessed", bot.resolveSkillHiscoreName("ru") === null);
+  }
+
+  // ================= handleOsrsStatsCommand: a truncated boss name works end-to-end =================
+  {
+    const prevFetcher = bot.config.hiscoreFetcher;
+    bot.config.hiscoreFetcher = async () => SAMPLE_HISCORES;
+    const message = makeFakeMessage({ content: "!kc zulr Zezima" }); // shortened, not the full "zulrah"
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("a shortened boss name is handled end-to-end", handled === true);
+    const text = message._channel._sent[0].payload.embeds[0].data.description;
+    check("it resolves and reports the right boss's kc", text.includes("1,500") && text.includes("Zulrah"));
+    bot.config.hiscoreFetcher = prevFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !lvl =================
@@ -138,6 +192,50 @@ const SAMPLE_HISCORES = {
     check("an unranked boss is still a handled command (not an error)", handled === true);
     const text = message._channel._sent[0].payload.embeds[0].data.description;
     check("the reply reports no recorded kills rather than crashing", /hasn't recorded any kills/i.test(text));
+    bot.config.hiscoreFetcher = prevFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !kc regression -- "The X" vs "X" naming mismatches =================
+  // Reproduces a live bug report: "!kc hueycoatl torlokt" replied "hasn't
+  // recorded any kills ... (unranked)" for a player who actually has 1,367
+  // KC, because the resolved display name ("Hueycoatl") didn't textually
+  // match the real Hiscores entry name ("The Hueycoatl").
+  {
+    const prevFetcher = bot.config.hiscoreFetcher;
+    bot.config.hiscoreFetcher = async () => REAL_WORLD_HISCORES;
+
+    const cases = [
+      { cmd: "!kc hueycoatl torlokt", expectKc: "1,367", expectRank: "1,226" },
+      { cmd: "!kc huey torlokt", expectKc: "1,367", expectRank: "1,226" }, // via the short alias too
+      { cmd: "!kc barrows torlokt", expectKc: "833", expectRank: "46,564" }, // different mismatch kind (not a "The " prefix)
+      { cmd: "!kc titans torlokt", expectKc: "802", expectRank: "8,390" },
+    ];
+    for (const { cmd, expectKc, expectRank } of cases) {
+      const message = makeFakeMessage({ content: cmd });
+      const handled = await bot.handleOsrsStatsCommand(message);
+      check(`"${cmd}" is handled`, handled === true);
+      const text = message._channel._sent[0]?.payload?.embeds?.[0]?.data?.description || "";
+      check(`"${cmd}" reports the real KC (${expectKc}), not "hasn't recorded any kills"`, text.includes(expectKc) && !/hasn't recorded/i.test(text));
+      check(`"${cmd}" also reports the real rank (#${expectRank})`, text.includes(expectRank));
+    }
+
+    // Genuinely distinct, merely co-located bosses must never be conflated
+    // with each other even though they share a boss family / loot table.
+    const callisto = makeFakeMessage({ content: "!kc callisto torlokt" });
+    await bot.handleOsrsStatsCommand(callisto);
+    const callistoText = callisto._channel._sent[0].payload.embeds[0].data.description;
+    check("Callisto (0 kc) is not conflated with Artio's kc", /hasn't recorded any kills/i.test(callistoText) && callistoText.includes("Callisto"));
+
+    const artio = makeFakeMessage({ content: "!kc artio torlokt" });
+    await bot.handleOsrsStatsCommand(artio);
+    const artioText = artio._channel._sent[0].payload.embeds[0].data.description;
+    check("Artio (1 kc) is not conflated with Callisto's kc", /\*\*1\*\*/.test(artioText) && artioText.includes("Artio"));
+
+    const phosani = makeFakeMessage({ content: "!kc phosani torlokt" });
+    await bot.handleOsrsStatsCommand(phosani);
+    const phosaniText = phosani._channel._sent[0].payload.embeds[0].data.description;
+    check("Phosani's Nightmare (0 kc) is not conflated with regular Nightmare's kc", /hasn't recorded any kills/i.test(phosaniText));
+
     bot.config.hiscoreFetcher = prevFetcher;
   }
 
@@ -214,6 +312,102 @@ const SAMPLE_HISCORES = {
     check("still handled even when the invoker's DMs are closed", handled === true);
     check("falls back to a (self-deleting) channel message instead of silently doing nothing", message._channel._sent.length === 1);
     bot.config.runeProfileFetcher = prevFetcher;
+  }
+
+  // ================= fetchRuneProfilePets: real response-shape parsing (regression) =================
+  // Reproduces a bug found live: a player with real RuneProfile pet data
+  // ("Iron EZ Pets") got "doesn't have any pets logged" because the code
+  // looked for a collection-log page literally named "Pets" — but
+  // RuneProfile (mirroring the real in-game collection log) has no such
+  // page. Every pet is aggregated onto ONE page named "All Pets" (confirmed
+  // against a live account's actual API response), nested under the
+  // "Other" tab, while each pet ALSO separately appears on its own boss's
+  // page (e.g. "Pet chaos elemental" shows up on both "Chaos Elemental" and
+  // "All Pets"). This exercises fetchRuneProfilePets' real parsing logic
+  // directly (not the config.runeProfileFetcher override used elsewhere in
+  // this file) by stubbing the global fetch(), matching the exact response
+  // shape RuneProfile's /collection-log endpoint actually returns.
+  {
+    const realisticCollectionLog = {
+      obtained: 791,
+      total: 1734,
+      tabs: [
+        {
+          name: "Bosses",
+          obtained: 204,
+          total: 381,
+          pages: [
+            {
+              name: "Chaos Elemental",
+              obtained: 3,
+              total: 3,
+              items: [
+                { id: 11995, name: "Pet chaos elemental", quantity: 1 }, // also appears on "All Pets" below — must not be double counted
+                { id: 11920, name: "Dragon pickaxe", quantity: 3 },
+              ],
+            },
+            {
+              name: "Commander Zilyana",
+              obtained: 2,
+              total: 8,
+              items: [{ id: 12651, name: "Pet Zilyana", quantity: 0 }], // not obtained here; IS obtained on "All Pets" below
+            },
+          ],
+        },
+        {
+          name: "Other",
+          obtained: 309,
+          total: 544,
+          pages: [
+            {
+              name: "All Pets",
+              obtained: 3,
+              total: 72,
+              items: [
+                { id: 11995, name: "Pet chaos elemental", quantity: 1 },
+                { id: 12651, name: "Pet Zilyana", quantity: 1 },
+                { id: 13247, name: "Hellpuppy", quantity: 0 },
+                { id: 12644, name: "Pet Dagannoth Prime", quantity: 0 },
+                { id: 13225, name: "TzRek-Jad", quantity: 1 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const originalFetch = global.fetch;
+    global.fetch = async (url) => {
+      check("fetchRuneProfilePets calls the RuneProfile v1 collection-log endpoint", String(url).startsWith("https://api.runeprofile.com/v1/accounts/"));
+      check("the rsn is present (URL-encoded) in the request path", String(url).includes(encodeURIComponent("Iron EZ Pets")));
+      return { ok: true, status: 200, json: async () => realisticCollectionLog };
+    };
+
+    const result = await bot.fetchRuneProfilePets("Iron EZ Pets");
+    global.fetch = originalFetch;
+
+    check("a real populated account resolves ok", result.ok === true && result.notFound === false);
+    check("exactly the 3 actually-owned pets are returned (from the \"All Pets\" page, not the per-boss pages)", result.pets.length === 3);
+    check("owned pets are named correctly", result.pets.includes("Pet chaos elemental") && result.pets.includes("Pet Zilyana") && result.pets.includes("TzRek-Jad"));
+    check("unowned pets (quantity 0) are excluded", !result.pets.includes("Hellpuppy") && !result.pets.includes("Pet Dagannoth Prime"));
+  }
+
+  // ================= fetchRuneProfilePets: account exists but has 404'd / malformed collection-log =================
+  {
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ obtained: 0, total: 0, tabs: [] }) });
+    const result = await bot.fetchRuneProfilePets("SomeAccount");
+    global.fetch = originalFetch;
+    check("an account with no tabs at all still resolves ok with an empty pet list (not a crash)", result.ok === true && Array.isArray(result.pets) && result.pets.length === 0);
+  }
+
+  // ================= fetchRuneProfilePets: a genuine 404 is reported as notFound, not a generic error =================
+  {
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 404 });
+    const result = await bot.fetchRuneProfilePets("NobodyHasThis123");
+    global.fetch = originalFetch;
+    check("a 404 from RuneProfile is reported as notFound", result.ok === false && result.notFound === true);
   }
 
   // ================= messages outside OSRS_STATS_CHANNEL_ID are left completely alone =================
