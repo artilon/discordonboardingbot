@@ -2590,6 +2590,141 @@ function resolveSkillHiscoreName(input) {
   return resolveViaUnambiguousPrefix(norm, SKILL_ALIASES, OSRS_SKILLS.map((s) => s.name));
 }
 
+// ================= WIKI IMAGES FOR !lvl / !kc / !pets =================
+// Pulls the thumbnail image the OSRS Wiki itself shows for a given page
+// (via MediaWiki's "pageimages" API, the same mechanism Google/Discord link
+// previews use) so !lvl/!kc/!pets replies can show the skill cape, boss, or
+// pet alongside the numbers. This is a nice-to-have, never load-bearing: any
+// failure (wiki down, title not found, network hiccup) just means the embed
+// posts without a picture -- it must never block or break the actual stat
+// lookup. `config.wikiImageFetcher`, when set, replaces the real HTTP call
+// entirely (test hook), matching the config.hiscoreFetcher / .runeProfileFetcher
+// pattern used elsewhere in this file.
+
+const WIKI_API_BASE = "https://oldschool.runescape.wiki/api.php";
+
+// Resolved title -> { url: string|null, expiresAt: number (ms epoch) }.
+// A found image is cached indefinitely (wiki art for a given page doesn't
+// change); a miss/failure is only cached briefly so a transient wiki hiccup
+// (or a title we haven't added an override for yet) gets retried instead of
+// being "stuck" broken for the life of the process.
+const wikiImageCache = new Map();
+const WIKI_IMAGE_MISS_TTL_MS = 10 * 60 * 1000;
+
+// A few boss names where the Hiscores' own name (what resolveBossHiscoreName
+// returns) doesn't match the wiki's article title at all -- not just a
+// leading "The " difference (the wiki's redirects already smooth those
+// over), but a genuinely different name. Add to this list if a specific
+// boss's image doesn't show up once this is live (couldn't be verified
+// against the real wiki from this sandbox, which has no outbound access to
+// oldschool.runescape.wiki).
+const WIKI_BOSS_TITLE_OVERRIDES = {
+  [normalizeStatToken("Barrows Chests")]: "Barrows",
+  [normalizeStatToken("Lunar Chests")]: "Moons of Peril",
+  [normalizeStatToken("Nightmare")]: "The Nightmare",
+};
+
+/** Strips a raid's "...: Challenge/Hard/Expert Mode" suffix -- same artwork either way. */
+function stripRaidModeSuffix(name) {
+  return String(name || "").replace(/:\s*(challenge|hard|expert)\s*mode$/i, "").trim();
+}
+
+/** Maps a resolved boss/activity name (from resolveBossHiscoreName) to the OSRS Wiki article title to fetch an image for. */
+function wikiTitleForBoss(canonicalName) {
+  const stripped = stripRaidModeSuffix(canonicalName);
+  return WIKI_BOSS_TITLE_OVERRIDES[normalizeStatToken(stripped)] || stripped;
+}
+
+/** Maps a resolved skill name (from resolveSkillHiscoreName) to the OSRS Wiki article title for its skill cape. */
+function wikiTitleForSkill(canonicalName) {
+  if (canonicalName === "Overall") return "Max cape"; // no "Overall cape" exists; closest equivalent
+  return `${canonicalName} cape`;
+}
+
+/**
+ * Looks up the OSRS Wiki's page image for one or more article titles in a
+ * single request (MediaWiki's query API accepts multiple `|`-separated
+ * titles at once). Returns a Map of the ORIGINAL requested title -> image
+ * URL, or null for any title with no image / that couldn't be resolved.
+ */
+async function fetchWikiPageImages(titles) {
+  const uniqueTitles = [...new Set((titles || []).map((t) => String(t || "").trim()).filter(Boolean))];
+  const result = new Map();
+  if (uniqueTitles.length === 0) return result;
+
+  const now = Date.now();
+  const toFetch = [];
+  for (const title of uniqueTitles) {
+    const cached = wikiImageCache.get(normalizeHiscoreName(title));
+    if (cached && cached.expiresAt > now) {
+      result.set(title, cached.url);
+    } else {
+      toFetch.push(title);
+    }
+  }
+  if (toFetch.length === 0) return result;
+
+  let fetched;
+  if (typeof config.wikiImageFetcher === "function") {
+    fetched = await config.wikiImageFetcher(toFetch).catch(() => null);
+  } else {
+    fetched = await fetchWikiPageImagesLive(toFetch).catch(() => null);
+  }
+  const fetchedMap = fetched instanceof Map ? fetched : new Map(Object.entries(fetched || {}));
+
+  for (const title of toFetch) {
+    const url = fetchedMap.get(title) || null;
+    result.set(title, url);
+    wikiImageCache.set(normalizeHiscoreName(title), {
+      url,
+      expiresAt: now + (url ? Number.POSITIVE_INFINITY : WIKI_IMAGE_MISS_TTL_MS),
+    });
+  }
+  return result;
+}
+
+/** The real network call behind fetchWikiPageImages — isolated so tests never need to hit the live wiki. */
+async function fetchWikiPageImagesLive(titles) {
+  const url =
+    `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=pageimages&piprop=thumbnail&pithumbsize=300` +
+    `&titles=${encodeURIComponent(titles.join("|"))}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  if (typeof timeout.unref === "function") timeout.unref();
+
+  const out = new Map(titles.map((t) => [t, null]));
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki image lookup)" }, signal: controller.signal });
+    if (!res.ok) return out;
+    const data = await res.json();
+
+    // Trace each requested title through MediaWiki's "normalized" ->
+    // "redirects" -> "pages" chain to find its final resolved page image.
+    const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
+    const redirectMap = new Map((data?.query?.redirects || []).map((r) => [r.from, r.to]));
+    const pages = Object.values(data?.query?.pages || {});
+    const imageByTitle = new Map(pages.map((p) => [p.title, p?.thumbnail?.source || null]));
+
+    for (const title of titles) {
+      let finalTitle = title;
+      if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
+      if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
+      out.set(title, imageByTitle.get(finalTitle) || null);
+    }
+    return out;
+  } catch {
+    return out;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Convenience single-title wrapper around fetchWikiPageImages. */
+async function fetchWikiImage(title) {
+  const map = await fetchWikiPageImages([title]);
+  return map.get(title) || null;
+}
+
 /** Parses a message's raw content into one of our three stat commands, or null if it isn't one. */
 function parseOsrsStatsCommand(content) {
   const tokens = String(content || "").trim().split(/\s+/);
@@ -2697,6 +2832,38 @@ async function sendRuneProfileSetupNotice(user, rsn, fallbackChannel) {
   }
 }
 
+// Discord caps embeds at 10 per message.
+const DISCORD_MAX_EMBEDS_PER_MESSAGE = 10;
+
+/**
+ * Posts the "!pets" result as a header line (player + pet count) followed by
+ * one small embed per pet, each showing that pet's own OSRS Wiki picture
+ * next to its name — i.e. a scrollable little gallery rather than one wall
+ * of plain text. Chunked into multiple messages if the player owns more
+ * pets than fit in a single message (Discord's 10-embeds-per-message cap).
+ */
+async function sendPetsResultWithImages(channel, rsn, pets) {
+  const header = await channel
+    .send({
+      embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`)],
+      allowedMentions: { parse: [] },
+    })
+    .catch((e) => console.warn("[OsrsStats] Could not post !pets header:", e.message));
+  if (!header) return;
+
+  const images = await fetchWikiPageImages(pets).catch(() => new Map());
+  for (let i = 0; i < pets.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
+    const batch = pets.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
+    const embeds = batch.map((pet) => {
+      const embed = new EmbedBuilder().setColor(COLOR.main).setDescription(pet);
+      const img = images.get(pet);
+      if (img) embed.setThumbnail(img);
+      return embed;
+    });
+    await channel.send({ embeds, allowedMentions: { parse: [] } }).catch((e) => console.warn("[OsrsStats] Could not post !pets image batch:", e.message));
+  }
+}
+
 /**
  * Handles one message in the OSRS stats channel. Returns false (and leaves
  * the message untouched) if it isn't a recognized !lvl/!kc/!pets command at
@@ -2724,16 +2891,7 @@ async function handleOsrsStatsCommand(message) {
         .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** doesn't have any pets logged on RuneProfile yet.`)], allowedMentions: { parse: [] } })
         .catch(() => {});
     } else {
-      await message.channel
-        .send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(COLOR.main)
-              .setDescription(`**${parsed.rsn}** has **${result.pets.length}** pet${result.pets.length === 1 ? "" : "s"}: ${result.pets.join(", ")}`),
-          ],
-          allowedMentions: { parse: [] },
-        })
-        .catch((e) => console.warn("[OsrsStats] Could not post !pets result:", e.message));
+      await sendPetsResultWithImages(message.channel, parsed.rsn, result.pets);
     }
     return true;
   }
@@ -2771,6 +2929,8 @@ async function handleOsrsStatsCommand(message) {
       .setDescription(
         `**${parsed.rsn}** has level **${level}** ${canonicalName} (**${xp.toLocaleString()}** XP${rank > 0 ? `, rank #${rank.toLocaleString()}` : ""}).`
       );
+    const skillImg = await fetchWikiImage(wikiTitleForSkill(canonicalName)).catch(() => null);
+    if (skillImg) embed.setThumbnail(skillImg);
     await message.channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((e) => console.warn("[OsrsStats] Could not post !lvl result:", e.message));
     return true;
   }
@@ -2793,6 +2953,8 @@ async function handleOsrsStatsCommand(message) {
   const embed = new EmbedBuilder()
     .setColor(COLOR.main)
     .setDescription(`**${parsed.rsn}** has a Kill Count of **${kc.toLocaleString()}** at **${canonicalName}**${rank > 0 ? ` (rank #${rank.toLocaleString()})` : ""}.`);
+  const bossImg = await fetchWikiImage(wikiTitleForBoss(canonicalName)).catch(() => null);
+  if (bossImg) embed.setThumbnail(bossImg);
   await message.channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((e) => console.warn("[OsrsStats] Could not post !kc result:", e.message));
   return true;
 }
@@ -8652,6 +8814,14 @@ module.exports = {
   sendRuneProfileSetupNotice,
   sendOsrsStatsNotice,
   handleOsrsStatsCommand,
+  // Wiki image lookups for !lvl / !kc / !pets
+  wikiTitleForBoss,
+  wikiTitleForSkill,
+  stripRaidModeSuffix,
+  fetchWikiPageImages,
+  fetchWikiImage,
+  sendPetsResultWithImages,
+  _wikiImageCacheForTests: wikiImageCache,
   // Server Privacy exports
   CLAN_FRIEND_ROLE_ID,
   SOCIAL_CHATTER_ROLE_ID,

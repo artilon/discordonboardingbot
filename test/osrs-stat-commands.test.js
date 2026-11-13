@@ -93,6 +93,15 @@ const REAL_WORLD_HISCORES = {
 };
 
 (async () => {
+  // Default stub so ordinary tests (that don't care about wiki images) never
+  // make a real network call to the OSRS Wiki — mirrors config.hiscoreFetcher
+  // / config.runeProfileFetcher being stubbed everywhere else in this file.
+  // Tests that specifically exercise image behavior override this locally
+  // AND clear the (permanent, process-lifetime) image cache first, since
+  // otherwise an earlier test's cached "no image found" result for the same
+  // title would shadow a later test's differently-stubbed fetcher.
+  bot.config.wikiImageFetcher = async () => new Map();
+
   // ================= parseOsrsStatsCommand =================
   {
     check("!lvl with skill + single-word rsn parses", JSON.stringify(bot.parseOsrsStatsCommand("!lvl woodcutting Zezima")) ===
@@ -183,6 +192,50 @@ const REAL_WORLD_HISCORES = {
     bot.config.hiscoreFetcher = prevFetcher;
   }
 
+  // ================= handleOsrsStatsCommand: !lvl / !kc include the OSRS Wiki image when found =================
+  {
+    const prevFetcher = bot.config.hiscoreFetcher;
+    const prevWikiFetcher = bot.config.wikiImageFetcher;
+    bot.config.hiscoreFetcher = async () => SAMPLE_HISCORES;
+    bot._wikiImageCacheForTests.clear();
+
+    bot.config.wikiImageFetcher = async (titles) => {
+      check("!lvl queries the skill's cape title on the wiki", titles.includes("Woodcutting cape"));
+      return new Map([["Woodcutting cape", "https://wiki.example/wc-cape.png"]]);
+    };
+    const lvlMessage = makeFakeMessage({ content: "!lvl wc Zezima" });
+    await bot.handleOsrsStatsCommand(lvlMessage);
+    check("!lvl's embed gets a thumbnail from the wiki", lvlMessage._channel._sent[0].payload.embeds[0].data.thumbnail?.url === "https://wiki.example/wc-cape.png");
+
+    bot.config.wikiImageFetcher = async (titles) => {
+      check("!kc queries the boss's own title on the wiki", titles.includes("King Black Dragon"));
+      return new Map([["King Black Dragon", "https://wiki.example/kbd.png"]]);
+    };
+    const kcMessage = makeFakeMessage({ content: "!kc kbd Zezima" });
+    await bot.handleOsrsStatsCommand(kcMessage);
+    check("!kc's embed gets a thumbnail from the wiki", kcMessage._channel._sent[0].payload.embeds[0].data.thumbnail?.url === "https://wiki.example/kbd.png");
+
+    bot.config.wikiImageFetcher = async () => new Map(); // simulate the wiki having no image for this one (a different boss, so it doesn't hit the cached King Black Dragon result above)
+    const noImgMessage = makeFakeMessage({ content: "!kc cerberus Zezima" });
+    await bot.handleOsrsStatsCommand(noImgMessage);
+    check("no wiki image found gracefully omits the thumbnail instead of breaking the reply", noImgMessage._channel._sent[0].payload.embeds[0].data.thumbnail === undefined);
+
+    bot.config.hiscoreFetcher = prevFetcher;
+    bot.config.wikiImageFetcher = prevWikiFetcher;
+  }
+
+  // ================= wikiTitleForBoss / wikiTitleForSkill =================
+  {
+    check("a boss whose Hiscores name differs from its wiki title resolves via the override table ('Barrows Chests' -> 'Barrows')", bot.wikiTitleForBoss("Barrows Chests") === "Barrows");
+    check("'Lunar Chests' overrides to the wiki's actual article title 'Moons of Peril'", bot.wikiTitleForBoss("Lunar Chests") === "Moons of Peril");
+    check("bare 'Nightmare' overrides to the wiki's 'The Nightmare' article", bot.wikiTitleForBoss("Nightmare") === "The Nightmare");
+    check("a raid's '...: Challenge Mode' suffix is stripped before looking up its (shared) artwork", bot.wikiTitleForBoss("Chambers of Xeric: Challenge Mode") === "Chambers of Xeric");
+    check("a boss with no naming quirks is passed through as-is", bot.wikiTitleForBoss("Zulrah") === "Zulrah");
+
+    check("a skill resolves to its skill cape's wiki title", bot.wikiTitleForSkill("Woodcutting") === "Woodcutting cape");
+    check("the Overall pseudo-skill resolves to the Max cape (no 'Overall cape' exists)", bot.wikiTitleForSkill("Overall") === "Max cape");
+  }
+
   // ================= handleOsrsStatsCommand: !kc for an unranked boss =================
   {
     const prevFetcher = bot.config.hiscoreFetcher;
@@ -270,8 +323,47 @@ const REAL_WORLD_HISCORES = {
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!pets is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    const text = message._channel._sent[0].payload.embeds[0].data.description;
-    check("the reply lists the pet count and names", text.includes("2") && text.includes("Baby Mole") && text.includes("Pet Zilyana"));
+    check("a header message plus one image-batch message are posted", message._channel._sent.length === 2);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header states the pet count", headerText.includes("2"));
+    const petEmbeds = message._channel._sent[1].payload.embeds;
+    check("one embed is posted per pet, named correctly", petEmbeds.length === 2 && petEmbeds[0].data.description === "Baby Mole" && petEmbeds[1].data.description === "Pet Zilyana");
+    bot.config.runeProfileFetcher = prevFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !pets images come from the OSRS Wiki =================
+  {
+    const prevFetcher = bot.config.runeProfileFetcher;
+    const prevWikiFetcher = bot.config.wikiImageFetcher;
+    bot._wikiImageCacheForTests.clear(); // an earlier test already cached "Baby Mole" as a miss under the default stub
+    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: ["Baby Mole", "Herbi"] });
+    bot.config.wikiImageFetcher = async (titles) => {
+      check("the wiki is queried with the exact pet names, in one batch", titles.length === 2 && titles.includes("Baby Mole") && titles.includes("Herbi"));
+      const m = new Map();
+      m.set("Baby Mole", "https://wiki.example/baby-mole.png");
+      m.set("Herbi", null); // simulates a pet whose wiki image couldn't be resolved
+      return m;
+    };
+    const message = makeFakeMessage({ content: "!pets Zezima" });
+    await bot.handleOsrsStatsCommand(message);
+    const petEmbeds = message._channel._sent[1].payload.embeds;
+    check("a pet with a resolved wiki image gets a thumbnail", petEmbeds[0].data.thumbnail?.url === "https://wiki.example/baby-mole.png");
+    check("a pet with no resolved image gracefully has no thumbnail (not a crash)", petEmbeds[1].data.thumbnail === undefined);
+    bot.config.runeProfileFetcher = prevFetcher;
+    bot.config.wikiImageFetcher = prevWikiFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !pets batches images across messages past Discord's 10-embed cap =================
+  {
+    const prevFetcher = bot.config.runeProfileFetcher;
+    const manyPets = Array.from({ length: 13 }, (_, i) => `Pet ${i + 1}`);
+    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: manyPets });
+    const message = makeFakeMessage({ content: "!pets Zezima" });
+    await bot.handleOsrsStatsCommand(message);
+    // 1 header + 2 image batches (10 + 3) = 3 messages total
+    check("more than 10 pets are split across multiple messages, respecting Discord's embed cap", message._channel._sent.length === 3);
+    check("the first image batch has exactly 10 embeds", message._channel._sent[1].payload.embeds.length === 10);
+    check("the second image batch has the remaining 3 embeds", message._channel._sent[2].payload.embeds.length === 3);
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
