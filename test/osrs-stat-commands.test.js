@@ -101,6 +101,7 @@ const REAL_WORLD_HISCORES = {
   // otherwise an earlier test's cached "no image found" result for the same
   // title would shadow a later test's differently-stubbed fetcher.
   bot.config.wikiImageFetcher = async () => new Map();
+  bot.config.wikiFileImageFetcher = async () => new Map();
 
   // ================= parseOsrsStatsCommand =================
   {
@@ -197,7 +198,7 @@ const REAL_WORLD_HISCORES = {
     const prevFetcher = bot.config.hiscoreFetcher;
     const prevWikiFetcher = bot.config.wikiImageFetcher;
     bot.config.hiscoreFetcher = async () => SAMPLE_HISCORES;
-    bot._wikiImageCacheForTests.clear();
+    bot._wikiPageImageCacheForTests.clear();
 
     bot.config.wikiImageFetcher = async (titles) => {
       check("!lvl queries the skill's cape title on the wiki", titles.includes("Woodcutting cape"));
@@ -331,26 +332,55 @@ const REAL_WORLD_HISCORES = {
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
-  // ================= handleOsrsStatsCommand: !pets images come from the OSRS Wiki =================
+  // ================= handleOsrsStatsCommand: !pets images come from the OSRS Wiki's small item icon, not the big creature render =================
+  // !pets uses fetchWikiFileImages (the wiki's small "<Item name>.png" inventory
+  // icon, e.g. https://oldschool.runescape.wiki/images/Huberte.png) rather than
+  // fetchWikiPageImages (the wiki's big infobox/creature render used by !kc) --
+  // reported live as "huge and spammy" when the big renders were tried for pets.
   {
     const prevFetcher = bot.config.runeProfileFetcher;
-    const prevWikiFetcher = bot.config.wikiImageFetcher;
-    bot._wikiImageCacheForTests.clear(); // an earlier test already cached "Baby Mole" as a miss under the default stub
+    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
+    const prevWikiPageFetcher = bot.config.wikiImageFetcher;
+    bot._wikiFileImageCacheForTests.clear(); // an earlier test already cached "Baby Mole" as a miss under the default stub
     bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: ["Baby Mole", "Herbi"] });
-    bot.config.wikiImageFetcher = async (titles) => {
-      check("the wiki is queried with the exact pet names, in one batch", titles.length === 2 && titles.includes("Baby Mole") && titles.includes("Herbi"));
+    bot.config.wikiFileImageFetcher = async (titles) => {
+      check("the wiki's small-icon lookup is queried with the exact pet names, in one batch", titles.length === 2 && titles.includes("Baby Mole") && titles.includes("Herbi"));
       const m = new Map();
       m.set("Baby Mole", "https://wiki.example/baby-mole.png");
       m.set("Herbi", null); // simulates a pet whose wiki image couldn't be resolved
       return m;
     };
+    bot.config.wikiImageFetcher = async () => { throw new Error("!pets must not use the big-image (pageimages) fetcher at all"); };
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
     const petEmbeds = message._channel._sent[1].payload.embeds;
-    check("a pet with a resolved wiki image gets a thumbnail", petEmbeds[0].data.thumbnail?.url === "https://wiki.example/baby-mole.png");
+    check("a pet with a resolved wiki icon gets a thumbnail", petEmbeds[0].data.thumbnail?.url === "https://wiki.example/baby-mole.png");
     check("a pet with no resolved image gracefully has no thumbnail (not a crash)", petEmbeds[1].data.thumbnail === undefined);
     bot.config.runeProfileFetcher = prevFetcher;
-    bot.config.wikiImageFetcher = prevWikiFetcher;
+    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
+    bot.config.wikiImageFetcher = prevWikiPageFetcher;
+  }
+
+  // ================= fetchWikiFileImages: queries the wiki's File: namespace with the exact "<name>.png" convention =================
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher; // exercise the real (live-call) code path, with fetch() itself stubbed
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    global.fetch = async (url) => {
+      check("the live file-image lookup queries MediaWiki's File: namespace using the exact '<name>.png' convention", String(url).includes("titles=File%3AHuberte.png"));
+      check("it asks for imageinfo/url, not pageimages", String(url).includes("prop=imageinfo") && String(url).includes("iiprop=url"));
+      return {
+        ok: true,
+        json: async () => ({
+          query: { pages: { "1": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] } } },
+        }),
+      };
+    };
+    const result = await bot.fetchWikiFileImages(["Huberte"]);
+    global.fetch = originalFetch;
+    check("resolves to the wiki's actual small icon URL", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !pets batches images across messages past Discord's 10-embed cap =================

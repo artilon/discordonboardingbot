@@ -2607,9 +2607,54 @@ const WIKI_API_BASE = "https://oldschool.runescape.wiki/api.php";
 // A found image is cached indefinitely (wiki art for a given page doesn't
 // change); a miss/failure is only cached briefly so a transient wiki hiccup
 // (or a title we haven't added an override for yet) gets retried instead of
-// being "stuck" broken for the life of the process.
-const wikiImageCache = new Map();
+// being "stuck" broken for the life of the process. Kept as two separate
+// caches since they're two different kinds of lookup against two different
+// MediaWiki endpoints (see fetchWikiPageImages vs fetchWikiFileImages below).
+const wikiPageImageCache = new Map();
+const wikiFileImageCache = new Map();
 const WIKI_IMAGE_MISS_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Shared cache-then-fetch plumbing for both fetchWikiPageImages and
+ * fetchWikiFileImages below. `liveFetcher(titles)` and `configFetcher`
+ * (e.g. config.wikiImageFetcher) must both resolve to a Map/object of
+ * title -> image URL (or null) for exactly the titles they were given.
+ */
+async function fetchWikiImagesCached(titles, cache, configFetcher, liveFetcher) {
+  const uniqueTitles = [...new Set((titles || []).map((t) => String(t || "").trim()).filter(Boolean))];
+  const result = new Map();
+  if (uniqueTitles.length === 0) return result;
+
+  const now = Date.now();
+  const toFetch = [];
+  for (const title of uniqueTitles) {
+    const cached = cache.get(normalizeHiscoreName(title));
+    if (cached && cached.expiresAt > now) {
+      result.set(title, cached.url);
+    } else {
+      toFetch.push(title);
+    }
+  }
+  if (toFetch.length === 0) return result;
+
+  let fetched;
+  if (typeof configFetcher === "function") {
+    fetched = await configFetcher(toFetch).catch(() => null);
+  } else {
+    fetched = await liveFetcher(toFetch).catch(() => null);
+  }
+  const fetchedMap = fetched instanceof Map ? fetched : new Map(Object.entries(fetched || {}));
+
+  for (const title of toFetch) {
+    const url = fetchedMap.get(title) || null;
+    result.set(title, url);
+    cache.set(normalizeHiscoreName(title), {
+      url,
+      expiresAt: now + (url ? Number.POSITIVE_INFINITY : WIKI_IMAGE_MISS_TTL_MS),
+    });
+  }
+  return result;
+}
 
 // A few boss names where the Hiscores' own name (what resolveBossHiscoreName
 // returns) doesn't match the wiki's article title at all -- not just a
@@ -2642,45 +2687,16 @@ function wikiTitleForSkill(canonicalName) {
 }
 
 /**
- * Looks up the OSRS Wiki's page image for one or more article titles in a
+ * Looks up the OSRS Wiki's PAGE image for one or more article titles in a
  * single request (MediaWiki's query API accepts multiple `|`-separated
- * titles at once). Returns a Map of the ORIGINAL requested title -> image
- * URL, or null for any title with no image / that couldn't be resolved.
+ * titles at once) -- i.e. whatever image the wiki's own infobox shows for
+ * that article, which for a boss is its full creature render. Used for
+ * !kc/!lvl, where that full picture is exactly what's wanted. Returns a Map
+ * of the ORIGINAL requested title -> image URL, or null if unresolved.
+ * `config.wikiImageFetcher`, when set, replaces the real HTTP call (test hook).
  */
 async function fetchWikiPageImages(titles) {
-  const uniqueTitles = [...new Set((titles || []).map((t) => String(t || "").trim()).filter(Boolean))];
-  const result = new Map();
-  if (uniqueTitles.length === 0) return result;
-
-  const now = Date.now();
-  const toFetch = [];
-  for (const title of uniqueTitles) {
-    const cached = wikiImageCache.get(normalizeHiscoreName(title));
-    if (cached && cached.expiresAt > now) {
-      result.set(title, cached.url);
-    } else {
-      toFetch.push(title);
-    }
-  }
-  if (toFetch.length === 0) return result;
-
-  let fetched;
-  if (typeof config.wikiImageFetcher === "function") {
-    fetched = await config.wikiImageFetcher(toFetch).catch(() => null);
-  } else {
-    fetched = await fetchWikiPageImagesLive(toFetch).catch(() => null);
-  }
-  const fetchedMap = fetched instanceof Map ? fetched : new Map(Object.entries(fetched || {}));
-
-  for (const title of toFetch) {
-    const url = fetchedMap.get(title) || null;
-    result.set(title, url);
-    wikiImageCache.set(normalizeHiscoreName(title), {
-      url,
-      expiresAt: now + (url ? Number.POSITIVE_INFINITY : WIKI_IMAGE_MISS_TTL_MS),
-    });
-  }
-  return result;
+  return fetchWikiImagesCached(titles, wikiPageImageCache, config.wikiImageFetcher, fetchWikiPageImagesLive);
 }
 
 /** The real network call behind fetchWikiPageImages — isolated so tests never need to hit the live wiki. */
@@ -2710,6 +2726,56 @@ async function fetchWikiPageImagesLive(titles) {
       if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
       if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
       out.set(title, imageByTitle.get(finalTitle) || null);
+    }
+    return out;
+  } catch {
+    return out;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Looks up the OSRS Wiki's small ITEM ICON for one or more pet names, as
+ * opposed to fetchWikiPageImages' big infobox/creature render -- for !pets,
+ * a whole page of those full-size renders stacked up was reported as "huge
+ * and spammy". The wiki's own file-naming convention for an item's inventory
+ * icon is literally "<Item name>.png" (e.g. "Huberte.png"), a different,
+ * much smaller file than whatever image the pet's own article uses as its
+ * lead picture -- so this queries that exact file directly (MediaWiki's
+ * File: namespace + imageinfo) instead of going through pageimages at all.
+ * `config.wikiFileImageFetcher`, when set, replaces the real HTTP call (test hook).
+ */
+async function fetchWikiFileImages(names) {
+  return fetchWikiImagesCached(names, wikiFileImageCache, config.wikiFileImageFetcher, fetchWikiFileImagesLive);
+}
+
+/** The real network call behind fetchWikiFileImages — isolated so tests never need to hit the live wiki. */
+async function fetchWikiFileImagesLive(names) {
+  const fileTitles = names.map((n) => `File:${n}.png`);
+  const url =
+    `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
+    `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  if (typeof timeout.unref === "function") timeout.unref();
+
+  const out = new Map(names.map((n) => [n, null]));
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
+    if (!res.ok) return out;
+    const data = await res.json();
+
+    const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
+    const redirectMap = new Map((data?.query?.redirects || []).map((r) => [r.from, r.to]));
+    const pages = Object.values(data?.query?.pages || {});
+    const urlByFileTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
+
+    for (let i = 0; i < names.length; i++) {
+      let finalTitle = fileTitles[i];
+      if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
+      if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
+      out.set(names[i], urlByFileTitle.get(finalTitle) || null);
     }
     return out;
   } catch {
@@ -2837,10 +2903,12 @@ const DISCORD_MAX_EMBEDS_PER_MESSAGE = 10;
 
 /**
  * Posts the "!pets" result as a header line (player + pet count) followed by
- * one small embed per pet, each showing that pet's own OSRS Wiki picture
- * next to its name — i.e. a scrollable little gallery rather than one wall
- * of plain text. Chunked into multiple messages if the player owns more
- * pets than fit in a single message (Discord's 10-embeds-per-message cap).
+ * one small embed per pet, each showing that pet's small OSRS Wiki item icon
+ * next to its name — i.e. a compact little gallery rather than one wall of
+ * plain text (or, worse, the wiki's big full-size creature renders, which
+ * made this huge and spammy when tried). Chunked into multiple messages if
+ * the player owns more pets than fit in one message (Discord's 10-embeds-
+ * per-message cap).
  */
 async function sendPetsResultWithImages(channel, rsn, pets) {
   const header = await channel
@@ -2851,7 +2919,7 @@ async function sendPetsResultWithImages(channel, rsn, pets) {
     .catch((e) => console.warn("[OsrsStats] Could not post !pets header:", e.message));
   if (!header) return;
 
-  const images = await fetchWikiPageImages(pets).catch(() => new Map());
+  const images = await fetchWikiFileImages(pets).catch(() => new Map());
   for (let i = 0; i < pets.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
     const batch = pets.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
     const embeds = batch.map((pet) => {
@@ -8819,9 +8887,11 @@ module.exports = {
   wikiTitleForSkill,
   stripRaidModeSuffix,
   fetchWikiPageImages,
+  fetchWikiFileImages,
   fetchWikiImage,
   sendPetsResultWithImages,
-  _wikiImageCacheForTests: wikiImageCache,
+  _wikiPageImageCacheForTests: wikiPageImageCache,
+  _wikiFileImageCacheForTests: wikiFileImageCache,
   // Server Privacy exports
   CLAN_FRIEND_ROLE_ID,
   SOCIAL_CHATTER_ROLE_ID,
