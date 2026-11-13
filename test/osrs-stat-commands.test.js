@@ -216,6 +216,102 @@ const SAMPLE_HISCORES = {
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
+  // ================= fetchRuneProfilePets: real response-shape parsing (regression) =================
+  // Reproduces a bug found live: a player with real RuneProfile pet data
+  // ("Iron EZ Pets") got "doesn't have any pets logged" because the code
+  // looked for a collection-log page literally named "Pets" — but
+  // RuneProfile (mirroring the real in-game collection log) has no such
+  // page. Every pet is aggregated onto ONE page named "All Pets" (confirmed
+  // against a live account's actual API response), nested under the
+  // "Other" tab, while each pet ALSO separately appears on its own boss's
+  // page (e.g. "Pet chaos elemental" shows up on both "Chaos Elemental" and
+  // "All Pets"). This exercises fetchRuneProfilePets' real parsing logic
+  // directly (not the config.runeProfileFetcher override used elsewhere in
+  // this file) by stubbing the global fetch(), matching the exact response
+  // shape RuneProfile's /collection-log endpoint actually returns.
+  {
+    const realisticCollectionLog = {
+      obtained: 791,
+      total: 1734,
+      tabs: [
+        {
+          name: "Bosses",
+          obtained: 204,
+          total: 381,
+          pages: [
+            {
+              name: "Chaos Elemental",
+              obtained: 3,
+              total: 3,
+              items: [
+                { id: 11995, name: "Pet chaos elemental", quantity: 1 }, // also appears on "All Pets" below — must not be double counted
+                { id: 11920, name: "Dragon pickaxe", quantity: 3 },
+              ],
+            },
+            {
+              name: "Commander Zilyana",
+              obtained: 2,
+              total: 8,
+              items: [{ id: 12651, name: "Pet Zilyana", quantity: 0 }], // not obtained here; IS obtained on "All Pets" below
+            },
+          ],
+        },
+        {
+          name: "Other",
+          obtained: 309,
+          total: 544,
+          pages: [
+            {
+              name: "All Pets",
+              obtained: 3,
+              total: 72,
+              items: [
+                { id: 11995, name: "Pet chaos elemental", quantity: 1 },
+                { id: 12651, name: "Pet Zilyana", quantity: 1 },
+                { id: 13247, name: "Hellpuppy", quantity: 0 },
+                { id: 12644, name: "Pet Dagannoth Prime", quantity: 0 },
+                { id: 13225, name: "TzRek-Jad", quantity: 1 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const originalFetch = global.fetch;
+    global.fetch = async (url) => {
+      check("fetchRuneProfilePets calls the RuneProfile v1 collection-log endpoint", String(url).startsWith("https://api.runeprofile.com/v1/accounts/"));
+      check("the rsn is present (URL-encoded) in the request path", String(url).includes(encodeURIComponent("Iron EZ Pets")));
+      return { ok: true, status: 200, json: async () => realisticCollectionLog };
+    };
+
+    const result = await bot.fetchRuneProfilePets("Iron EZ Pets");
+    global.fetch = originalFetch;
+
+    check("a real populated account resolves ok", result.ok === true && result.notFound === false);
+    check("exactly the 3 actually-owned pets are returned (from the \"All Pets\" page, not the per-boss pages)", result.pets.length === 3);
+    check("owned pets are named correctly", result.pets.includes("Pet chaos elemental") && result.pets.includes("Pet Zilyana") && result.pets.includes("TzRek-Jad"));
+    check("unowned pets (quantity 0) are excluded", !result.pets.includes("Hellpuppy") && !result.pets.includes("Pet Dagannoth Prime"));
+  }
+
+  // ================= fetchRuneProfilePets: account exists but has 404'd / malformed collection-log =================
+  {
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ obtained: 0, total: 0, tabs: [] }) });
+    const result = await bot.fetchRuneProfilePets("SomeAccount");
+    global.fetch = originalFetch;
+    check("an account with no tabs at all still resolves ok with an empty pet list (not a crash)", result.ok === true && Array.isArray(result.pets) && result.pets.length === 0);
+  }
+
+  // ================= fetchRuneProfilePets: a genuine 404 is reported as notFound, not a generic error =================
+  {
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 404 });
+    const result = await bot.fetchRuneProfilePets("NobodyHasThis123");
+    global.fetch = originalFetch;
+    check("a 404 from RuneProfile is reported as notFound", result.ok === false && result.notFound === true);
+  }
+
   // ================= messages outside OSRS_STATS_CHANNEL_ID are left completely alone =================
   {
     const message = makeFakeMessage({ content: "!pets Zezima" });

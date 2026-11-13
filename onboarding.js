@@ -2591,10 +2591,17 @@ async function fetchRuneProfilePets(rsn) {
     if (res.status === 404) return { ok: false, notFound: true };
     if (!res.ok) return { ok: false, notFound: false, error: `RuneProfile request failed: ${res.status}` };
     const data = await res.json();
-    // Pets live as a page named "Pets" somewhere under the tabs (normally
-    // "Other", but we scan every tab so this keeps working even if
-    // RuneProfile ever reorganizes it).
-    const petsPage = (data?.tabs || []).flatMap((t) => t.pages || []).find((p) => normalizeHiscoreName(p.name) === "pets");
+    // Every pet in the game is aggregated onto one page named "All Pets"
+    // (confirmed against a live RuneProfile account: it lives under the
+    // "Other" tab, alongside each pet ALSO appearing on its own boss/skill's
+    // page — e.g. "Pet chaos elemental" shows up on both "Chaos Elemental"
+    // and "All Pets"). We match "All Pets" specifically rather than any
+    // page whose name merely contains "pet", since page names like
+    // "Barbarian Assault" or "Nex" don't mention pets at all but still
+    // nest a pet item inside them, and we only want the de-duplicated
+    // all-up list. We scan every tab (not just "Other") so this keeps
+    // working even if RuneProfile ever reorganizes it.
+    const petsPage = (data?.tabs || []).flatMap((t) => t.pages || []).find((p) => normalizeHiscoreName(p.name) === "all pets");
     const pets = petsPage ? (petsPage.items || []).filter((i) => Number(i.quantity) > 0).map((i) => i.name) : [];
     return { ok: true, notFound: false, pets };
   } catch (e) {
