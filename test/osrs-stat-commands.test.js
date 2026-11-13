@@ -327,12 +327,11 @@ const REAL_WORLD_HISCORES = {
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!pets is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("a header message plus one image-batch message are posted", message._channel._sent.length === 2);
+    check("with no resolvable wiki icons (the default test stub), only the header is posted -- no empty picture-gallery message", message._channel._sent.length === 1);
     const headerText = message._channel._sent[0].payload.embeds[0].data.description;
     check("the header states the pet count", headerText.includes("2"));
-    const petEmbeds = message._channel._sent[1].payload.embeds;
-    check("a pet obtained once is shown by name alone (no dupe badge)", petEmbeds[0].data.description === "Baby Mole");
-    check("a pet obtained more than once shows an 'xN' dupe count", petEmbeds[1].data.description === "Pet Zilyana x3");
+    check("a pet obtained once is named in the header's list, without a dupe badge", headerText.includes("Baby Mole,"));
+    check("a pet obtained more than once shows an 'xN' dupe count in the header's list", headerText.includes("Pet Zilyana x3"));
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
@@ -357,9 +356,13 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiImageFetcher = async () => { throw new Error("!pets must not use the big-image (pageimages) fetcher at all"); };
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    const petEmbeds = message._channel._sent[1].payload.embeds;
-    check("a pet with a resolved wiki icon gets a thumbnail", petEmbeds[0].data.thumbnail?.url === "https://wiki.example/baby-mole.png");
-    check("a pet with no resolved image gracefully has no thumbnail (not a crash)", petEmbeds[1].data.thumbnail === undefined);
+    check("a header plus one gallery message are posted, since at least one pet has a resolvable icon", message._channel._sent.length === 2);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("both pets are still named in the header regardless of whether their icon resolved", headerText.includes("Baby Mole") && headerText.includes("Herbi"));
+    const galleryEmbeds = message._channel._sent[1].payload.embeds;
+    check("only the pet with a resolved wiki icon appears in the picture gallery (the other is simply omitted, not a broken tile)", galleryEmbeds.length === 1);
+    check("a pet with a resolved wiki icon is shown via the embed's full image (not a thumbnail)", galleryEmbeds[0].data.image?.url === "https://wiki.example/baby-mole.png");
+    check("gallery embeds set a shared url -- Discord's same-url trick for tiling multiple images into one compact grid", typeof galleryEmbeds[0].data.url === "string" && galleryEmbeds[0].data.url.length > 0);
     bot.config.runeProfileFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
     bot.config.wikiImageFetcher = prevWikiPageFetcher;
@@ -390,15 +393,21 @@ const REAL_WORLD_HISCORES = {
   // ================= handleOsrsStatsCommand: !pets batches images across messages past Discord's 10-embed cap =================
   {
     const prevFetcher = bot.config.runeProfileFetcher;
+    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
     const manyPets = Array.from({ length: 13 }, (_, i) => ({ name: `Pet ${i + 1}`, quantity: 1 }));
     bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: manyPets });
+    bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/\s+/g, "-").toLowerCase()}.png`]));
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    // 1 header + 2 image batches (10 + 3) = 3 messages total
-    check("more than 10 pets are split across multiple messages, respecting Discord's embed cap", message._channel._sent.length === 3);
-    check("the first image batch has exactly 10 embeds", message._channel._sent[1].payload.embeds.length === 10);
-    check("the second image batch has the remaining 3 embeds", message._channel._sent[2].payload.embeds.length === 3);
+    // 1 header + 2 gallery batches (10 + 3) = 3 messages total
+    check("more than 10 pictured pets are split across multiple gallery messages, respecting Discord's embed cap", message._channel._sent.length === 3);
+    check("the first gallery batch has exactly 10 embeds", message._channel._sent[1].payload.embeds.length === 10);
+    check("the second gallery batch has the remaining 3 embeds", message._channel._sent[2].payload.embeds.length === 3);
+    const allUrls = new Set([...message._channel._sent[1].payload.embeds, ...message._channel._sent[2].payload.embeds].map((e) => e.data.url));
+    check("every gallery embed across both batches shares the identical url -- that's what makes Discord tile them into one gallery", allUrls.size === 1);
     bot.config.runeProfileFetcher = prevFetcher;
+    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !pets with zero pets owned =================
@@ -602,23 +611,29 @@ const REAL_WORLD_HISCORES = {
   // ================= handleOsrsStatsCommand: !log <category> end-to-end =================
   {
     const prevFetcher = bot.config.collectionLogFetcher;
+    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
     bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`]));
 
     const message = makeFakeMessage({ content: "!log toa Zezima" });
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!log is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("a header message plus one image-batch message are posted", message._channel._sent.length === 2);
+    check("a header message plus one gallery message are posted", message._channel._sent.length === 2);
     const headerText = message._channel._sent[0].payload.embeds[0].data.description;
     check("the header names the player and the resolved category", headerText.includes("Zezima") && headerText.includes("Tombs of Amascut"));
     check("the header shows the category's obtained/total progress", headerText.includes("4/10"));
     check("the header states how many items are shown (only the owned ones)", headerText.includes("2"));
+    check("an item obtained once is named in the header's list, without a dupe badge", headerText.includes("Masori mask,"));
+    check("an item obtained more than once shows its dupe count in the header's list", headerText.includes("Lightbearer x2"));
     const itemEmbeds = message._channel._sent[1].payload.embeds;
-    check("only owned items are listed (the unowned Osmumten's fang is excluded)", itemEmbeds.length === 2);
-    check("an item obtained once is shown by name alone", itemEmbeds.some((e) => e.data.description === "Masori mask"));
-    check("an item obtained more than once shows its dupe count", itemEmbeds.some((e) => e.data.description === "Lightbearer x2"));
+    check("only owned items appear in the picture gallery (the unowned Osmumten's fang is excluded)", itemEmbeds.length === 2);
+    check("gallery embeds use the item's wiki icon as the full embed image (not a per-item caption)", itemEmbeds.every((e) => typeof e.data.image?.url === "string"));
+    check("gallery embeds share one identical url so Discord tiles them into a compact grid", new Set(itemEmbeds.map((e) => e.data.url)).size === 1);
 
     bot.config.collectionLogFetcher = prevFetcher;
+    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !log <category> with nothing obtained yet =================

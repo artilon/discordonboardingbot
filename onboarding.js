@@ -129,6 +129,12 @@ const LEADER_CHANNEL_ID       = "1546416683684593724";
 const OWNER_CHAT_CHANNEL_ID   = "1560000052435619901";
 const CLAN_CHAT_CHANNEL_ID    = "1561154983120863303";
 
+// The clan's general announcements channel -- doesn't live under any of the
+// categories above, so it gets its own standalone static rule (see
+// SERVER_PRIVACY_CATEGORIES; a plain channel ID works fine as a "category"
+// key there since applyServerPrivacyCategory fetches it directly by ID).
+const CLAN_ANNOUNCEMENTS_CHANNEL_ID = "1560034690340102164";
+
 // #server-logs is restricted to this one Discord account specifically, not a
 // role — so it stays private even if more people are ever given the Owner role.
 const SERVER_LOGS_OWNER_USER_ID = "351190870416031744";
@@ -2972,32 +2978,55 @@ async function sendRuneProfileSetupNotice(user, rsn, fallbackChannel) {
 // Discord caps embeds at 10 per message.
 const DISCORD_MAX_EMBEDS_PER_MESSAGE = 10;
 
+// Any valid, stable URL works here -- Discord renders multiple embeds in the
+// same message that all share an identical `url` as one compact tiled photo
+// gallery, instead of stacking a full card per embed. That's the whole
+// reason this is set at all: it's never meant to be clicked, just to trigger
+// that grouping behavior. Pointed at the wiki since that's genuinely where
+// the pictures come from.
+const ITEM_GALLERY_URL = "https://oldschool.runescape.wiki/";
+
+// Keeps the header embed's one-line name list comfortably under Discord's
+// 4096-character embed description cap even for a very large haul.
+const ITEM_GALLERY_NAME_LIST_MAX_CHARS = 3500;
+
 /**
- * Posts a header line followed by one small embed per `item` ({name,
- * quantity}), each showing that item's small OSRS Wiki item icon next to its
- * name (with an "xN" dupe count if quantity > 1) — i.e. a compact little
- * gallery rather than one wall of plain text (or, worse, the wiki's big
- * full-size creature renders, which made !pets huge and spammy when tried).
- * Chunked into multiple messages if there are more items than fit in one
- * message (Discord's 10-embeds-per-message cap). Shared by !pets and
+ * Posts one header embed naming every `item` ({name, quantity}, with an
+ * "xN" dupe count where quantity > 1), followed by a compact tiled photo
+ * gallery of their OSRS Wiki item icons — NOT one full embed card per item,
+ * which (for a big pet collection or a large collection log category) was
+ * reported as huge and spammy. Items with no resolvable icon are still
+ * named in the header, just left out of the picture gallery. Chunked into
+ * multiple gallery messages if there are more pictured items than fit in
+ * one message (Discord's 10-embeds-per-message cap). Shared by !pets and
  * !log <category>, which both ultimately show "which collection log items
  * does this player own, and how many of each".
  */
 async function sendItemGalleryWithImages(channel, headerText, items, warnLabel) {
+  const labels = items.map((item) => (item.quantity > 1 ? `${item.name} x${item.quantity}` : item.name));
+  let truncatedNameList = labels.join(", ");
+  if (truncatedNameList.length > ITEM_GALLERY_NAME_LIST_MAX_CHARS) {
+    let shown = 0;
+    let chars = 0;
+    for (const label of labels) {
+      const added = (shown === 0 ? 0 : 2) + label.length;
+      if (chars + added > ITEM_GALLERY_NAME_LIST_MAX_CHARS) break;
+      chars += added;
+      shown++;
+    }
+    truncatedNameList = `${labels.slice(0, shown).join(", ")} … (+${items.length - shown} more)`;
+  }
+
   const header = await channel
-    .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(headerText)], allowedMentions: { parse: [] } })
+    .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`${headerText} ${truncatedNameList}`)], allowedMentions: { parse: [] } })
     .catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} header:`, e.message));
   if (!header) return;
 
   const images = await fetchWikiFileImages(items.map((i) => i.name)).catch(() => new Map());
-  for (let i = 0; i < items.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
-    const batch = items.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
-    const embeds = batch.map((item) => {
-      const embed = new EmbedBuilder().setColor(COLOR.main).setDescription(item.quantity > 1 ? `${item.name} x${item.quantity}` : item.name);
-      const img = images.get(item.name);
-      if (img) embed.setThumbnail(img);
-      return embed;
-    });
+  const pictured = items.filter((item) => images.get(item.name));
+  for (let i = 0; i < pictured.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
+    const batch = pictured.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
+    const embeds = batch.map((item) => new EmbedBuilder().setColor(COLOR.main).setURL(ITEM_GALLERY_URL).setImage(images.get(item.name)));
     await channel.send({ embeds, allowedMentions: { parse: [] } }).catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} image batch:`, e.message));
   }
 }
@@ -5902,6 +5931,16 @@ const SERVER_PRIVACY_CATEGORIES = {
   [SERVER_LOGS_CATEGORY_ID]: {
     label: "Server Logs",
     default: { everyone: EVERYONE_DENY, allowRoleIds: [], allowUserIds: [SERVER_LOGS_OWNER_USER_ID] },
+    channels: {},
+  },
+  // Standalone channel, not a real category -- see the comment on
+  // CLAN_ANNOUNCEMENTS_CHANNEL_ID above for why this still works cleanly.
+  // Visible to every clan member tier (same roster as Clan Chat/Recruitment
+  // Drive/Rank List) PLUS Clan Friends, so announcements always reach
+  // everyone in the community, not just full members.
+  [CLAN_ANNOUNCEMENTS_CHANNEL_ID]: {
+    label: "Announcements",
+    default: { everyone: EVERYONE_DENY, allowRoleIds: [...CLAN_MEMBER_AND_ABOVE_ROLE_IDS, CLAN_FRIEND_ROLE_ID] },
     channels: {},
   },
 };
@@ -9020,6 +9059,7 @@ module.exports = {
   LEADER_CHANNEL_ID,
   OWNER_CHAT_CHANNEL_ID,
   CLAN_CHAT_CHANNEL_ID,
+  CLAN_ANNOUNCEMENTS_CHANNEL_ID,
   SERVER_LOGS_OWNER_USER_ID,
   SERVER_PRIVACY_CATEGORIES,
   EVERYONE_OPEN,
