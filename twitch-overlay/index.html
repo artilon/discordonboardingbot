@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Odinheim — Discord pop-up overlay</title>
+<!--
+  ODINHEIM DISCORD POP-UP OVERLAY
+  ============================================================================
+  A transparent, self-contained overlay for an OBS Browser Source (or any
+  window-capture source). No internet, no build step, no dependencies — the QR
+  code is generated in the page from whatever link you put in CONFIG below.
+
+  EDIT THE BLOCK MARKED "EDIT ME" ONLY. Everything else is presentation.
+  See README.md in this folder for the OBS setup and the honest story about
+  what is and isn't clickable for viewers.
+-->
+
+<style>
+  :root {
+    /* Edit these to re-skin the card. */
+    --gold:       #f0c96b;
+    --gold-hot:   #ffe6a8;
+    --parchment:  #f5ecd8;
+    --muted:      #a9b4c2;
+    --card-w:     600px;
+    --radius:     22px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;   /* keep transparent for OBS */
+    overflow: hidden;
+    user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Stage: where the card is anchored. Position is set by JS. */
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    padding: 56px;
+    pointer-events: none;
+    align-items: flex-end;
+    justify-content: flex-end;
+  }
+  #stage.pos-bottom-left  { justify-content: flex-start; align-items: flex-end; }
+  #stage.pos-top-left     { justify-content: flex-start; align-items: flex-start; }
+  #stage.pos-top-right    { justify-content: flex-end;   align-items: flex-start; }
+  #stage.pos-center       { justify-content: center;     align-items: center; }
+
+  /* ---------- card shell ---------- */
+  .card {
+    position: relative;
+    width: var(--card-w);
+    padding: 26px 26px 26px 24px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 22px;
+    align-items: center;
+    border-radius: var(--radius);
+    color: var(--parchment);
+    background:
+      radial-gradient(120% 140% at 8% 0%, rgba(240,201,107,0.16), transparent 55%),
+      linear-gradient(160deg, #161d27 0%, #0d1319 55%, #090d12 100%);
+    border: 1px solid rgba(240, 201, 107, 0.45);
+    box-shadow:
+      0 26px 60px rgba(0, 0, 0, 0.62),
+      0 0 0 1px rgba(0, 0, 0, 0.5),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    opacity: 0;
+    transform: translateY(30px) scale(0.84) rotate(-1.2deg);
+    transform-origin: 100% 100%;
+    transition:
+      opacity 220ms ease,
+      transform 620ms cubic-bezier(0.18, 1.28, 0.36, 1);
+    will-change: transform, opacity;
+    pointer-events: auto;
+    cursor: pointer;
+    overflow: hidden;
+  }
+  .card.show {
+    opacity: 1;
+    transform: translateY(0) scale(1) rotate(0deg);
+    animation: halo 3.6s ease-in-out infinite;   /* breathing glow */
+  }
+  @keyframes halo {
+    0%, 100% {
+      box-shadow:
+        0 26px 60px rgba(0, 0, 0, 0.62),
+        0 0 18px rgba(240, 201, 107, 0.16),
+        inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+    50% {
+      box-shadow:
+        0 26px 60px rgba(0, 0, 0, 0.62),
+        0 0 44px rgba(240, 201, 107, 0.36),
+        inset 0 1px 0 rgba(255, 255, 255, 0.10);
+    }
+  }
+
+  /* slow diagonal sheen sweeping across the card */
+  .sheen {
+    position: absolute;
+    top: -60%;
+    left: -35%;
+    width: 42%;
+    height: 220%;
+    background: linear-gradient(
+      100deg,
+      transparent,
+      rgba(255, 240, 200, 0.10) 45%,
+      rgba(255, 246, 220, 0.22) 50%,
+      rgba(255, 240, 200, 0.10) 55%,
+      transparent
+    );
+    transform: rotate(12deg);
+    animation: sweep 5.5s ease-in-out infinite;
+    pointer-events: none;
+  }
+  @keyframes sweep {
+    0%   { left: -40%; opacity: 0; }
+    18%  { opacity: 1; }
+    62%  { left: 110%; opacity: 0; }
+    100% { left: 110%; opacity: 0; }
+  }
+
+  /* ---------- left: crest + copy ---------- */
+  .copy { position: relative; z-index: 2; min-width: 0; }
+
+  .eyebrow {
+    font: 700 11px/1 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--gold);
+    opacity: 0.85;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .eyebrow .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--gold);
+    box-shadow: 0 0 10px var(--gold);
+    animation: pulseDot 1.8s ease-in-out infinite;
+  }
+  @keyframes pulseDot {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50%      { transform: scale(0.6); opacity: 0.45; }
+  }
+
+  .title-row { display: flex; align-items: center; gap: 12px; }
+
+  .crest {
+    width: 46px; height: 52px;
+    flex: 0 0 auto;
+    filter: drop-shadow(0 0 12px rgba(240, 201, 107, 0.45));
+  }
+
+  .title {
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    font-size: 40px;
+    line-height: 0.98;
+    letter-spacing: 0.055em;
+    margin: 0;
+    background: linear-gradient(180deg, #fff6dd 12%, var(--gold) 62%, #b98a35 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow: 0 2px 18px rgba(240, 201, 107, 0.22);
+    white-space: nowrap;
+  }
+
+  .sub {
+    margin: 9px 0 0;
+    font: 500 14px/1.35 ui-sans-serif, system-ui, sans-serif;
+    color: var(--muted);
+    letter-spacing: 0.01em;
+  }
+
+  .cta {
+    margin-top: 16px;
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 16px;
+    border-radius: 999px;
+    font: 700 13px/1 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #1a1204;
+    background: linear-gradient(180deg, var(--gold-hot), var(--gold) 55%, #c39a3f 100%);
+    box-shadow: 0 6px 18px rgba(240, 201, 107, 0.28), inset 0 1px 0 rgba(255,255,255,0.6);
+  }
+  .cta svg { width: 15px; height: 15px; }
+
+  .url {
+    margin-top: 11px;
+    font: 600 13px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: rgba(245, 236, 216, 0.72);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ---------- right: QR ---------- */
+  .qr-wrap {
+    position: relative;
+    z-index: 2;
+    padding: 11px;
+    border-radius: 16px;
+    background: #fdfaf2;
+    box-shadow:
+      0 10px 26px rgba(0, 0, 0, 0.42),
+      inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+    animation: floaty 4.6s ease-in-out infinite;
+  }
+  @keyframes floaty {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-5px); }
+  }
+  .qr-wrap svg {
+    display: block;
+    width: 168px;
+    height: 168px;
+    shape-rendering: crispEdges;
+  }
+  .qr-wrap .scan-hint {
+    margin-top: 7px;
+    text-align: center;
+    font: 700 9.5px/1 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #6b5a34;
+  }
+
+  /* corner ticks on the QR panel — reads as "target me" */
+  .qr-wrap .tick {
+    position: absolute;
+    width: 12px; height: 12px;
+    border: 2px solid var(--gold);
+    opacity: 0.9;
+  }
+  .tick.tl { top: -6px; left: -6px;  border-right: 0; border-bottom: 0; border-radius: 4px 0 0 0; }
+  .tick.tr { top: -6px; right: -6px; border-left: 0;  border-bottom: 0; border-radius: 0 4px 0 0; }
+  .tick.bl { bottom: -6px; left: -6px;  border-right: 0; border-top: 0; border-radius: 0 0 0 4px; }
+  .tick.br { bottom: -6px; right: -6px; border-left: 0;  border-top: 0; border-radius: 0 0 4px 0; }
+
+  /* ---------- auto-hide progress bar ---------- */
+  .timer {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--gold), var(--gold-hot));
+    transform-origin: 0 50%;
+    transform: scaleX(1);
+    opacity: 0;
+  }
+  .card.show .timer { opacity: 0.75; }
+  .card.show .timer.run {
+    animation: drain var(--show-ms, 12000ms) linear forwards;
+  }
+  @keyframes drain {
+    from { transform: scaleX(1); }
+    to   { transform: scaleX(0); }
+  }
+
+  /* ---------- sparkles ---------- */
+  .spark {
+    position: absolute;
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--gold-hot);
+    box-shadow: 0 0 10px 2px rgba(255, 230, 168, 0.75);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .card.show .spark { animation: twinkle 1.5s ease-in-out forwards; }
+  @keyframes twinkle {
+    0%   { opacity: 0; transform: scale(0.2); }
+    40%  { opacity: 1; transform: scale(1); }
+    100% { opacity: 0; transform: scale(0.3) translateY(-14px); }
+  }
+
+  /* Respect reduced-motion (and OBS on weak hardware) */
+  @media (prefers-reduced-motion: reduce) {
+    .card, .sheen, .qr-wrap, .spark, .timer, .eyebrow .dot {
+      animation: none !important;
+      transition: opacity 180ms linear !important;
+    }
+    .card { transform: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="stage" class="pos-bottom-right">
+  <div class="card" id="card" role="button" tabindex="0" aria-label="Join the Odinheim clan Discord">
+    <div class="sheen"></div>
+
+    <div class="copy">
+      <div class="eyebrow"><span class="dot"></span><span id="eyebrowText">OSRS Clan</span></div>
+
+      <div class="title-row">
+        <svg class="crest" viewBox="0 0 46 52" aria-hidden="true">
+          <defs>
+            <linearGradient id="shieldGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%"   stop-color="#ffe6a8"/>
+              <stop offset="55%"  stop-color="#f0c96b"/>
+              <stop offset="100%" stop-color="#a8792a"/>
+            </linearGradient>
+          </defs>
+          <path d="M23 1.5 43.5 9v17.5c0 11-8.6 20-20.5 24C11.1 46.5 2.5 37.5 2.5 26.5V9L23 1.5Z"
+                fill="none" stroke="url(#shieldGrad)" stroke-width="2.4"/>
+          <path d="M23 8.5 37 13.5v12.2c0 7.6-5.9 14.2-14 17.4-8.1-3.2-14-9.8-14-17.4V13.5L23 8.5Z"
+                fill="rgba(240,201,107,0.10)"/>
+          <path d="M23 16v13M17.5 21.5 23 16l5.5 5.5M19 33.5h8" stroke="url(#shieldGrad)"
+                stroke-width="2.1" stroke-linecap="round" fill="none"/>
+        </svg>
+        <h1 class="title" id="clanName">ODINHEIM</h1>
+      </div>
+
+      <p class="sub" id="tagline">Raids &middot; PvM &middot; Skilling &middot; 18+</p>
+
+      <div class="cta">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M20.3 4.4A18 18 0 0 0 15.9 3c-.2.4-.4.9-.6 1.3a13.4 13.4 0 0 0-4 0C11.1 3.9 10.9 3.4 10.7 3a18 18 0 0 0-4.4 1.4C3.6 8.6 3 12.7 3.3 16.7c1.7 1.2 3.3 2 4.9 2.5.4-.6.7-1.2 1-1.8-.5-.2-1-.5-1.5-.8l.4-.3c2.9 1.3 6 1.3 8.8 0l.4.3c-.5.3-1 .6-1.5.8.3.6.6 1.2 1 1.8 1.6-.5 3.2-1.3 4.9-2.5.4-4.6-.6-8.7-2.9-12.3ZM9.4 14.2c-1 0-1.7-.9-1.7-1.9s.8-1.9 1.7-1.9c1 0 1.8.9 1.7 1.9 0 1-.8 1.9-1.7 1.9Zm5.2 0c-1 0-1.7-.9-1.7-1.9s.8-1.9 1.7-1.9c1 0 1.8.9 1.7 1.9 0 1-.7 1.9-1.7 1.9Z"/>
+        </svg>
+        <span id="ctaText">Scan to join</span>
+      </div>
+
+      <div class="url" id="urlText">discord.gg/odinheim</div>
+    </div>
+
+    <div class="qr-wrap">
+      <span class="tick tl"></span><span class="tick tr"></span>
+      <span class="tick bl"></span><span class="tick br"></span>
+      <div id="qrbox"></div>
+      <div class="scan-hint">Scan me</div>
+    </div>
+
+    <div class="timer" id="timer"></div>
+    <span class="spark" style="top:14%;left:22%"></span>
+    <span class="spark" style="top:26%;left:58%;animation-delay:.18s"></span>
+    <span class="spark" style="top:62%;left:36%;animation-delay:.36s"></span>
+    <span class="spark" style="top:48%;left:78%;animation-delay:.54s"></span>
+    <span class="spark" style="top:74%;left:66%;animation-delay:.72s"></span>
+  </div>
+</div>
+
+<!-- QR encoder (qrcode-generator 2.0.4, MIT, Kazuhiko Arase) — vendored so the
+     overlay works with no network access inside OBS. -->
+<script src="vendor/qrcode.js"></script>
+
+<script>
+/* ============================== EDIT ME ============================== */
+const CONFIG = {
+  // 1. Your clan's Discord invite. Permanent invites look like
+  //    https://discord.gg/abcdef  (Server Settings -> Invites -> create one).
+  LINK: "https://discord.gg/odinheim",
+
+  CLAN:    "ODINHEIM",                    // big gold name on the card
+  EYEBROW: "OSRS Clan",                   // tiny label above the name
+  TAGLINE: "Raids · PvM · Skilling · 18+",// one line under the name
+  CTA:     "Scan to join",                // pill button text
+
+  SHOW_SECONDS: 14,   // how long the card stays on screen once it pops
+  INTERVAL_SECONDS: 0,  // auto pop every N seconds (0 = only via hotkey/click)
+  START_VISIBLE: true,  // pop once on load (nice for testing)
+  POSITION: "pos-bottom-right" // pos-bottom-right | pos-bottom-left | pos-top-right | pos-top-left | pos-center
+};
+/* ===================================================================== */
+
+/* URL overrides, so one file can serve several scenes:
+   index.html?link=https://discord.gg/xyz&clan=ODINHEIM&seconds=20&interval=0&pos=pos-center */
+const params = new URLSearchParams(location.search);
+const pick = (key, fallback) => (params.has(key) ? params.get(key) : fallback);
+
+const LINK     = pick("link", CONFIG.LINK);
+const CLAN     = pick("clan", CONFIG.CLAN);
+const EYEBROW  = pick("eyebrow", CONFIG.EYEBROW);
+const TAGLINE  = pick("tagline", CONFIG.TAGLINE);
+const CTA      = pick("cta", CONFIG.CTA);
+const SHOW_MS  = Math.max(2, Number(pick("seconds", CONFIG.SHOW_SECONDS))) * 1000;
+const INTERVAL_S = Number(pick("interval", CONFIG.INTERVAL_SECONDS));
+const POSITION = pick("pos", CONFIG.POSITION);
+const START_VISIBLE = pick("start", String(CONFIG.START_VISIBLE)) !== "false";
+
+const $ = (id) => document.getElementById(id);
+const card = $("card");
+const stage = $("stage");
+
+/* ---- text ---- */
+$("clanName").textContent = CLAN;
+$("eyebrowText").textContent = EYEBROW;
+$("tagline").textContent = TAGLINE;
+$("ctaText").textContent = CTA;
+$("urlText").textContent = LINK.replace(/^https?:\/\//, "").replace(/\/$/, "");
+stage.className = POSITION;
+document.documentElement.style.setProperty("--show-ms", SHOW_MS + "ms");
+
+/* ---- QR code (generated locally from LINK) ---- */
+function buildQr() {
+  if (typeof qrcode !== "function") {
+    $("qrbox").textContent = "QR unavailable";
+    return;
+  }
+  const qr = qrcode(0, "M");   // 0 = auto-size, M = medium error correction
+  qr.addData(LINK);
+  qr.make();
+  $("qrbox").innerHTML = qr.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
+  const svg = $("qrbox").querySelector("svg");
+  if (svg) {
+    svg.removeAttribute("width");
+    svg.removeAttribute("height");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "QR code linking to " + LINK);
+  }
+}
+
+/* ---- show / hide ---- */
+let hideTimer = null;
+let loopTimer = null;
+let visible = false;
+
+function show() {
+  clearTimeout(hideTimer);
+  clearTimeout(loopTimer);
+  visible = true;
+  card.classList.add("show");
+  const bar = $("timer");
+  bar.classList.remove("run");
+  void bar.offsetWidth;      // restart the drain animation
+  bar.classList.add("run");
+  if (SHOW_MS > 0) hideTimer = setTimeout(hide, SHOW_MS);
+}
+
+function hide() {
+  clearTimeout(hideTimer);
+  visible = false;
+  card.classList.remove("show");
+  $("timer").classList.remove("run");
+  scheduleLoop();
+}
+
+function toggle() { visible ? hide() : show(); }
+
+function scheduleLoop() {
+  clearTimeout(loopTimer);
+  if (INTERVAL_S > 0) loopTimer = setTimeout(show, INTERVAL_S * 1000);
+}
+
+/* ---- controls (for the streamer, via OBS "Interact") ---- */
+card.addEventListener("click", toggle);
+card.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+});
+window.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  if (k === "d") toggle();            // D = Discord card
+  if (e.key === "Escape") hide();
+});
+
+/* Clicking the (empty) rest of the canvas does nothing, so a stray click never
+   dismisses the card — only the card itself or the hotkeys do. */
+
+/* ---- boot ---- */
+buildQr();
+if (START_VISIBLE) {
+  setTimeout(show, 900);              // let the source finish fading in first
+} else {
+  scheduleLoop();
+}
+</script>
+</body>
+</html>
