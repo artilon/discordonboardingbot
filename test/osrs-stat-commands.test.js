@@ -102,6 +102,12 @@ const REAL_WORLD_HISCORES = {
   // title would shadow a later test's differently-stubbed fetcher.
   bot.config.wikiImageFetcher = async () => new Map();
   bot.config.wikiFileImageFetcher = async () => new Map();
+  // Same idea for the GE price + wiki drop-rate lookups: no price, no rate,
+  // by default. Tests that specifically exercise that behavior override
+  // these locally AND reset the (permanent, process-lifetime) caches first.
+  bot.config.geMappingFetcher = async () => [];
+  bot.config.geLatestPriceFetcher = async () => ({});
+  bot.config.dropRateFetcher = async () => null;
 
   // ================= parseOsrsStatsCommand =================
   {
@@ -451,6 +457,128 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 
+  // ================= formatGpAmount: formats GP the way OSRS players actually write it =================
+  {
+    check("sub-1000 stays a plain number", bot.formatGpAmount(999) === "999");
+    check("thousands get a 'k' suffix", bot.formatGpAmount(1500) === "1.5k");
+    check("a round thousand doesn't show a pointless '.0'", bot.formatGpAmount(2000) === "2k");
+    check("millions get an 'm' suffix", bot.formatGpAmount(4_300_000) === "4.3m");
+    check("billions get a 'b' suffix", bot.formatGpAmount(2_100_000_000) === "2.1b");
+    check("a non-numeric/missing amount resolves to null rather than 'NaN'", bot.formatGpAmount(undefined) === null && bot.formatGpAmount(null) === null);
+  }
+
+  // ================= fetchGePrices: resolves a GE value via the cached mapping + latest-price datasets =================
+  {
+    bot._resetGePriceCachesForTests();
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    const prevLatestFetcher = bot.config.geLatestPriceFetcher;
+    let mappingCalls = 0;
+    let latestCalls = 0;
+    bot.config.geMappingFetcher = async () => {
+      mappingCalls++;
+      return [
+        { id: 11832, name: "Bandos chestplate" },
+        { id: 4151, name: "Abyssal whip" },
+      ];
+    };
+    bot.config.geLatestPriceFetcher = async () => {
+      latestCalls++;
+      return {
+        "11832": { high: 22000000, low: 21500000 },
+        "4151": { high: null, low: 1200000 }, // only ever seen an instant-sell
+      };
+    };
+    const prices = await bot.fetchGePrices(["Bandos chestplate", "Abyssal whip", "Some Untradeable Thing"]);
+    check("a tradeable item's price resolves (preferring the instant-buy 'high' price)", prices.get("Bandos chestplate") === 22000000);
+    check("an item with only an instant-sell price on record falls back to 'low'", prices.get("Abyssal whip") === 1200000);
+    check("an item absent from the mapping entirely (never tradeable) is simply not in the result", !prices.has("Some Untradeable Thing"));
+
+    // A second lookup within the cache TTL must reuse the cached datasets,
+    // not re-fetch the (large) mapping/latest-price datasets per command.
+    await bot.fetchGePrices(["Bandos chestplate"]);
+    check("the mapping dataset is only fetched once while cached", mappingCalls === 1);
+    check("the latest-price dataset is only fetched once while cached", latestCalls === 1);
+
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot.config.geLatestPriceFetcher = prevLatestFetcher;
+    bot._resetGePriceCachesForTests();
+  }
+
+  // ================= fetchGePrices: a failed mapping/latest-price fetch degrades to "no prices" rather than crashing =================
+  {
+    bot._resetGePriceCachesForTests();
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    bot.config.geMappingFetcher = async () => { throw new Error("simulated GE API outage"); };
+    const prices = await bot.fetchGePrices(["Bandos chestplate"]);
+    check("a failed GE price lookup resolves to an empty Map instead of throwing", prices.size === 0);
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot._resetGePriceCachesForTests();
+  }
+
+  // ================= fetchWikiDropRates: resolves each item's rarity, optionally scoped to a specific source page =================
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    bot.config.dropRateFetcher = async (itemName, pageNameHint) => {
+      if (itemName === "Tanzanite fang" && pageNameHint === "Zulrah") return "1/512";
+      if (itemName === "Magic fang") return null; // never obtained / no drop-table entry on file
+      return null;
+    };
+    const rates = await bot.fetchWikiDropRates(["Tanzanite fang", "Magic fang"], "Zulrah");
+    check("an item with a known rate (scoped to the right source page) resolves", rates.get("Tanzanite fang") === "1/512");
+    check("an item with no drop-table entry at all is simply absent, not a crash", !rates.has("Magic fang"));
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+  }
+
+  // ================= fetchWikiDropRate: caches a hit indefinitely but retries a miss later =================
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    let calls = 0;
+    bot.config.dropRateFetcher = async () => { calls++; return "1/5000"; };
+    await bot.fetchWikiDropRate("Baby Mole", "Giant Mole");
+    await bot.fetchWikiDropRate("Baby Mole", "Giant Mole");
+    check("a resolved drop rate is cached -- the fetcher isn't called again for the same item+source", calls === 1);
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+  }
+
+  // ================= buildItemExtraLabel: combines price + rate into one trailing label =================
+  {
+    check("both present: price first, then rate in parens", bot.buildItemExtraLabel("4.3m", "1/512") === "— 4.3m (1/512)");
+    check("price only", bot.buildItemExtraLabel("4.3m", null) === "— 4.3m");
+    check("rate only", bot.buildItemExtraLabel(null, "1/512") === "(1/512)");
+    check("neither present is an empty string", bot.buildItemExtraLabel(null, null) === "");
+  }
+
+  // ================= enrichItemsWithExtras: wires price + drop rate into the gallery's item labels =================
+  {
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    const prevLatestFetcher = bot.config.geLatestPriceFetcher;
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    bot.config.geMappingFetcher = async () => [{ id: 1, name: "Lightbearer" }];
+    bot.config.geLatestPriceFetcher = async () => ({ "1": { high: 4300000, low: 4200000 } });
+    bot.config.dropRateFetcher = async (itemName) => (itemName === "Lightbearer" ? "1/200" : null);
+
+    const items = [
+      { name: "Lightbearer", quantity: 2 },
+      { name: "Masori mask", quantity: 1 }, // untradeable-in-this-test (not in the mapping) and no drop rate on file
+    ];
+    const enrichedWithPrice = await bot.enrichItemsWithExtras(items, { includePrice: true, pageNameHint: "Tombs of Amascut" });
+    check("an item with both a price and a rate gets both in its extra label", enrichedWithPrice[0].extra === "— 4.3m (1/200)");
+    check("an item with neither gets no .extra field at all", enrichedWithPrice[1].extra === undefined);
+
+    const enrichedNoPrice = await bot.enrichItemsWithExtras(items, { includePrice: false, pageNameHint: "Tombs of Amascut" });
+    check("includePrice: false (used for !pets, since pets are untradeable) omits the price even for an otherwise-tradeable name", enrichedNoPrice[0].extra === "(1/200)");
+
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot.config.geLatestPriceFetcher = prevLatestFetcher;
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
+  }
+
   // ================= handleOsrsStatsCommand: !pets batches images across messages past Discord's 10-embed cap =================
   {
     const prevFetcher = bot.config.runeProfileFetcher;
@@ -696,6 +824,47 @@ const REAL_WORLD_HISCORES = {
 
     bot.config.collectionLogFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> shows GE value + drop rate in the item labels, !pets shows drop rate only =================
+  {
+    const prevCollectionFetcher = bot.config.collectionLogFetcher;
+    const prevRuneProfileFetcher = bot.config.runeProfileFetcher;
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    const prevLatestFetcher = bot.config.geLatestPriceFetcher;
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
+
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: [{ name: "Baby Mole", quantity: 1 }] });
+    bot.config.geMappingFetcher = async () => [{ id: 1, name: "Masori mask" }, { id: 2, name: "Lightbearer" }];
+    bot.config.geLatestPriceFetcher = async () => ({ "1": { high: 8_500_000, low: 8_300_000 }, "2": { high: 4_300_000, low: 4_200_000 } });
+    bot.config.dropRateFetcher = async (itemName) => {
+      if (itemName === "Masori mask") return "1/3,000";
+      if (itemName === "Lightbearer") return "1/1,500";
+      if (itemName === "Baby Mole") return "1/3,000";
+      return null;
+    };
+
+    const logMessage = makeFakeMessage({ content: "!log toa Zezima" });
+    await bot.handleOsrsStatsCommand(logMessage);
+    const logHeaderText = logMessage._channel._sent[0].payload.embeds[0].data.description;
+    check("!log's name list includes a tradeable item's GE value", logHeaderText.includes("Masori mask — 8.5m (1/3,000)"));
+    check("!log's name list includes a dupe-count item's GE value alongside its count", logHeaderText.includes("Lightbearer x2 — 4.3m (1/1,500)"));
+
+    const petsMessage = makeFakeMessage({ content: "!pets Zezima" });
+    await bot.handleOsrsStatsCommand(petsMessage);
+    const petsHeaderText = petsMessage._channel._sent[0].payload.embeds[0].data.description;
+    check("!pets' name list shows the drop rate but NEVER a GE value, since pets are untradeable", petsHeaderText.includes("Baby Mole (1/3,000)") && !/—/.test(petsHeaderText));
+
+    bot.config.collectionLogFetcher = prevCollectionFetcher;
+    bot.config.runeProfileFetcher = prevRuneProfileFetcher;
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot.config.geLatestPriceFetcher = prevLatestFetcher;
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
   }
 
   // ================= findHiscoreActivityForCollectionLogPage: cross-referencing a !log category against the official Hiscores =================
