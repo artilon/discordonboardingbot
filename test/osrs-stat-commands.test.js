@@ -121,6 +121,39 @@ const REAL_WORLD_HISCORES = {
     check("unknown boss resolves to null", bot.resolveBossHiscoreName("bananas") === null);
   }
 
+  // ================= unambiguous prefix / shortened-typing fallback =================
+  // Players shouldn't have to know the bot's exact curated alias spelling --
+  // a shortened or slightly-truncated form of a real name or alias should
+  // still resolve, as long as it's unambiguous. An ambiguous shortening
+  // (one that could mean more than one different boss) must still refuse
+  // rather than silently guessing the wrong one.
+  {
+    check("a truncated boss name ('zily' -> Commander Zilyana) resolves", bot.resolveBossHiscoreName("zily") === "Commander Zilyana");
+    check("a truncated boss name missing its last letter ('zilyan') resolves", bot.resolveBossHiscoreName("zilyan") === "Commander Zilyana");
+    check("a truncated alias ('cerbe' for the 'cerb' alias) resolves", bot.resolveBossHiscoreName("cerbe") === "Cerberus");
+    check("a truncated alias ('vor' for the 'vork' alias) resolves to Vorkath", bot.resolveBossHiscoreName("vor") === "Vorkath");
+    check("a truncated real name ('grot' for Grotesque Guardians) resolves", bot.resolveBossHiscoreName("grot") === "Grotesque Guardians");
+    check("a truncated real name ('zulr' for Zulrah) resolves", bot.resolveBossHiscoreName("zulr") === "Zulrah");
+    check("an ambiguous shortening ('dag', which could mean Prime/Rex/Supreme) safely refuses rather than guessing", bot.resolveBossHiscoreName("dag") === null);
+    check("a too-short fragment (below the 3-character floor) is rejected rather than guessed", bot.resolveBossHiscoreName("zu") === null);
+
+    check("a truncated skill name ('wood' -> Woodcutting) resolves", bot.resolveSkillHiscoreName("wood") === "Woodcutting");
+    check("a truncated skill alias ('fir' for the implicit Firemaking name) resolves", bot.resolveSkillHiscoreName("fir") === "Firemaking");
+    check("a too-short skill fragment is rejected rather than guessed", bot.resolveSkillHiscoreName("ru") === null);
+  }
+
+  // ================= handleOsrsStatsCommand: a truncated boss name works end-to-end =================
+  {
+    const prevFetcher = bot.config.hiscoreFetcher;
+    bot.config.hiscoreFetcher = async () => SAMPLE_HISCORES;
+    const message = makeFakeMessage({ content: "!kc zulr Zezima" }); // shortened, not the full "zulrah"
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("a shortened boss name is handled end-to-end", handled === true);
+    const text = message._channel._sent[0].payload.embeds[0].data.description;
+    check("it resolves and reports the right boss's kc", text.includes("1,500") && text.includes("Zulrah"));
+    bot.config.hiscoreFetcher = prevFetcher;
+  }
+
   // ================= handleOsrsStatsCommand: !lvl =================
   {
     const prevFetcher = bot.config.hiscoreFetcher;

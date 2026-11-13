@@ -2521,11 +2521,33 @@ function hiscoreMatchKey(name) {
   return normalizeHiscoreName(name).replace(/^the\s+/, "");
 }
 
+// Lets a shortened or slightly-off typed token still resolve, as long as
+// doing so is unambiguous. `aliasMap` is e.g. KC_ALIASES (short nickname ->
+// exact target name); `fullNames` is every "real" full name it could also
+// be typed out as (e.g. ALL_KC_HISCORE_NAMES). A typed token resolves if
+// it's a prefix of EXACTLY ONE alias key or full name -- if it's a prefix
+// of two or more different targets (e.g. "dag" could mean any of the three
+// Dagannoth Kings), it's rejected rather than guessing wrong, same as an
+// unrecognized token.
+function resolveViaUnambiguousPrefix(norm, aliasMap, fullNames) {
+  if (norm.length < 3) return null; // too short to safely guess from
+  const candidates = new Set();
+  for (const [key, target] of Object.entries(aliasMap)) {
+    if (key.startsWith(norm)) candidates.add(target);
+  }
+  for (const name of fullNames) {
+    if (normalizeStatToken(name).startsWith(norm)) candidates.add(name);
+  }
+  return candidates.size === 1 ? [...candidates][0] : null;
+}
+
 function resolveBossHiscoreName(input) {
   const norm = normalizeStatToken(input);
   if (!norm) return null;
   if (KC_ALIASES[norm]) return KC_ALIASES[norm];
-  return ALL_KC_HISCORE_NAMES.find((n) => normalizeStatToken(n) === norm) || null;
+  const exact = ALL_KC_HISCORE_NAMES.find((n) => normalizeStatToken(n) === norm);
+  if (exact) return exact;
+  return resolveViaUnambiguousPrefix(norm, KC_ALIASES, ALL_KC_HISCORE_NAMES);
 }
 
 const SKILL_ALIASES = {
@@ -2564,7 +2586,8 @@ function resolveSkillHiscoreName(input) {
   if (norm === "overall" || norm === "total") return "Overall";
   if (SKILL_ALIASES[norm]) return SKILL_ALIASES[norm];
   const direct = OSRS_SKILLS.find((s) => normalizeStatToken(s.name) === norm);
-  return direct ? direct.name : null;
+  if (direct) return direct.name;
+  return resolveViaUnambiguousPrefix(norm, SKILL_ALIASES, OSRS_SKILLS.map((s) => s.name));
 }
 
 /** Parses a message's raw content into one of our three stat commands, or null if it isn't one. */
@@ -8616,6 +8639,7 @@ module.exports = {
   OSRS_STATS_CHANNEL_ID,
   normalizeStatToken,
   hiscoreMatchKey,
+  resolveViaUnambiguousPrefix,
   resolveSkillHiscoreName,
   resolveBossHiscoreName,
   SKILL_ALIASES,
