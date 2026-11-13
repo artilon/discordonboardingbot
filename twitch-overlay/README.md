@@ -51,17 +51,76 @@ scroll down, chat for people who just ask.
 
 ## Setup in OBS
 
-1. **Add** → **Browser** source.
-2. Tick **Local file** → browse to `twitch-overlay/index.html`.
-3. Width **1920**, height **1080**. Untick **Shutdown source when not visible**
-   and **Refresh browser when scene becomes active**, so the overlay doesn't
-   restart the animation every scene switch.
-4. Right-click the source → **Interact** to poke it while you're live, or press
-   **D** in that window to pop the card manually.
+**1. Add the source.** In your scene: **+** under *Sources* → **Browser** → name it
+`Discord Pop-up` → OK.
 
-Background is transparent, so the card floats over your game with no box
-around it. Keep the source above your game capture and below any webcam frame
-you want on top of it.
+**2. Point it at the file.** Tick **Local file**, then **Browse…** and pick
+`twitch-overlay/index.html` (wherever you cloned this repo). Don't paste a
+`file:///…` URL by hand unless you have to — the checkbox keeps it portable.
+
+**3.** Set **Width** `1920`, **Height** `1080` — the full canvas, not the size of
+the card. The card is 600 px wide and sits inside that canvas, so it stays sharp
+at 720p/1080p and doesn't need rescaling.
+
+**4. Untick these two boxes** (they're the usual culprits):
+
+| Checkbox | Leave it | Why |
+| --- | --- | --- |
+| **Shutdown source when not visible** | **off** | Otherwise the page reloads every time you change scenes and the card pops on its own mid-fight. |
+| **Refresh browser when scene becomes active** | **off** | Same thing — the card would pop every scene switch instead of when you want it. |
+
+**5. Don't add a background colour.** Transparent is the default and is what
+makes the card float over the game with no box around it.
+
+That's it — the source should animate in immediately (it pops once on load, then
+hides). From then on you control it.
+
+### Popping it while you're live
+
+- **Right-click the source → Interact.** A window opens with just the overlay in
+  it. Click the card or press **D** to pop it, **Esc** to hide. Leave this window
+  open on a second monitor — it's the intended remote control.
+- **Right-click the source → Refresh page** pops it instantly, always, because
+  the card shows on load. Handy if you'd rather not keep the Interact window up.
+- **Auto:** set `INTERVAL_SECONDS` (e.g. `300` for every 5 minutes) and forget
+  about it.
+- **On a channel-point reward:** have Streamer.bot / Mix It Up refresh the source
+  (obs-websocket, or a Stream Deck "Refresh Browser Source") when someone redeems
+  "post the Discord".
+
+### Putting it somewhere other than the bottom-right corner
+
+The card is anchored inside the 1920×1080 canvas, so dragging the source around
+moves the whole canvas, not the card. Two clean options:
+
+- **Another corner/centre** — set `POSITION` in `CONFIG`, or append
+  `?pos=pos-top-left` (`pos-center`, `pos-top-right`, `pos-bottom-left`).
+- **Anywhere at all** — shrink the *source* to roughly `700 × 420` and drag it
+  wherever you want on screen. The card fills that little canvas and the gap
+  around it is controlled by `?pad=24` (default `56` px). This is the trick to
+  use if you want it tucked beside your webcam or above your alerts.
+
+### Layer order
+
+Put the pop-up **above** your game capture and overlay images, and **below**
+anything you want drawn on top of it (webcam frame, alert box) — just drag it in
+the Sources list. It renders with a transparent background, so it never punches
+a hole in the scene.
+
+### If something looks off
+
+- **Blurry card** — the source isn't 1920×1080. Either set it exactly, or
+  right-click → **Transform** → **Fit to screen** and don't scale it by hand.
+- **Card never appears** — check `START_VISIBLE` is `true` and that you didn't
+  set `?start=false`. Then try **Refresh page** in the source's context menu.
+- **Card pops on its own** — you left `Refresh browser when scene becomes active`
+  ticked, or `INTERVAL_SECONDS` is above 0.
+- **Timing drifts / it reloads alone** — "Shutdown source when not visible" is on.
+- **QR won't scan on stream** — the invite is long, so the modules got tiny. Use a
+  short `discord.gg/<code>` invite, keep the 1080p source, and give it ~10 s on
+  screen. Test by scanning the actual stream preview on your phone, not the file.
+- **Nothing renders at all** — OBS is too old; browser sources shipped in OBS 18
+  and got much better at 27+, so update.
 
 ## Customising
 
@@ -90,17 +149,9 @@ corner the rest of the time:
 index.html?link=https://discord.gg/abcd1234&clan=ODINHEIM&seconds=20&interval=0&pos=pos-center&cta=Type%20!discord
 ```
 
-Colours live in the `:root` block (`--gold`, `--ink`, etc.) if you want to move
-off the clan gold.
-
-## Triggering it on demand
-
-- **Hotkey / click:** press `D` in the OBS Interact window, or click the card.
-  `Esc` hides it. Leave `INTERVAL_SECONDS: 0` for a purely manual card.
-- **On a channel-point reward:** point a **Streamer.bot** or **Mix It Up**
-  action at the sound/overlay, or simply refresh the browser source — the card
-  pops on load.
-- **Every N minutes:** leave `INTERVAL_SECONDS` at something like `300`.
+Every key above has a URL-param twin: `link`, `clan`, `eyebrow`, `tagline`,
+`cta`, `seconds`, `interval`, `start`, `pos`, `pad`. Colours live in the `:root`
+block (`--gold`, `--gold-hot`, etc.) if you want to move off the clan gold.
 
 ## Notes
 
@@ -115,3 +166,6 @@ off the clan gold.
 - `prefers-reduced-motion` is respected, and there are no external fonts,
   scripts, or requests — nothing to break if OBS is offline or your PC is
   loaded.
+- No audio is played. The QR code is generated in-page, so changing `LINK` is
+  the only step to re-point it — never screenshot the QR, just keep the source
+  as the file.

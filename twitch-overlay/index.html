@@ -391,6 +391,7 @@ const CTA      = pick("cta", CONFIG.CTA);
 const SHOW_MS  = Math.max(2, Number(pick("seconds", CONFIG.SHOW_SECONDS))) * 1000;
 const INTERVAL_S = Number(pick("interval", CONFIG.INTERVAL_SECONDS));
 const POSITION = pick("pos", CONFIG.POSITION);
+const PAD      = Number(pick("pad", 56));   // gap from the source edge, in px
 const START_VISIBLE = pick("start", String(CONFIG.START_VISIBLE)) !== "false";
 
 const $ = (id) => document.getElementById(id);
@@ -404,6 +405,7 @@ $("tagline").textContent = TAGLINE;
 $("ctaText").textContent = CTA;
 $("urlText").textContent = LINK.replace(/^https?:\/\//, "").replace(/\/$/, "");
 stage.className = POSITION;
+stage.style.padding = PAD + "px";
 document.documentElement.style.setProperty("--show-ms", SHOW_MS + "ms");
 
 /* ---- QR code (generated locally from LINK) ---- */
