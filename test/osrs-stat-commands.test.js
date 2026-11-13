@@ -332,6 +332,7 @@ const REAL_WORLD_HISCORES = {
     check("the header states the pet count", headerText.includes("2"));
     check("a pet obtained once is named in the header's list, without a dupe badge", headerText.includes("Baby Mole,"));
     check("a pet obtained more than once shows an 'xN' dupe count in the header's list", headerText.includes("Pet Zilyana x3"));
+    check("!pets' header keeps the normal (non-red) color -- only !log's header is colored red", message._channel._sent[0].payload.embeds[0].data.color === bot.COLOR.main);
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
@@ -387,6 +388,66 @@ const REAL_WORLD_HISCORES = {
     const result = await bot.fetchWikiFileImages(["Huberte"]);
     global.fetch = originalFetch;
     check("resolves to the wiki's actual small icon URL", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= fetchWikiFileImages: a transient whole-request failure is retried once instead of giving up immediately =================
+  // Reported live: some (not all) item icons in the same !log/!pets batch
+  // intermittently failed to load, pointing at a transient wiki/CDN hiccup
+  // under load rather than permanently-missing icons.
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+    global.fetch = async () => {
+      callCount++;
+      if (callCount === 1) throw new Error("simulated transient network failure");
+      return {
+        ok: true,
+        json: async () => ({
+          query: { pages: { "1": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] } } },
+        }),
+      };
+    };
+    const result = await bot.fetchWikiFileImages(["Huberte"]);
+    global.fetch = originalFetch;
+    check("a failed first attempt is retried exactly once", callCount === 2);
+    check("the retry's success is still returned to the caller", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= fetchWikiFileImages: a genuinely missing icon (not a request failure) is NOT retried as if it were transient =================
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+    global.fetch = async () => {
+      callCount++;
+      return { ok: true, json: async () => ({ query: { pages: { "-1": { title: "File:NoSuchItem.png", missing: true } } } }) };
+    };
+    const result = await bot.fetchWikiFileImages(["NoSuchItem"]);
+    global.fetch = originalFetch;
+    check("a clean (successful) response reporting no icon for this title is treated as a legitimate miss, not retried", callCount === 1);
+    check("the miss still resolves to null rather than throwing", result.get("NoSuchItem") === null);
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= fetchWikiFileImages: two consecutive whole-request failures give up gracefully =================
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+    global.fetch = async () => { callCount++; throw new Error("simulated persistent network failure"); };
+    const result = await bot.fetchWikiFileImages(["Huberte"]);
+    global.fetch = originalFetch;
+    check("exactly 2 attempts are made (1 initial + 1 retry), not an unbounded retry loop", callCount === 2);
+    check("after both attempts fail, the title resolves to null instead of the whole command crashing", result.get("Huberte") === null);
     bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 
@@ -621,6 +682,7 @@ const REAL_WORLD_HISCORES = {
     check("!log is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
     check("a header message plus one gallery message are posted", message._channel._sent.length === 2);
+    check("!log's header embed is colored red (COLOR.bad), distinct from the gallery underneath it", message._channel._sent[0].payload.embeds[0].data.color === bot.COLOR.bad);
     const headerText = message._channel._sent[0].payload.embeds[0].data.description;
     check("the header names the player and the resolved category", headerText.includes("Zezima") && headerText.includes("Tombs of Amascut"));
     check("the header shows the category's obtained/total progress", headerText.includes("4/10"));
@@ -634,6 +696,78 @@ const REAL_WORLD_HISCORES = {
 
     bot.config.collectionLogFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
+  }
+
+  // ================= findHiscoreActivityForCollectionLogPage: cross-referencing a !log category against the official Hiscores =================
+  // RuneProfile's own collection log data never includes kill counts, so !log
+  // shows them (when available) by matching the resolved category name
+  // against the SAME official Hiscores activities !kc already reads from --
+  // letting someone spot a mega-spooned (very few kills, lots of items) or
+  // cursed (tons of kills, barely any items) account from the numbers alone.
+  {
+    const hiscoreData = {
+      activities: [
+        { name: "The Hueycoatl", rank: 1226, score: 1367 }, // "The "-prefix mismatch, same as !kc's own bug fix
+        { name: "Tombs of Amascut", rank: 500, score: 42 },
+        { name: "Tombs of Amascut: Expert Mode", rank: -1, score: 0 },
+        { name: "Zulrah", rank: -1, score: 0 }, // never killed -- must NOT be reported as "0 kills recorded"
+      ],
+    };
+    check(
+      "a page name resolves against the Hiscores even across a 'The '-prefix mismatch",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Hueycoatl")?.score === 1367
+    );
+    check(
+      "an exact-name match (no prefix quirk) also resolves",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Tombs of Amascut")?.score === 42
+    );
+    check(
+      "a raid's '...: Expert Mode' collection log page name falls back to the base raid's Hiscores entry when the CM-specific one is unranked",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Tombs of Amascut: Expert Mode")?.score === 42
+    );
+    check(
+      "a Hiscores entry with 0 recorded kills (never actually killed) is treated as no match, not a real 0-kill result",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Zulrah") === null
+    );
+    check(
+      "a category with no Hiscores equivalent at all (e.g. a non-tracked minigame) resolves to null rather than crashing",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Some Untracked Minigame") === null
+    );
+    check("a missing/null hiscoreData is handled gracefully", bot.findHiscoreActivityForCollectionLogPage(null, "Zulrah") === null);
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> shows Hiscores KC/completions alongside the item count =================
+  {
+    const prevCollectionFetcher = bot.config.collectionLogFetcher;
+    const prevHiscoreFetcher = bot.config.hiscoreFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.hiscoreFetcher = async () => ({ activities: [{ name: "The Hueycoatl", rank: 1226, score: 1367 }] });
+
+    const message = makeFakeMessage({ content: "!log huey Zezima" });
+    await bot.handleOsrsStatsCommand(message);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header includes the matched Hiscores kill count for a boss category", headerText.includes("1,367"));
+    check("the header phrases it as kills/completions recorded", /kills?\/completions? recorded/i.test(headerText));
+
+    bot.config.collectionLogFetcher = prevCollectionFetcher;
+    bot.config.hiscoreFetcher = prevHiscoreFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> still works fine when there's no Hiscores match (or the lookup fails) =================
+  {
+    const prevCollectionFetcher = bot.config.collectionLogFetcher;
+    const prevHiscoreFetcher = bot.config.hiscoreFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.hiscoreFetcher = async () => { throw new Error("simulated Hiscores outage"); };
+
+    const message = makeFakeMessage({ content: "!log toa Zezima" });
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("a failed/unmatched Hiscores lookup doesn't break the !log command itself", handled === true);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header simply omits the kills/completions clause rather than crashing or showing a bogus number", !/kills?\/completions?/i.test(headerText));
+
+    bot.config.collectionLogFetcher = prevCollectionFetcher;
+    bot.config.hiscoreFetcher = prevHiscoreFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !log <category> with nothing obtained yet =================

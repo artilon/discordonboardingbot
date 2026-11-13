@@ -2764,19 +2764,23 @@ async function fetchWikiFileImages(names) {
 }
 
 /** The real network call behind fetchWikiFileImages — isolated so tests never need to hit the live wiki. */
-async function fetchWikiFileImagesLive(names) {
+// One real attempt at the live file-image lookup. Unlike a per-title "no
+// icon exists for this name" miss (a legitimate, expected result that
+// should NOT be retried), this THROWS on a whole-request failure (timeout,
+// network error, non-2xx, bad JSON) so the retry wrapper below only retries
+// genuine transient failures, not items that simply don't have a wiki icon.
+async function fetchWikiFileImagesAttempt(names, timeoutMs) {
   const fileTitles = names.map((n) => `File:${n}.png`);
   const url =
     `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
     `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   if (typeof timeout.unref === "function") timeout.unref();
 
-  const out = new Map(names.map((n) => [n, null]));
   try {
     const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
-    if (!res.ok) return out;
+    if (!res.ok) throw new Error(`wiki file-image lookup returned HTTP ${res.status}`);
     const data = await res.json();
 
     const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
@@ -2784,6 +2788,7 @@ async function fetchWikiFileImagesLive(names) {
     const pages = Object.values(data?.query?.pages || {});
     const urlByFileTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
 
+    const out = new Map(names.map((n) => [n, null]));
     for (let i = 0; i < names.length; i++) {
       let finalTitle = fileTitles[i];
       if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
@@ -2791,10 +2796,30 @@ async function fetchWikiFileImagesLive(names) {
       out.set(names[i], urlByFileTitle.get(finalTitle) || null);
     }
     return out;
-  } catch {
-    return out;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/**
+ * Live file-image lookup with one automatic retry on a whole-request
+ * failure -- added after a live report of some (but not all) item icons in
+ * the same batch intermittently failing to load, which pointed at a
+ * transient wiki/CDN hiccup under load rather than a permanently-missing
+ * icon. Also bumped the per-attempt timeout from the original 8s to 10s,
+ * since a slow-but-eventually-successful response was being cut off early.
+ */
+async function fetchWikiFileImagesLive(names) {
+  try {
+    return await fetchWikiFileImagesAttempt(names, 10000);
+  } catch (err) {
+    console.warn("[OsrsStats] Wiki file-image lookup failed, retrying once:", err.message);
+    try {
+      return await fetchWikiFileImagesAttempt(names, 10000);
+    } catch (err2) {
+      console.warn("[OsrsStats] Wiki file-image lookup failed again, giving up for this batch:", err2.message);
+      return new Map(names.map((n) => [n, null]));
+    }
   }
 }
 
@@ -3002,7 +3027,7 @@ const ITEM_GALLERY_NAME_LIST_MAX_CHARS = 3500;
  * !log <category>, which both ultimately show "which collection log items
  * does this player own, and how many of each".
  */
-async function sendItemGalleryWithImages(channel, headerText, items, warnLabel) {
+async function sendItemGalleryWithImages(channel, headerText, items, warnLabel, headerColor = COLOR.main) {
   const labels = items.map((item) => (item.quantity > 1 ? `${item.name} x${item.quantity}` : item.name));
   let truncatedNameList = labels.join(", ");
   if (truncatedNameList.length > ITEM_GALLERY_NAME_LIST_MAX_CHARS) {
@@ -3018,7 +3043,7 @@ async function sendItemGalleryWithImages(channel, headerText, items, warnLabel) 
   }
 
   const header = await channel
-    .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`${headerText} ${truncatedNameList}`)], allowedMentions: { parse: [] } })
+    .send({ embeds: [new EmbedBuilder().setColor(headerColor).setDescription(`${headerText} ${truncatedNameList}`)], allowedMentions: { parse: [] } })
     .catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} header:`, e.message));
   if (!header) return;
 
@@ -3036,11 +3061,37 @@ async function sendPetsResultWithImages(channel, rsn, pets) {
   await sendItemGalleryWithImages(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, pets, "!pets");
 }
 
-/** Posts the "!log <category>" result — see sendItemGalleryWithImages. */
-async function sendCollectionLogResultWithImages(channel, rsn, page, ownedItems) {
+/**
+ * Finds this collection log page's corresponding OSRS Hiscores activity
+ * entry (if any), so !log can show "how many kills/completions" alongside
+ * "how many items obtained" -- letting someone tell a mega-spooned (very
+ * few kills, lots of items) or cursed (tons of kills, barely any items)
+ * account apart at a glance. RuneProfile's own collection log data never
+ * includes kill counts, so this cross-references the same official OSRS
+ * Hiscores lookup !kc already uses. Not every collection log page has a
+ * Hiscores equivalent (plenty of minigames/misc categories aren't tracked
+ * there at all) -- returns null rather than guessing in that case.
+ */
+function findHiscoreActivityForCollectionLogPage(hiscoreData, pageName) {
+  const activities = hiscoreData && Array.isArray(hiscoreData.activities) ? hiscoreData.activities : [];
+  const candidateNames = [pageName, stripRaidModeSuffix(pageName)];
+  for (const candidate of candidateNames) {
+    const key = hiscoreMatchKey(candidate);
+    const entry = activities.find((a) => hiscoreMatchKey(a.name) === key);
+    if (entry && Number(entry.score) > 0) return entry;
+  }
+  return null;
+}
+
+/** Posts the "!log <category>" result — see sendItemGalleryWithImages. `hiscoreEntry` is optional, from findHiscoreActivityForCollectionLogPage. */
+async function sendCollectionLogResultWithImages(channel, rsn, page, ownedItems, hiscoreEntry) {
   const progress = Number.isFinite(page.obtained) && Number.isFinite(page.total) ? ` (**${page.obtained}/${page.total}**)` : "";
-  const header = `**${rsn}**'s **${page.name}**${progress} collection log — **${ownedItems.length}** item${ownedItems.length === 1 ? "" : "s"} obtained:`;
-  await sendItemGalleryWithImages(channel, header, ownedItems, "!log");
+  const kc = hiscoreEntry ? Number(hiscoreEntry.score) : 0;
+  const kcLine = hiscoreEntry && kc > 0 ? `, **${kc.toLocaleString()}** kill${kc === 1 ? "" : "s"}/completion${kc === 1 ? "" : "s"} recorded` : "";
+  const header = `**${rsn}**'s **${page.name}**${progress} collection log — **${ownedItems.length}** item${ownedItems.length === 1 ? "" : "s"} obtained${kcLine}:`;
+  // Colored red per request, so the category name/stats stand out distinctly
+  // from the picture gallery underneath it.
+  await sendItemGalleryWithImages(channel, header, ownedItems, "!log", COLOR.bad);
 }
 
 /**
@@ -3100,7 +3151,9 @@ async function handleOsrsStatsCommand(message) {
         .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** hasn't obtained anything from **${page.name}** yet.`)], allowedMentions: { parse: [] } })
         .catch(() => {});
     } else {
-      await sendCollectionLogResultWithImages(message.channel, parsed.rsn, page, owned);
+      const hiscoreData = await fetchPlayerHiscores(parsed.rsn).catch(() => null);
+      const hiscoreEntry = hiscoreData ? findHiscoreActivityForCollectionLogPage(hiscoreData, page.name) : null;
+      await sendCollectionLogResultWithImages(message.channel, parsed.rsn, page, owned, hiscoreEntry);
     }
     return true;
   }
@@ -8785,6 +8838,7 @@ if (require.main === module) {
 
 module.exports = {
   client,
+  COLOR,
   validateRsn,
   encodeName,
   decodeName,
@@ -9046,6 +9100,7 @@ module.exports = {
   sendItemGalleryWithImages,
   sendPetsResultWithImages,
   sendCollectionLogResultWithImages,
+  findHiscoreActivityForCollectionLogPage,
   _wikiPageImageCacheForTests: wikiPageImageCache,
   _wikiFileImageCacheForTests: wikiFileImageCache,
   // Server Privacy exports
