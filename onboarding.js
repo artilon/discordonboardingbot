@@ -4288,6 +4288,22 @@ async function logXpAwardToDiscord(memberRsn, events, totalXp, eligibleRankName)
   }
 }
 
+// Guards the final ("2nd confirmation") step of the Rank-Up and Member-Left
+// staff alerts against being processed twice for the exact same alert
+// message — e.g. a staff member double-clicking "Yes, Confirm" before the
+// alert message visibly disappears sends Discord two separate button-click
+// interactions. Checked and recorded synchronously (no `await` in between),
+// so this is race-free even for two interactions arriving back-to-back,
+// since a single Node process only runs one event handler at a time.
+// Returns true the first time a given message id is seen, false after.
+const claimedAlertConfirmations = new Set();
+function claimAlertConfirmation(messageId) {
+  if (!messageId) return true; // nothing to key on (shouldn't happen outside tests) — don't block
+  if (claimedAlertConfirmations.has(messageId)) return false;
+  claimedAlertConfirmations.add(messageId);
+  return true;
+}
+
 async function logRankUpConfirmedToDiscord({ rsn, oldRank, newRank, totalXp, staffUser }) {
   const nowUnix = Math.floor(Date.now() / 1000);
   await recordAuditLog({
@@ -7400,6 +7416,16 @@ async function onRankUpCancel(interaction, encodedRsn, targetRank) {
 
 async function onRankUpConfirm2(interaction, encodedRsn, targetRank) {
   const rsn = decodeName(encodedRsn);
+
+  // Guard against double-processing the exact same confirmation — e.g. an
+  // impatient double-click on "Yes, Confirm" before the alert message gets
+  // deleted/disabled sends two separate interactions for the same button.
+  // Without this, each one would independently promote the member again and
+  // post its own duplicate congrats announcement. See claimAlertConfirmation.
+  if (!claimAlertConfirmation(interaction.message?.id)) {
+    return interaction.deferUpdate().catch(() => {});
+  }
+
   await interaction.deferUpdate();
 
   const supabase = getSupabase();
@@ -7410,6 +7436,14 @@ async function onRankUpConfirm2(interaction, encodedRsn, targetRank) {
   if (supabase) {
     const member = await findMemberByRsn(supabase, rsn);
     if (member) {
+      // Defense in depth beyond the in-memory guard above (e.g. covers two
+      // overlapping bot processes during a deploy): if this exact alert was
+      // already resolved — its pending_alert_message_id no longer matches
+      // the message this click came from — someone else already handled it.
+      if (interaction.message?.id && member.pending_alert_message_id !== interaction.message.id) {
+        return;
+      }
+
       oldRank = member.confirmed_rank || "Bronze";
       xp = Number(member.xp) || 0;
       promotedTo = targetRank || member.eligible_rank || getRankForXp(xp).name;
@@ -7469,6 +7503,12 @@ async function onMemberLeftCancel(interaction, encodedRsn) {
 
 async function onMemberLeftConfirm2(interaction, encodedRsn) {
   const rsn = decodeName(encodedRsn);
+
+  // Same double-click guard as onRankUpConfirm2 — see claimAlertConfirmation.
+  if (!claimAlertConfirmation(interaction.message?.id)) {
+    return interaction.deferUpdate().catch(() => {});
+  }
+
   await interaction.deferUpdate();
 
   const supabase = getSupabase();
@@ -7482,6 +7522,12 @@ async function onMemberLeftConfirm2(interaction, encodedRsn) {
   if (supabase) {
     const member = await findMemberByRsn(supabase, rsn);
     if (member) {
+      // Defense in depth beyond the in-memory guard above — see the matching
+      // check in onRankUpConfirm2.
+      if (interaction.message?.id && member.pending_alert_message_id !== interaction.message.id) {
+        return;
+      }
+
       memberRecord = member;
       await supabase
         .from("clan_members")
@@ -7996,8 +8042,10 @@ module.exports = {
   buildRankUpCongratsAnnouncement,
   postRankUpCongratsAnnouncement,
   onRankUpConfirm2,
+  claimAlertConfirmation,
   buildMemberLeftAlertStep1,
   buildMemberLeftAlertStep2,
+  onMemberLeftConfirm2,
   ensureRankListMessage,
   onGrowthRangeButton,
   onRankListPageButton,
