@@ -20,38 +20,44 @@ function check(label, cond) {
   passed++;
 }
 
-// ================= Components V2 gallery test helpers =================
-// sendItemGalleryWithImages (!pets / !log <category>) posts Components V2
-// messages: a Container holding one overall header Text Display (first
-// batch only), followed by one row per item -- a Section pairing that
-// item's name/quantity/price/drop-rate label with a small Thumbnail
-// accessory of its wiki icon, right next to the text, when an icon could be
-// resolved; otherwise a bare Text Display with just the label. These
-// helpers pull the plain-JSON shape back out of a captured `_sent` entry for
-// assertions.
-function galleryContainerJSON(sentEntry) {
+// ================= Components V2 result test helpers =================
+// sendItemListMessage (!pets / !log <category>) posts Components V2
+// messages: a Container holding an optional single-item Media Gallery (the
+// one overall banner picture, !log <category> only -- !pets has none), an
+// overall header Text Display (first batch only), and an item-list Text
+// Display whose content is one line per item (name/quantity/price/
+// drop-rate label), newline-separated -- NOT a picture per item, which was
+// reported live as turning into a huge scrolling mess once an account had a
+// lot of items. These helpers pull the plain-JSON shape back out of a
+// captured `_sent` entry for assertions.
+function resultContainerJSON(sentEntry) {
   return sentEntry.payload.components[0].toJSON();
 }
-/** The overall header line -- only present on a batch that has one (always the first component when it does). */
-function galleryHeaderText(sentEntry) {
-  const first = galleryContainerJSON(sentEntry).components[0];
-  return first && first.type === ComponentType.TextDisplay ? first.content : null;
+/** The single overall banner picture's URL, or null if this message has none. */
+function resultBannerUrl(sentEntry) {
+  const gallery = resultContainerJSON(sentEntry).components.find((c) => c.type === ComponentType.MediaGallery);
+  return gallery ? gallery.items[0]?.media?.url || null : null;
+}
+function resultTextDisplays(sentEntry) {
+  return resultContainerJSON(sentEntry).components.filter((c) => c.type === ComponentType.TextDisplay);
+}
+/** The overall header line -- only present on a batch that has one (always the first Text Display when it does). */
+function resultHeaderText(sentEntry) {
+  const texts = resultTextDisplays(sentEntry);
+  return texts.length > 0 ? texts[0].content : null;
 }
 /**
- * Every per-item row in a batch, normalized to `{ text, imageUrl }` --
- * `imageUrl` is null for an item whose wiki icon couldn't be resolved.
- * `hasHeader` (default true) skips the leading header Text Display, which
- * is only present on the first batch of a multi-batch send.
+ * Every item line in a batch's item-list Text Display, split into an array
+ * -- an empty array if this batch has no items at all (a header-only
+ * message). `hasHeader` (default true) controls whether the first Text
+ * Display found is the header (so the item list is the second one, if any)
+ * or whether this batch has no header of its own (a continuation-only
+ * batch past the first message of a multi-message send).
  */
-function galleryItemRows(sentEntry, { hasHeader = true } = {}) {
-  const components = galleryContainerJSON(sentEntry).components;
-  const rows = hasHeader ? components.slice(1) : components;
-  return rows.map((row) => {
-    if (row.type === ComponentType.Section) {
-      return { text: row.components.map((c) => c.content).join("\n"), imageUrl: row.accessory?.media?.url || null };
-    }
-    return { text: row.content, imageUrl: null };
-  });
+function resultItemLines(sentEntry, { hasHeader = true } = {}) {
+  const texts = resultTextDisplays(sentEntry);
+  const itemsText = hasHeader ? texts[1] : texts[0];
+  return itemsText ? itemsText.content.split("\n") : [];
 }
 
 function makeFakeChannel() {
@@ -136,7 +142,6 @@ const REAL_WORLD_HISCORES = {
   // otherwise an earlier test's cached "no image found" result for the same
   // title would shadow a later test's differently-stubbed fetcher.
   bot.config.wikiImageFetcher = async () => new Map();
-  bot.config.wikiFileImageFetcher = async () => new Map();
   // Same idea for the GE price + wiki drop-rate lookups: no price, no rate,
   // by default. Tests that specifically exercise that behavior override
   // these locally AND reset the (permanent, process-lifetime) caches first.
@@ -368,209 +373,37 @@ const REAL_WORLD_HISCORES = {
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!pets is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("with no resolvable wiki icons (the default test stub), everything still fits in a single message", message._channel._sent.length === 1);
-    const headerText = galleryHeaderText(message._channel._sent[0]);
+    check("everything still fits in a single message", message._channel._sent.length === 1);
+    const headerText = resultHeaderText(message._channel._sent[0]);
     check("the header states the pet count", headerText.includes("2"));
-    const rows = galleryItemRows(message._channel._sent[0]);
-    check("each pet gets its own row rather than being crammed into one giant header line", rows.length === 2);
-    check("none of the rows have a thumbnail, since no wiki icon could be resolved for either pet", rows.every((r) => r.imageUrl === null));
-    check("a pet obtained once is named in its own row, without a dupe badge", rows.some((r) => r.text === "**Baby Mole**"));
-    check("a pet obtained more than once shows an 'xN' dupe count in its own row", rows.some((r) => r.text === "**Pet Zilyana** x3"));
-    check("!pets' header keeps the normal (non-red) color -- only !log's header is colored red", galleryContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.main);
+    check("!pets never shows a banner picture -- no single image represents a mixed pet list", resultBannerUrl(message._channel._sent[0]) === null);
+    const lines = resultItemLines(message._channel._sent[0]);
+    check("each pet gets its own compact text line rather than its own image/row", lines.length === 2);
+    check("a pet obtained once is named on its own line, without a dupe badge", lines.includes("**Baby Mole**"));
+    check("a pet obtained more than once shows an 'xN' dupe count on its own line", lines.includes("**Pet Zilyana** x3"));
+    check("!pets' header keeps the normal (non-red) color -- only !log's header is colored red", resultContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.main);
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
-  // ================= handleOsrsStatsCommand: !pets images come from fetchWikiFileImages, not !kc's big creature render =================
-  // !pets uses fetchWikiFileImages (an item's own detail/icon image, e.g.
-  // https://oldschool.runescape.wiki/images/Huberte.png) rather than
-  // fetchWikiPageImages (the wiki's big infobox/creature render used by !kc) --
-  // reported live as "huge and spammy" when the big renders were tried for pets.
+  // ================= handleOsrsStatsCommand: !pets with a lot of pets stays compact, with no per-pet image =================
+  // Reported live as "a huge scrolling mess" when !pets showed one image per
+  // pet: an account with ~20 pets produced an excessively long post. !pets
+  // now shows no image at all (no single picture represents a mixed pet
+  // list) and packs every pet into plain text lines instead.
   {
     const prevFetcher = bot.config.runeProfileFetcher;
-    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
     const prevWikiPageFetcher = bot.config.wikiImageFetcher;
-    bot._wikiFileImageCacheForTests.clear(); // an earlier test already cached "Baby Mole" as a miss under the default stub
-    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: [{ name: "Baby Mole", quantity: 1 }, { name: "Herbi", quantity: 1 }] });
-    bot.config.wikiFileImageFetcher = async (titles) => {
-      check("the wiki's small-icon lookup is queried with the exact pet names, in one batch", titles.length === 2 && titles.includes("Baby Mole") && titles.includes("Herbi"));
-      const m = new Map();
-      m.set("Baby Mole", "https://wiki.example/baby-mole.png");
-      m.set("Herbi", null); // simulates a pet whose wiki image couldn't be resolved
-      return m;
-    };
-    bot.config.wikiImageFetcher = async () => { throw new Error("!pets must not use the big-image (pageimages) fetcher at all"); };
+    const pets = Array.from({ length: 20 }, (_, i) => ({ name: `Pet ${i}`, quantity: 1 }));
+    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets });
+    bot.config.wikiImageFetcher = async () => { throw new Error("!pets must never look up any image at all"); };
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    check("the header and both item rows combine into one Components V2 message, since everything fits in one message", message._channel._sent.length === 1);
-    const headerText = galleryHeaderText(message._channel._sent[0]);
-    check("the header states the pet count, without listing the pets by name itself", headerText.includes("2"));
-    const rows = galleryItemRows(message._channel._sent[0]);
-    check("both pets still get their own row regardless of whether their icon resolved", rows.length === 2);
-    const babyMoleRow = rows.find((r) => r.text.includes("Baby Mole"));
-    const herbiRow = rows.find((r) => r.text.includes("Herbi"));
-    check("a pet with a resolved wiki icon shows its name/label right next to a thumbnail of its own real icon (not force-cropped square)", babyMoleRow && babyMoleRow.imageUrl === "https://wiki.example/baby-mole.png");
-    check("a pet whose wiki icon couldn't be resolved is still listed as a plain text row -- not silently dropped, and not a broken image tile", herbiRow && herbiRow.imageUrl === null);
+    check("20 pets as plain text lines comfortably fit in a single message, with no scrolling mess of per-item images", message._channel._sent.length === 1);
+    check("still no banner picture even with a large pet list", resultBannerUrl(message._channel._sent[0]) === null);
+    const lines = resultItemLines(message._channel._sent[0]);
+    check("all 20 pets are listed", lines.length === 20);
     bot.config.runeProfileFetcher = prevFetcher;
-    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
     bot.config.wikiImageFetcher = prevWikiPageFetcher;
-  }
-
-  // ================= fetchWikiFileImages: queries both the wiki's high-res "<name> detail.png" and the flat "<name>.png" icon, preferring the detail image =================
-  // Reported live: the flat inventory icon is often only ~15-40px at its
-  // real native size (e.g. Masori chaps.png is a literal 13x26 image) --
-  // fine as a full embed image, but Discord's Section Thumbnail accessory
-  // upscales whatever source it's given to fill a small fixed box, which
-  // showed up live as a blown-up, blurry, pixelated "huge"-looking image.
-  // The much-higher-resolution "detail" image (typically 500-1500px) is
-  // preferred instead, since scaling a big image DOWN to fit that box stays
-  // sharp.
-  {
-    const prevFileFetcher = bot.config.wikiFileImageFetcher;
-    delete bot.config.wikiFileImageFetcher; // exercise the real (live-call) code path, with fetch() itself stubbed
-    bot._wikiFileImageCacheForTests.clear();
-    const originalFetch = global.fetch;
-    global.fetch = async (url) => {
-      check("the live file-image lookup queries both the detail image and the flat icon as a fallback, in one request", String(url).includes("titles=File%3AHuberte%20detail.png%7CFile%3AHuberte.png"));
-      check("it asks for imageinfo/url, not pageimages", String(url).includes("prop=imageinfo") && String(url).includes("iiprop=url"));
-      return {
-        ok: true,
-        json: async () => ({
-          query: {
-            pages: {
-              "1": { title: "File:Huberte detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte_detail.png" }] },
-              "2": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] },
-            },
-          },
-        }),
-      };
-    };
-    const result = await bot.fetchWikiFileImages(["Huberte"]);
-    global.fetch = originalFetch;
-    check("resolves to the wiki's high-res detail image, not the flat icon, when both exist", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte_detail.png");
-    bot.config.wikiFileImageFetcher = prevFileFetcher;
-  }
-
-  // ================= fetchWikiFileImages: falls back to the flat icon when an item has no dedicated detail image =================
-  {
-    const prevFileFetcher = bot.config.wikiFileImageFetcher;
-    delete bot.config.wikiFileImageFetcher;
-    bot._wikiFileImageCacheForTests.clear();
-    const originalFetch = global.fetch;
-    global.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        query: {
-          pages: {
-            "-1": { title: "File:Huberte detail.png", missing: true },
-            "2": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] },
-          },
-        },
-      }),
-    });
-    const result = await bot.fetchWikiFileImages(["Huberte"]);
-    global.fetch = originalFetch;
-    check("falls back to the flat icon when the detail image doesn't exist for this item", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
-    bot.config.wikiFileImageFetcher = prevFileFetcher;
-  }
-
-  // ================= fetchWikiFileImages: a transient whole-request failure is retried once instead of giving up immediately =================
-  // Reported live: some (not all) item icons in the same !log/!pets batch
-  // intermittently failed to load, pointing at a transient wiki/CDN hiccup
-  // under load rather than permanently-missing icons.
-  {
-    const prevFileFetcher = bot.config.wikiFileImageFetcher;
-    delete bot.config.wikiFileImageFetcher;
-    bot._wikiFileImageCacheForTests.clear();
-    const originalFetch = global.fetch;
-    let callCount = 0;
-    global.fetch = async () => {
-      callCount++;
-      if (callCount === 1) throw new Error("simulated transient network failure");
-      return {
-        ok: true,
-        json: async () => ({
-          query: { pages: { "1": { title: "File:Huberte detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte_detail.png" }] } } },
-        }),
-      };
-    };
-    const result = await bot.fetchWikiFileImages(["Huberte"]);
-    global.fetch = originalFetch;
-    check("a failed first attempt is retried exactly once", callCount === 2);
-    check("the retry's success is still returned to the caller", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte_detail.png");
-    bot.config.wikiFileImageFetcher = prevFileFetcher;
-  }
-
-  // ================= fetchWikiFileImages: a genuinely missing icon (not a request failure) is NOT retried as if it were transient =================
-  {
-    const prevFileFetcher = bot.config.wikiFileImageFetcher;
-    delete bot.config.wikiFileImageFetcher;
-    bot._wikiFileImageCacheForTests.clear();
-    const originalFetch = global.fetch;
-    let callCount = 0;
-    global.fetch = async () => {
-      callCount++;
-      return {
-        ok: true,
-        json: async () => ({
-          query: {
-            pages: {
-              "-1": { title: "File:NoSuchItem detail.png", missing: true },
-              "-2": { title: "File:NoSuchItem.png", missing: true },
-            },
-          },
-        }),
-      };
-    };
-    const result = await bot.fetchWikiFileImages(["NoSuchItem"]);
-    global.fetch = originalFetch;
-    check("a clean (successful) response reporting no icon for this title is treated as a legitimate miss, not retried", callCount === 1);
-    check("the miss still resolves to null rather than throwing", result.get("NoSuchItem") === null);
-    bot.config.wikiFileImageFetcher = prevFileFetcher;
-  }
-
-  // ================= fetchWikiFileImages: two consecutive whole-request failures give up gracefully =================
-  {
-    const prevFileFetcher = bot.config.wikiFileImageFetcher;
-    delete bot.config.wikiFileImageFetcher;
-    bot._wikiFileImageCacheForTests.clear();
-    const originalFetch = global.fetch;
-    let callCount = 0;
-    global.fetch = async () => { callCount++; throw new Error("simulated persistent network failure"); };
-    const result = await bot.fetchWikiFileImages(["Huberte"]);
-    global.fetch = originalFetch;
-    check("exactly 2 attempts are made (1 initial + 1 retry), not an unbounded retry loop", callCount === 2);
-    check("after both attempts fail, the title resolves to null instead of the whole command crashing", result.get("Huberte") === null);
-    bot.config.wikiFileImageFetcher = prevFileFetcher;
-  }
-
-  // ================= fetchWikiFileImages: queries more than one item's detail+icon title pair in a single chunked request =================
-  {
-    const prevFileFetcher = bot.config.wikiFileImageFetcher;
-    delete bot.config.wikiFileImageFetcher;
-    bot._wikiFileImageCacheForTests.clear();
-    const originalFetch = global.fetch;
-    let callCount = 0;
-    global.fetch = async (url) => {
-      callCount++;
-      check("both items' title pairs are queried in one request, not one request per item", String(url).includes("Masori%20chaps") && String(url).includes("Lightbearer"));
-      return {
-        ok: true,
-        json: async () => ({
-          query: {
-            pages: {
-              "1": { title: "File:Masori chaps detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Masori_chaps_detail.png" }] },
-              "2": { title: "File:Lightbearer detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Lightbearer_detail.png" }] },
-            },
-          },
-        }),
-      };
-    };
-    const result = await bot.fetchWikiFileImages(["Masori chaps", "Lightbearer"]);
-    global.fetch = originalFetch;
-    check("exactly one HTTP request handles both items (well under the chunk size), not two separate round trips", callCount === 1);
-    check("the first item's detail image resolves correctly", result.get("Masori chaps") === "https://oldschool.runescape.wiki/images/Masori_chaps_detail.png");
-    check("the second item's detail image resolves correctly", result.get("Lightbearer") === "https://oldschool.runescape.wiki/images/Lightbearer_detail.png");
-    bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 
   // ================= formatGpAmount: formats GP the way OSRS players actually write it =================
@@ -808,28 +641,48 @@ const REAL_WORLD_HISCORES = {
     bot._wikiDropRateCacheForTests.clear();
   }
 
-  // ================= handleOsrsStatsCommand: !pets batches items across messages past the per-message component cap =================
+  // ================= batchItemListLines: packs item lines into message-sized batches under ITEM_LIST_CHAR_BUDGET =================
+  {
+    const emptyBatches = bot.batchItemListLines("Header", []);
+    check("zero items still returns at least one (empty) batch, so the header still posts on its own", emptyBatches.length === 1 && emptyBatches[0].length === 0);
+
+    const fewLines = ["**Pet 1**", "**Pet 2**", "**Pet 3**"];
+    const fewBatches = bot.batchItemListLines("Header", fewLines);
+    check("a short list that easily fits the budget stays in a single batch", fewBatches.length === 1 && fewBatches[0].length === 3);
+
+    // Build enough lines that, together with the header, comfortably bust
+    // ITEM_LIST_CHAR_BUDGET and force a split into (at least) two batches.
+    const longLine = "*".repeat(200);
+    const manyLongLines = Array.from({ length: 30 }, () => longLine); // 30 * 201 chars (incl. newline) > 3500
+    const header = "Header";
+    const splitBatches = bot.batchItemListLines(header, manyLongLines);
+    check("a list that exceeds the character budget is split into more than one batch", splitBatches.length > 1);
+    check("every single batch (all lines + header where applicable) stays under the character budget", splitBatches.every((batch, i) => {
+      const total = (i === 0 ? header.length : 0) + batch.reduce((sum, l) => sum + l.length + 1, 0);
+      return total <= bot.ITEM_LIST_CHAR_BUDGET;
+    }));
+    check("no line is lost or duplicated across the split", splitBatches.flat().length === manyLongLines.length);
+  }
+
+  // ================= handleOsrsStatsCommand: !pets batches an unusually long list across multiple messages =================
   {
     const prevFetcher = bot.config.runeProfileFetcher;
-    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
-    bot._wikiFileImageCacheForTests.clear();
-    const manyPets = Array.from({ length: 13 }, (_, i) => ({ name: `Pet ${i + 1}`, quantity: 1 }));
+    // Long names push the combined item-list text past ITEM_LIST_CHAR_BUDGET
+    // for a single message, forcing a second, header-less continuation
+    // message -- the character-budget-based equivalent of the old
+    // item-count-based batching cap.
+    const manyPets = Array.from({ length: 80 }, (_, i) => ({ name: `A Pet With A Rather Long Name Number ${i + 1}`, quantity: 1 }));
     bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: manyPets });
-    bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/\s+/g, "-").toLowerCase()}.png`]));
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    // header + first 10-item batch combine into one message, with the
-    // remaining 3 items spilling into a second, header-less message
-    // (2 messages total).
-    check("more than 10 pictured pets are split across multiple messages, respecting Discord's per-message component cap", message._channel._sent.length === 2);
-    check("the first message's header text is still present alongside its (first) item batch", galleryHeaderText(message._channel._sent[0]).includes("13"));
-    const firstBatchRows = galleryItemRows(message._channel._sent[0]);
-    const secondBatchRows = galleryItemRows(message._channel._sent[1], { hasHeader: false });
-    check("the first batch has exactly 10 item rows", firstBatchRows.length === 10);
-    check("the second, header-less message has the remaining 3 item rows", secondBatchRows.length === 3);
-    check("every item across both batches resolves to its own distinct, correctly-shaped icon url shown right next to its row (no shared-url cropping hack needed)", new Set([...firstBatchRows, ...secondBatchRows].map((r) => r.imageUrl)).size === 13);
+    check("an unusually long pet list spills into more than one message", message._channel._sent.length > 1);
+    check("the first message's header text is still present alongside its (first) item batch", resultHeaderText(message._channel._sent[0]).includes("80"));
+    const firstBatchLines = resultItemLines(message._channel._sent[0]);
+    const secondBatchLines = resultItemLines(message._channel._sent[1], { hasHeader: false });
+    check("the first batch has at least one item line", firstBatchLines.length > 0);
+    check("the second, header-less message also has item lines", secondBatchLines.length > 0);
+    check("every pet across both batches is accounted for exactly once, combined across however many messages it took", message._channel._sent.reduce((sum, sent, i) => sum + resultItemLines(sent, { hasHeader: i === 0 }).length, 0) === 80);
     bot.config.runeProfileFetcher = prevFetcher;
-    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !pets with zero pets owned =================
@@ -1033,29 +886,32 @@ const REAL_WORLD_HISCORES = {
   // ================= handleOsrsStatsCommand: !log <category> end-to-end =================
   {
     const prevFetcher = bot.config.collectionLogFetcher;
-    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
-    bot._wikiFileImageCacheForTests.clear();
+    const prevWikiPageFetcher = bot.config.wikiImageFetcher;
+    bot._wikiPageImageCacheForTests.clear();
     bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
-    bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`]));
+    bot.config.wikiImageFetcher = async (titles) => {
+      check("!log looks up the category's own boss/activity image -- the same lookup !kc already uses -- via wikiTitleForBoss", titles.length === 1 && titles[0] === "Tombs of Amascut");
+      return new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`]));
+    };
 
     const message = makeFakeMessage({ content: "!log toa Zezima" });
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!log is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("the header and both item rows combine into one Components V2 message", message._channel._sent.length === 1);
-    check("!log's header container is colored red (COLOR.bad), distinct from the item rows underneath it", galleryContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.bad);
-    const headerText = galleryHeaderText(message._channel._sent[0]);
+    check("the banner, header, and item list all combine into one Components V2 message", message._channel._sent.length === 1);
+    check("!log's container is colored red (COLOR.bad), distinct from !pets' coloring", resultContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.bad);
+    check("!log shows a single banner picture of the category's own boss/activity, resolved the same way !kc's image is", resultBannerUrl(message._channel._sent[0]) === "https://wiki.example/tombs-of-amascut.png");
+    const headerText = resultHeaderText(message._channel._sent[0]);
     check("the header names the player and the resolved category", headerText.includes("Zezima") && headerText.includes("Tombs of Amascut"));
     check("the header shows the category's obtained/total progress", headerText.includes("4/10"));
     check("the header states how many items are shown (only the owned ones), without listing them itself", headerText.includes("2") && !headerText.includes("Masori"));
-    const rows = galleryItemRows(message._channel._sent[0]);
-    check("only owned items get their own row (the unowned Osmumten's fang is excluded)", rows.length === 2);
-    check("an item obtained once is named in its own row, without a dupe badge", rows.some((r) => r.text === "**Masori mask**"));
-    check("an item obtained more than once shows its dupe count in its own row", rows.some((r) => r.text === "**Lightbearer** x2"));
-    check("each row's item name/label sits right next to that item's own wiki icon thumbnail (not force-cropped square)", rows.every((r) => typeof r.imageUrl === "string"));
+    const lines = resultItemLines(message._channel._sent[0]);
+    check("only owned items get their own line (the unowned Osmumten's fang is excluded)", lines.length === 2);
+    check("an item obtained once is named on its own line, without a dupe badge", lines.includes("**Masori mask**"));
+    check("an item obtained more than once shows its dupe count on its own line", lines.includes("**Lightbearer** x2"));
 
     bot.config.collectionLogFetcher = prevFetcher;
-    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
+    bot.config.wikiImageFetcher = prevWikiPageFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !log <category> shows GE value + drop rate in the item labels, !pets shows drop rate only =================
@@ -1081,14 +937,14 @@ const REAL_WORLD_HISCORES = {
 
     const logMessage = makeFakeMessage({ content: "!log toa Zezima" });
     await bot.handleOsrsStatsCommand(logMessage);
-    const logRows = galleryItemRows(logMessage._channel._sent[0]);
-    check("!log's item rows include a tradeable item's GE value next to its name", logRows.some((r) => r.text === "**Masori mask** — 8.5m (1/3,000)"));
-    check("!log's item rows include a dupe-count item's GE value alongside its count", logRows.some((r) => r.text === "**Lightbearer** x2 — 4.3m (1/1,500)"));
+    const logLines = resultItemLines(logMessage._channel._sent[0]);
+    check("!log's item lines include a tradeable item's GE value next to its name", logLines.includes("**Masori mask** — 8.5m (1/3,000)"));
+    check("!log's item lines include a dupe-count item's GE value alongside its count", logLines.includes("**Lightbearer** x2 — 4.3m (1/1,500)"));
 
     const petsMessage = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(petsMessage);
-    const petsRows = galleryItemRows(petsMessage._channel._sent[0]);
-    check("!pets' item rows show the drop rate but NEVER a GE value, since pets are untradeable", petsRows.some((r) => r.text === "**Baby Mole** (1/3,000)") && !petsRows.some((r) => /—/.test(r.text)));
+    const petsLines = resultItemLines(petsMessage._channel._sent[0]);
+    check("!pets' item lines show the drop rate but NEVER a GE value, since pets are untradeable", petsLines.includes("**Baby Mole** (1/3,000)") && !petsLines.some((l) => /—/.test(l)));
 
     bot.config.collectionLogFetcher = prevCollectionFetcher;
     bot.config.runeProfileFetcher = prevRuneProfileFetcher;
@@ -1146,7 +1002,7 @@ const REAL_WORLD_HISCORES = {
 
     const message = makeFakeMessage({ content: "!log huey Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    const headerText = galleryHeaderText(message._channel._sent[0]);
+    const headerText = resultHeaderText(message._channel._sent[0]);
     check("the header includes the matched Hiscores kill count for a boss category", headerText.includes("1,367"));
     check("the header phrases it as kills/completions recorded", /kills?\/completions? recorded/i.test(headerText));
 
@@ -1164,7 +1020,7 @@ const REAL_WORLD_HISCORES = {
     const message = makeFakeMessage({ content: "!log toa Zezima" });
     const handled = await bot.handleOsrsStatsCommand(message);
     check("a failed/unmatched Hiscores lookup doesn't break the !log command itself", handled === true);
-    const headerText = galleryHeaderText(message._channel._sent[0]);
+    const headerText = resultHeaderText(message._channel._sent[0]);
     check("the header simply omits the kills/completions clause rather than crashing or showing a bogus number", !/kills?\/completions?/i.test(headerText));
 
     bot.config.collectionLogFetcher = prevCollectionFetcher;

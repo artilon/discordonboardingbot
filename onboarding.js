@@ -50,16 +50,16 @@ const {
   ContainerBuilder,
   EmbedBuilder,
   GuildMemberFlags,
+  MediaGalleryBuilder,
+  MediaGalleryItemBuilder,
   MessageFlags,
   ModalBuilder,
   OverwriteType,
   PermissionFlagsBits,
-  SectionBuilder,
   StringSelectMenuBuilder,
   TextDisplayBuilder,
   TextInputBuilder,
   TextInputStyle,
-  ThumbnailBuilder,
   UserSelectMenuBuilder,
 } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
@@ -2627,18 +2627,15 @@ const WIKI_API_BASE = "https://oldschool.runescape.wiki/api.php";
 // A found image is cached indefinitely (wiki art for a given page doesn't
 // change); a miss/failure is only cached briefly so a transient wiki hiccup
 // (or a title we haven't added an override for yet) gets retried instead of
-// being "stuck" broken for the life of the process. Kept as two separate
-// caches since they're two different kinds of lookup against two different
-// MediaWiki endpoints (see fetchWikiPageImages vs fetchWikiFileImages below).
+// being "stuck" broken for the life of the process.
 const wikiPageImageCache = new Map();
-const wikiFileImageCache = new Map();
 const WIKI_IMAGE_MISS_TTL_MS = 10 * 60 * 1000;
 
 /**
- * Shared cache-then-fetch plumbing for both fetchWikiPageImages and
- * fetchWikiFileImages below. `liveFetcher(titles)` and `configFetcher`
- * (e.g. config.wikiImageFetcher) must both resolve to a Map/object of
- * title -> image URL (or null) for exactly the titles they were given.
+ * Shared cache-then-fetch plumbing for fetchWikiPageImages below.
+ * `liveFetcher(titles)` and `configFetcher` (e.g. config.wikiImageFetcher)
+ * must both resolve to a Map/object of title -> image URL (or null) for
+ * exactly the titles they were given.
  */
 async function fetchWikiImagesCached(titles, cache, configFetcher, liveFetcher) {
   const uniqueTitles = [...new Set((titles || []).map((t) => String(t || "").trim()).filter(Boolean))];
@@ -2755,120 +2752,6 @@ async function fetchWikiPageImagesLive(titles) {
   }
 }
 
-/**
- * Looks up an OSRS Wiki item/pet image for display at small size next to its
- * name in !pets / !log <category> -- as opposed to fetchWikiPageImages' big
- * infobox/creature render, a whole page of which stacked up was reported as
- * "huge and spammy". Prefers the wiki's "detail" image (file-naming
- * convention "<name> detail.png", e.g. "Masori chaps detail.png" or "Baby
- * Mole detail.png") -- a high-resolution (typically 500-1500px) "examine"
- * render -- over the flat inventory icon ("<name>.png", e.g. "Huberte.png").
- * The inventory icon is the item's actual native in-game size, often only
- * ~15-40px -- fine for a full-size embed image, but when placed in Discord's
- * Components V2 Section Thumbnail accessory (a small, fixed-size box) it was
- * reported live as a blown-up, blurry, pixelated "huge"-looking image, since
- * Discord upscales whatever source it's given to fill that box rather than
- * leaving a tiny source at its native size. The much-higher-resolution
- * detail image gets scaled DOWN to fit the same box instead, which looks
- * sharp. Falls back to the inventory icon for the rare item with no detail
- * image on the wiki. `config.wikiFileImageFetcher`, when set, replaces the
- * real HTTP call (test hook).
- */
-async function fetchWikiFileImages(names) {
-  return fetchWikiImagesCached(names, wikiFileImageCache, config.wikiFileImageFetcher, fetchWikiFileImagesLive);
-}
-
-/** Exact MediaWiki File: title for an item's detail ("examine" render) image. */
-function wikiDetailFileTitle(name) {
-  return `File:${name} detail.png`;
-}
-/** Exact MediaWiki File: title for an item's flat inventory icon (the detail image's fallback). */
-function wikiIconFileTitle(name) {
-  return `File:${name}.png`;
-}
-
-// MediaWiki doesn't document a titles-per-request cap for this wiki's API,
-// but querying 2 file titles per item (detail + icon fallback) doubles the
-// title count of a plain icon-only lookup -- chunk defensively to stay well
-// under the common 50-titles-per-query default used elsewhere in MediaWiki.
-const WIKI_FILE_IMAGE_TITLES_PER_REQUEST = 40;
-
-/** One real HTTP GET for one chunk of file titles, resolving MediaWiki's redirects/normalization back to the exact titles that were asked for. */
-async function fetchWikiFileImageTitlesChunk(fileTitles, timeoutMs) {
-  const url =
-    `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
-    `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  if (typeof timeout.unref === "function") timeout.unref();
-  try {
-    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
-    if (!res.ok) throw new Error(`wiki file-image lookup returned HTTP ${res.status}`);
-    const data = await res.json();
-
-    const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
-    const redirectMap = new Map((data?.query?.redirects || []).map((r) => [r.from, r.to]));
-    const pages = Object.values(data?.query?.pages || {});
-    const urlByResolvedTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
-
-    const out = new Map();
-    for (const originalTitle of fileTitles) {
-      let finalTitle = originalTitle;
-      if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
-      if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
-      out.set(originalTitle, urlByResolvedTitle.get(finalTitle) || null);
-    }
-    return out;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-/** The real network call behind fetchWikiFileImages — isolated so tests never need to hit the live wiki. */
-// One real attempt at the live file-image lookup. Unlike a per-title "no
-// icon exists for this name" miss (a legitimate, expected result that
-// should NOT be retried), this THROWS on a whole-request failure (timeout,
-// network error, non-2xx, bad JSON) so the retry wrapper below only retries
-// genuine transient failures, not items that simply don't have a wiki icon.
-async function fetchWikiFileImagesAttempt(names, timeoutMs) {
-  const allTitles = names.flatMap((n) => [wikiDetailFileTitle(n), wikiIconFileTitle(n)]);
-
-  const urlByFileTitle = new Map();
-  for (let i = 0; i < allTitles.length; i += WIKI_FILE_IMAGE_TITLES_PER_REQUEST) {
-    const chunk = allTitles.slice(i, i + WIKI_FILE_IMAGE_TITLES_PER_REQUEST);
-    const chunkResult = await fetchWikiFileImageTitlesChunk(chunk, timeoutMs);
-    for (const [title, imageUrl] of chunkResult) urlByFileTitle.set(title, imageUrl);
-  }
-
-  const out = new Map();
-  for (const name of names) {
-    out.set(name, urlByFileTitle.get(wikiDetailFileTitle(name)) || urlByFileTitle.get(wikiIconFileTitle(name)) || null);
-  }
-  return out;
-}
-
-/**
- * Live file-image lookup with one automatic retry on a whole-request
- * failure -- added after a live report of some (but not all) item icons in
- * the same batch intermittently failing to load, which pointed at a
- * transient wiki/CDN hiccup under load rather than a permanently-missing
- * icon. Also bumped the per-attempt timeout from the original 8s to 10s,
- * since a slow-but-eventually-successful response was being cut off early.
- */
-async function fetchWikiFileImagesLive(names) {
-  try {
-    return await fetchWikiFileImagesAttempt(names, 10000);
-  } catch (err) {
-    console.warn("[OsrsStats] Wiki file-image lookup failed, retrying once:", err.message);
-    try {
-      return await fetchWikiFileImagesAttempt(names, 10000);
-    } catch (err2) {
-      console.warn("[OsrsStats] Wiki file-image lookup failed again, giving up for this batch:", err2.message);
-      return new Map(names.map((n) => [n, null]));
-    }
-  }
-}
-
 /** Convenience single-title wrapper around fetchWikiPageImages. */
 async function fetchWikiImage(title) {
   const map = await fetchWikiPageImages([title]);
@@ -2912,9 +2795,9 @@ async function fetchGePricesJson(path, timeoutMs) {
 
 /**
  * Fetches one GE prices endpoint with one automatic retry on a whole-request
- * failure (mirrors fetchWikiFileImagesLive's retry, for the same reason --
- * a transient hiccup on a large dataset shouldn't mean "no prices at all for
- * the next several hours" since a failed fetch isn't cached). Logs on both
+ * failure (a transient hiccup on a large dataset shouldn't mean "no prices
+ * at all for the next several hours" since a failed fetch isn't cached).
+ * Logs on both
  * the retry and the final give-up so a real, ongoing problem (e.g. the
  * wiki's API rejecting requests outright) is visible in the bot's own logs
  * instead of silently showing no prices with no explanation.
@@ -3150,9 +3033,9 @@ function buildItemExtraLabel(priceText, rateText) {
 
 /**
  * Enriches {name, quantity} items with an `.extra` label (GE price and/or
- * drop rate) for sendItemGalleryWithImages to display. `includePrice`
- * should be false for !pets -- OSRS pets are untradeable, so they never
- * have a meaningful GE value.
+ * drop rate) for sendItemListMessage to display. `includePrice` should be
+ * false for !pets -- OSRS pets are untradeable, so they never have a
+ * meaningful GE value.
  */
 async function enrichItemsWithExtras(items, { includePrice, pageNameHint } = {}) {
   const names = items.map((i) => i.name);
@@ -3339,65 +3222,76 @@ async function sendRuneProfileSetupNotice(user, rsn, fallbackChannel) {
   }
 }
 
-// Each pictured item row costs 3 components (Section + its Text Display +
-// its Thumbnail accessory) towards Discord's 40-components-per-message cap;
-// an unpictured item row costs 1 (a bare Text Display); the header line and
-// the Container itself cost 1 each. Batching at 10 items per message keeps
-// every batch comfortably under that cap even in the worst case (every item
-// pictured): 1 (container) + 1 (header, first batch only) + 10*3 = 32.
-const ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE = 10;
+// A single message can't exceed Discord's 4,000-character total text budget
+// across all of its text-bearing components -- this caps how many item
+// lines go in one message before spilling into a continuation message,
+// rather than risk Discord silently rejecting an oversized payload for an
+// unusually large category (e.g. a sprawling "Rare drop table" list).
+// Deliberately conservative (well under the real 4,000 cap) to leave room
+// for the header line's own length, which varies per call.
+const ITEM_LIST_CHAR_BUDGET = 3500;
 
 /**
- * Posts one or more messages listing every `item` ({name, quantity, extra?},
- * with an "xN" dupe count where quantity > 1 and an optional trailing
- * `.extra` label, e.g. GE price / drop rate from enrichItemsWithExtras), one
- * per line, each shown next to its own OSRS Wiki item icon at a small
- * thumbnail size -- NOT one full embed card per item (reported as huge and
- * spammy), NOT a single giant comma-separated block of names up top with a
- * separate picture grid below it (reported as hard to read -- which item is
- * which?), and NOT the old "multiple embeds sharing one url" trick either
- * (that forces Discord to crop every image into a uniform square, which
- * mangled non-square icons into unrecognizable close-up slices). This uses
- * Discord's native Components V2 Section component instead, which pairs a
- * line of text directly with a small thumbnail image beside it -- so the
- * name/price/drop-rate label sits right next to the icon it describes.
- * Items with no resolvable icon are still listed as a plain text line, just
- * without a thumbnail next to them. Chunked into multiple messages if there
- * are more items than fit in one message (see
- * ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE above). Shared by !pets and
- * !log <category>, which both ultimately show "which collection log items
- * does this player own, and how many of each".
+ * Splits `lines` (one per item) into message-sized batches, each one
+ * staying under ITEM_LIST_CHAR_BUDGET once `headerText`'s own length
+ * (counted only against the first batch, since only the first message
+ * includes it) is factored in. Always returns at least one batch (possibly
+ * empty), so the header still gets posted on its own when there are zero
+ * items.
  */
-async function sendItemGalleryWithImages(channel, headerText, items, warnLabel, headerColor = COLOR.main) {
-  const images = await fetchWikiFileImages(items.map((i) => i.name)).catch(() => new Map());
-
-  // Always at least one batch, even with zero items, so the header text
-  // still gets posted on its own.
-  const batches = [];
-  for (let i = 0; i < items.length; i += ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE) {
-    batches.push(items.slice(i, i + ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE));
+function batchItemListLines(headerText, lines) {
+  const batches = [[]];
+  let currentLen = headerText.length;
+  for (const line of lines) {
+    const addedLen = line.length + 1; // +1 for the joining newline
+    if (batches[batches.length - 1].length > 0 && currentLen + addedLen > ITEM_LIST_CHAR_BUDGET) {
+      batches.push([]);
+      currentLen = 0;
+    }
+    batches[batches.length - 1].push(line);
+    currentLen += addedLen;
   }
-  if (batches.length === 0) batches.push([]);
+  return batches;
+}
+
+/**
+ * Posts one or more messages for !pets / !log <category>: an optional
+ * single banner picture of the overall thing being looked at (e.g. the
+ * Tombs of Amascut or Zulrah wiki picture for !log -- nothing for !pets,
+ * since pets span every boss/skill in the game and there's no one picture
+ * that represents "all of them"), the header line, and then every `item`
+ * ({name, quantity, extra?}, with an "xN" dupe count where quantity > 1 and
+ * an optional trailing `.extra` label -- GE price / drop rate -- from
+ * enrichItemsWithExtras) as its own compact line of plain text underneath.
+ *
+ * Every earlier attempt gave each individual item its own picture -- first
+ * a cropped same-url embed grid, then a Components V2 Media Gallery, then a
+ * small thumbnail next to each item's own row -- and every version was
+ * reported live as turning into "a huge scrolling mess" once an account had
+ * a lot of items (the common case being an account with 15-20+ pets).
+ * Showing just ONE picture for the whole result, with the per-item details
+ * as plain text lines underneath, keeps the whole thing to one short,
+ * scannable message even for a long list. Chunked into multiple messages
+ * only if the list is unusually long (see ITEM_LIST_CHAR_BUDGET above).
+ */
+async function sendItemListMessage(channel, headerText, items, { bannerImageUrl = null, headerColor = COLOR.main, warnLabel } = {}) {
+  const lines = items.map((item) => {
+    const qtyPart = item.quantity > 1 ? ` x${item.quantity}` : "";
+    const extraPart = item.extra ? ` ${item.extra}` : "";
+    return `**${item.name}**${qtyPart}${extraPart}`;
+  });
+  const batches = batchItemListLines(headerText, lines);
 
   for (let i = 0; i < batches.length; i++) {
     const container = new ContainerBuilder().setAccentColor(headerColor);
     if (i === 0) {
+      if (bannerImageUrl) {
+        container.addMediaGalleryComponents(new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(bannerImageUrl)));
+      }
       container.addTextDisplayComponents(new TextDisplayBuilder().setContent(headerText));
     }
-    for (const item of batches[i]) {
-      const qtyPart = item.quantity > 1 ? ` x${item.quantity}` : "";
-      const extraPart = item.extra ? ` ${item.extra}` : "";
-      const label = `**${item.name}**${qtyPart}${extraPart}`;
-      const imageUrl = images.get(item.name);
-      if (imageUrl) {
-        container.addSectionComponents(
-          new SectionBuilder()
-            .addTextDisplayComponents(new TextDisplayBuilder().setContent(label))
-            .setThumbnailAccessory(new ThumbnailBuilder().setURL(imageUrl).setDescription(item.name.slice(0, 256)))
-        );
-      } else {
-        container.addTextDisplayComponents(new TextDisplayBuilder().setContent(label));
-      }
+    if (batches[i].length > 0) {
+      container.addTextDisplayComponents(new TextDisplayBuilder().setContent(batches[i].join("\n")));
     }
     await channel
       .send({ components: [container], flags: MessageFlags.IsComponentsV2, allowedMentions: { parse: [] } })
@@ -3405,10 +3299,16 @@ async function sendItemGalleryWithImages(channel, headerText, items, warnLabel, 
   }
 }
 
-/** Posts the "!pets" result — see sendItemGalleryWithImages. No GE price (pets are untradeable); drop rate only, where the wiki has one on file. */
-async function sendPetsResultWithImages(channel, rsn, pets) {
+/**
+ * Posts the "!pets" result — see sendItemListMessage. No banner picture
+ * (pets span every boss/skill in the game, so there's no single image that
+ * represents "all of them" the way a boss's own wiki picture does for
+ * !log); no GE price either (pets are untradeable); drop rate only, where
+ * the wiki has one on file.
+ */
+async function sendPetsResult(channel, rsn, pets) {
   const enriched = await enrichItemsWithExtras(pets, { includePrice: false });
-  await sendItemGalleryWithImages(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, enriched, "!pets");
+  await sendItemListMessage(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, enriched, { warnLabel: "!pets" });
 }
 
 /**
@@ -3434,23 +3334,28 @@ function findHiscoreActivityForCollectionLogPage(hiscoreData, pageName) {
 }
 
 /**
- * Posts the "!log <category>" result — see sendItemGalleryWithImages.
+ * Posts the "!log <category>" result — see sendItemListMessage.
  * `hiscoreEntry` is optional, from findHiscoreActivityForCollectionLogPage.
  * Items are enriched with their current GE value (scoped by item name, since
  * price isn't source-specific) and the wiki's listed drop rate for THIS
  * specific source (scoped by `page.name`, so e.g. an item obtainable from
  * multiple places shows the rate for the boss/category actually being
- * looked at here, not some unrelated source of the same item).
+ * looked at here, not some unrelated source of the same item). The banner
+ * picture is the category's own OSRS Wiki picture (the same lookup !kc uses
+ * for a boss, since a collection log category name is almost always the
+ * exact same boss/raid/minigame name) -- one picture for the whole result,
+ * not one per item.
  */
-async function sendCollectionLogResultWithImages(channel, rsn, page, ownedItems, hiscoreEntry) {
+async function sendCollectionLogResult(channel, rsn, page, ownedItems, hiscoreEntry) {
   const progress = Number.isFinite(page.obtained) && Number.isFinite(page.total) ? ` (**${page.obtained}/${page.total}**)` : "";
   const kc = hiscoreEntry ? Number(hiscoreEntry.score) : 0;
   const kcLine = hiscoreEntry && kc > 0 ? `, **${kc.toLocaleString()}** kill${kc === 1 ? "" : "s"}/completion${kc === 1 ? "" : "s"} recorded` : "";
   const header = `**${rsn}**'s **${page.name}**${progress} collection log — **${ownedItems.length}** item${ownedItems.length === 1 ? "" : "s"} obtained${kcLine}:`;
   const enriched = await enrichItemsWithExtras(ownedItems, { includePrice: true, pageNameHint: page.name });
+  const bannerImageUrl = await fetchWikiImage(wikiTitleForBoss(page.name)).catch(() => null);
   // Colored red per request, so the category name/stats stand out distinctly
-  // from the picture gallery underneath it.
-  await sendItemGalleryWithImages(channel, header, enriched, "!log", COLOR.bad);
+  // from the item list underneath it.
+  await sendItemListMessage(channel, header, enriched, { bannerImageUrl, headerColor: COLOR.bad, warnLabel: "!log" });
 }
 
 /**
@@ -3480,7 +3385,7 @@ async function handleOsrsStatsCommand(message) {
         .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** doesn't have any pets logged on RuneProfile yet.`)], allowedMentions: { parse: [] } })
         .catch(() => {});
     } else {
-      await sendPetsResultWithImages(message.channel, parsed.rsn, result.pets);
+      await sendPetsResult(message.channel, parsed.rsn, result.pets);
     }
     return true;
   }
@@ -3512,7 +3417,7 @@ async function handleOsrsStatsCommand(message) {
     } else {
       const hiscoreData = await fetchPlayerHiscores(parsed.rsn).catch(() => null);
       const hiscoreEntry = hiscoreData ? findHiscoreActivityForCollectionLogPage(hiscoreData, page.name) : null;
-      await sendCollectionLogResultWithImages(message.channel, parsed.rsn, page, owned, hiscoreEntry);
+      await sendCollectionLogResult(message.channel, parsed.rsn, page, owned, hiscoreEntry);
     }
     return true;
   }
@@ -9454,11 +9359,12 @@ module.exports = {
   wikiTitleForSkill,
   stripRaidModeSuffix,
   fetchWikiPageImages,
-  fetchWikiFileImages,
   fetchWikiImage,
-  sendItemGalleryWithImages,
-  sendPetsResultWithImages,
-  sendCollectionLogResultWithImages,
+  sendItemListMessage,
+  sendPetsResult,
+  sendCollectionLogResult,
+  batchItemListLines,
+  ITEM_LIST_CHAR_BUDGET,
   findHiscoreActivityForCollectionLogPage,
   // GE price + wiki drop-rate lookups for !log (price) / !pets & !log (drop rate)
   fetchGeItemMapping,
@@ -9474,7 +9380,6 @@ module.exports = {
   _resetGePriceCachesForTests: () => { geItemMappingCache = null; geLatestPricesCache = null; },
   _wikiDropRateCacheForTests: wikiDropRateCache,
   _wikiPageImageCacheForTests: wikiPageImageCache,
-  _wikiFileImageCacheForTests: wikiFileImageCache,
   // Server Privacy exports
   CLAN_FRIEND_ROLE_ID,
   SOCIAL_CHATTER_ROLE_ID,
