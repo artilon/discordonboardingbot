@@ -50,14 +50,14 @@ const {
   ContainerBuilder,
   EmbedBuilder,
   GuildMemberFlags,
-  MediaGalleryBuilder,
-  MediaGalleryItemBuilder,
   MessageFlags,
   ModalBuilder,
   OverwriteType,
   PermissionFlagsBits,
+  SectionBuilder,
   StringSelectMenuBuilder,
   TextDisplayBuilder,
+  ThumbnailBuilder,
   TextInputBuilder,
   TextInputStyle,
   UserSelectMenuBuilder,
@@ -2758,6 +2758,103 @@ async function fetchWikiImage(title) {
   return map.get(title) || null;
 }
 
+// Resolved item name -> { url: string|null, expiresAt }, separate from
+// wikiPageImageCache above since this looks up a different kind of image
+// (an item's own small picture, by File: title) via a different MediaWiki
+// endpoint -- see fetchWikiItemImage below.
+const wikiItemImageCache = new Map();
+
+/** Exact MediaWiki File: title for an item's detail ("examine" render) image. */
+function wikiDetailFileTitle(name) {
+  return `File:${name} detail.png`;
+}
+/** Exact MediaWiki File: title for an item's flat inventory icon (the detail image's fallback). */
+function wikiIconFileTitle(name) {
+  return `File:${name}.png`;
+}
+
+/** One real HTTP GET resolving a set of File: titles to their image URLs, following MediaWiki's redirects/normalization back to the exact titles that were asked for. */
+async function fetchWikiFileTitlesChunk(fileTitles, timeoutMs) {
+  const url =
+    `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
+    `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof timeout.unref === "function") timeout.unref();
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
+    if (!res.ok) throw new Error(`wiki file-image lookup returned HTTP ${res.status}`);
+    const data = await res.json();
+
+    const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
+    const redirectMap = new Map((data?.query?.redirects || []).map((r) => [r.from, r.to]));
+    const pages = Object.values(data?.query?.pages || {});
+    const urlByResolvedTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
+
+    const out = new Map();
+    for (const originalTitle of fileTitles) {
+      let finalTitle = originalTitle;
+      if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
+      if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
+      out.set(originalTitle, urlByResolvedTitle.get(finalTitle) || null);
+    }
+    return out;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** One real attempt at the live single-item image lookup -- queries both the detail image and the flat icon fallback for `name` in one request. */
+async function fetchWikiItemImageAttempt(name, timeoutMs) {
+  const urlByFileTitle = await fetchWikiFileTitlesChunk([wikiDetailFileTitle(name), wikiIconFileTitle(name)], timeoutMs);
+  return urlByFileTitle.get(wikiDetailFileTitle(name)) || urlByFileTitle.get(wikiIconFileTitle(name)) || null;
+}
+
+/** Live single-item image lookup with one automatic retry on a whole-request failure (network hiccup, timeout, bad JSON), mirroring the resilience of the other wiki lookups in this file. */
+async function fetchWikiItemImageLive(name) {
+  try {
+    return await fetchWikiItemImageAttempt(name, 10000);
+  } catch (err) {
+    console.warn(`[OsrsStats] Wiki item-image lookup failed for "${name}", retrying once:`, err.message);
+    try {
+      return await fetchWikiItemImageAttempt(name, 10000);
+    } catch (err2) {
+      console.warn(`[OsrsStats] Wiki item-image lookup failed again for "${name}", giving up:`, err2.message);
+      return null;
+    }
+  }
+}
+
+/**
+ * Looks up a single item's own picture -- used for !pets' banner picture
+ * (the rarest pet someone owns, since a mixed pet list has no single
+ * "overall" picture the way a boss has for !log). Prefers the wiki's
+ * higher-resolution "detail" (examine) image over the tiny flat inventory
+ * icon, for the same reason the banner picture is shown as a small
+ * Thumbnail accessory rather than full-size: Discord's Thumbnail box
+ * upscales (and blurs/pixelates) a too-small source image, so the
+ * much-larger detail render gets scaled DOWN into that box instead, which
+ * stays sharp. Falls back to the flat icon for the rare item with no
+ * dedicated detail image on the wiki. `config.wikiItemImageFetcher`, when
+ * set, replaces the real HTTP call (test hook) -- receives a single name,
+ * returns its image URL or null.
+ */
+async function fetchWikiItemImage(name) {
+  const now = Date.now();
+  const cacheKey = normalizeHiscoreName(name);
+  const cached = wikiItemImageCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.url;
+
+  let url = null;
+  try {
+    url = typeof config.wikiItemImageFetcher === "function" ? await config.wikiItemImageFetcher(name) : await fetchWikiItemImageLive(name);
+  } catch (e) {
+    console.warn(`[OsrsStats] Wiki item-image lookup failed for "${name}":`, e.message);
+  }
+  wikiItemImageCache.set(cacheKey, { url, expiresAt: now + (url ? Number.POSITIVE_INFINITY : WIKI_IMAGE_MISS_TTL_MS) });
+  return url;
+}
+
 // ================= GE prices (for !log item values) =================
 // The OSRS Wiki's real-time price API, built on real Jagex trade data. Its
 // acceptable-use policy asks for a descriptive User-Agent, hence the same
@@ -2875,10 +2972,13 @@ async function fetchGeLatestPrices() {
  */
 async function fetchGePrices(names) {
   const out = new Map();
-  const mapping = await fetchGeItemMapping().catch(() => null);
-  if (!mapping) return out;
-  const latest = await fetchGeLatestPrices().catch(() => null);
-  if (!latest) return out;
+  // These two datasets are independent of each other -- fetched
+  // concurrently rather than one after the other, since on a cold cache
+  // (the common case right after the process starts, or once every 5
+  // minutes when the latest-price TTL expires) that was needlessly adding
+  // both calls' latency together instead of just the slower one's.
+  const [mapping, latest] = await Promise.all([fetchGeItemMapping().catch(() => null), fetchGeLatestPrices().catch(() => null)]);
+  if (!mapping || !latest) return out;
   for (const name of names) {
     const id = mapping.get(normalizeHiscoreName(name));
     if (id == null) continue;
@@ -3013,20 +3113,94 @@ async function fetchWikiDropRate(itemName, pageNameHint) {
   return rate;
 }
 
-/** Looks up drop rates for every name in `names`, scoped to the same optional `pageNameHint`. Returns a Map of name -> rarity string (only for names where one was found). */
+/**
+ * Runs async `fn(item, index)` across `items` with at most `concurrency` in
+ * flight at once. A plain `Promise.all` would fire every request at the
+ * same instant -- fine for a handful of items, but an earlier version of
+ * !log/!pets did each item's drop-rate lookup one at a time in a sequential
+ * loop, which was reported live as "pretty slow" for any category with more
+ * than a few items (a 13-item category like Tombs of Amascut meant 13
+ * sequential network round trips). Capping (rather than removing) the
+ * concurrency avoids firing an unbounded burst of simultaneous requests at
+ * the wiki's API for an unusually long list, e.g. an account with 80+ pets.
+ */
+async function mapWithConcurrency(items, concurrency, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
+
+/**
+ * Looks up drop rates for every name in `names`, scoped to the same
+ * optional `pageNameHint`. Returns a Map of name -> rarity string (only for
+ * names where one was found). Runs lookups concurrently (see
+ * mapWithConcurrency) rather than one at a time -- each item's own
+ * fetchWikiDropRate call already short-circuits via the cache for anything
+ * already resolved, so this only ever pays real network latency for
+ * genuinely new items, and pays it in parallel instead of serially.
+ */
 async function fetchWikiDropRates(names, pageNameHint) {
   const out = new Map();
-  for (const name of names) {
-    const rate = await fetchWikiDropRate(name, pageNameHint).catch(() => null);
-    if (rate) out.set(name, rate);
-  }
+  const rates = await mapWithConcurrency(names, 10, (name) => fetchWikiDropRate(name, pageNameHint).catch(() => null));
+  names.forEach((name, i) => {
+    if (rates[i]) out.set(name, rates[i]);
+  });
   return out;
 }
 
-/** Combines an optional GE-price string and an optional drop-rate string into one trailing label, e.g. "— 4.3m (1/512)". */
-function buildItemExtraLabel(priceText, rateText) {
+/**
+ * Extracts the "N" from a wiki rarity string like "1/5,000" as a plain
+ * number, for comparing how rare two items are (a bigger N is rarer).
+ * Returns null for a rarity label that isn't a plain "1/N" fraction (e.g.
+ * "Always", "Varies") -- those aren't meaningfully comparable this way.
+ */
+function parseDropRateDenominator(rateText) {
+  if (!rateText) return null;
+  const match = String(rateText).replace(/,/g, "").match(/^1\s*\/\s*([\d.]+)/);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * Picks the name of the single rarest item in `items` (the one with the
+ * lowest drop probability, i.e. the largest "1/N" denominator) using
+ * `rates` (name -> rarity string, as from fetchWikiDropRates). Used to pick
+ * !pets' one banner picture -- a mixed pet list has no single picture that
+ * represents "all of them" the way a boss's own picture does for !log, but
+ * the rarest pet someone actually owns is a natural, meaningful highlight
+ * instead. Items with no comparable rarity on file (e.g. most skilling
+ * pets, which aren't modeled as a "drop" at all) are skipped; returns null
+ * if none of `items` have a comparable rarity.
+ */
+function findRarestItemName(items, rates) {
+  let rarestName = null;
+  let rarestDenominator = -Infinity;
+  for (const item of items) {
+    const denominator = parseDropRateDenominator(rates.get(item.name));
+    if (denominator !== null && denominator > rarestDenominator) {
+      rarestDenominator = denominator;
+      rarestName = item.name;
+    }
+  }
+  return rarestName;
+}
+
+/**
+ * Combines an optional GE-price string and an optional drop-rate string
+ * into one trailing label, e.g. "— 4.3m (1/512)". When `quantity` is more
+ * than 1, the price gets an "ea" qualifier ("— 4.3m ea (1/512)") so it's
+ * unambiguous that the shown price is per item, not a total for however
+ * many of that item are owned.
+ */
+function buildItemExtraLabel(priceText, rateText, quantity = 1) {
   const parts = [];
-  if (priceText) parts.push(`— ${priceText}`);
+  if (priceText) parts.push(`— ${priceText}${quantity > 1 ? " ea" : ""}`);
   if (rateText) parts.push(`(${rateText})`);
   return parts.join(" ");
 }
@@ -3046,7 +3220,7 @@ async function enrichItemsWithExtras(items, { includePrice, pageNameHint } = {})
   return items.map((item) => {
     const priceText = includePrice ? formatGpAmount(prices.get(item.name)) : null;
     const rateText = rates.get(item.name) || null;
-    const extra = buildItemExtraLabel(priceText, rateText);
+    const extra = buildItemExtraLabel(priceText, rateText, item.quantity);
     return extra ? { ...item, extra } : item;
   });
 }
@@ -3257,11 +3431,10 @@ function batchItemListLines(headerText, lines) {
 /**
  * Posts one or more messages for !pets / !log <category>: an optional
  * single banner picture of the overall thing being looked at (e.g. the
- * Tombs of Amascut or Zulrah wiki picture for !log -- nothing for !pets,
- * since pets span every boss/skill in the game and there's no one picture
- * that represents "all of them"), the header line, and then every `item`
- * ({name, quantity, extra?}, with an "xN" dupe count where quantity > 1 and
- * an optional trailing `.extra` label -- GE price / drop rate -- from
+ * Tombs of Amascut or Zulrah wiki picture for !log, or the rarest pet in
+ * the list for !pets), the header line, and then every `item` ({name,
+ * quantity, extra?}, with an "xN" dupe count where quantity > 1 and an
+ * optional trailing `.extra` label -- GE price / drop rate -- from
  * enrichItemsWithExtras) as its own compact line of plain text underneath.
  *
  * Every earlier attempt gave each individual item its own picture -- first
@@ -3273,6 +3446,14 @@ function batchItemListLines(headerText, lines) {
  * as plain text lines underneath, keeps the whole thing to one short,
  * scannable message even for a long list. Chunked into multiple messages
  * only if the list is unusually long (see ITEM_LIST_CHAR_BUDGET above).
+ *
+ * The banner picture is rendered as a Section's small Thumbnail accessory
+ * (next to the header text) rather than a full-width Media Gallery --
+ * reported live as rendering far too large/dominant, especially for a
+ * simple boss logo image. A Thumbnail accessory is a fixed small box
+ * Discord scales any source image down to fit, which both caps its size on
+ * screen and (per the same finding that drove the detail-image preference
+ * elsewhere) stays sharp rather than blurring up a small source.
  */
 async function sendItemListMessage(channel, headerText, items, { bannerImageUrl = null, headerColor = COLOR.main, warnLabel } = {}) {
   const lines = items.map((item) => {
@@ -3286,9 +3467,14 @@ async function sendItemListMessage(channel, headerText, items, { bannerImageUrl 
     const container = new ContainerBuilder().setAccentColor(headerColor);
     if (i === 0) {
       if (bannerImageUrl) {
-        container.addMediaGalleryComponents(new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(bannerImageUrl)));
+        container.addSectionComponents(
+          new SectionBuilder()
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(headerText))
+            .setThumbnailAccessory(new ThumbnailBuilder().setURL(bannerImageUrl))
+        );
+      } else {
+        container.addTextDisplayComponents(new TextDisplayBuilder().setContent(headerText));
       }
-      container.addTextDisplayComponents(new TextDisplayBuilder().setContent(headerText));
     }
     if (batches[i].length > 0) {
       container.addTextDisplayComponents(new TextDisplayBuilder().setContent(batches[i].join("\n")));
@@ -3300,15 +3486,27 @@ async function sendItemListMessage(channel, headerText, items, { bannerImageUrl 
 }
 
 /**
- * Posts the "!pets" result — see sendItemListMessage. No banner picture
- * (pets span every boss/skill in the game, so there's no single image that
- * represents "all of them" the way a boss's own wiki picture does for
- * !log); no GE price either (pets are untradeable); drop rate only, where
- * the wiki has one on file.
+ * Posts the "!pets" result — see sendItemListMessage. No GE price (pets are
+ * untradeable); drop rate only, where the wiki has one on file. The banner
+ * picture is the rarest pet in the list (see findRarestItemName) -- a mixed
+ * pet list has no single picture that represents "all of them" the way a
+ * boss's own wiki picture does for !log, but the rarest pet someone owns is
+ * a natural highlight instead. Falls back to no banner picture at all if
+ * none of the pets have a comparable rarity on file.
  */
 async function sendPetsResult(channel, rsn, pets) {
-  const enriched = await enrichItemsWithExtras(pets, { includePrice: false });
-  await sendItemListMessage(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, enriched, { warnLabel: "!pets" });
+  const names = pets.map((p) => p.name);
+  // Looked up directly (rather than via enrichItemsWithExtras) since the
+  // raw rates are also needed here to pick the rarest pet for the banner
+  // picture, not just the formatted label text.
+  const rates = await fetchWikiDropRates(names).catch(() => new Map());
+  const enriched = pets.map((pet) => {
+    const extra = buildItemExtraLabel(null, rates.get(pet.name) || null, pet.quantity);
+    return extra ? { ...pet, extra } : pet;
+  });
+  const rarestName = findRarestItemName(pets, rates);
+  const bannerImageUrl = rarestName ? await fetchWikiItemImage(rarestName).catch(() => null) : null;
+  await sendItemListMessage(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, enriched, { bannerImageUrl, warnLabel: "!pets" });
 }
 
 /**
@@ -3333,26 +3531,101 @@ function findHiscoreActivityForCollectionLogPage(hiscoreData, pageName) {
   return null;
 }
 
+// The three raids whose Hiscores track a separately-counted harder
+// difficulty as its own activity, even though their collection log merges
+// every difficulty's loot into ONE page (so e.g. !log toa's item list
+// covers normal/entry/expert all at once -- there's no separate "expert
+// mode" collection log page to resolve against). Confirmed against the
+// real OSRS Hiscores activity list: "Chambers of Xeric: Challenge Mode",
+// "Theatre of Blood: Hard Mode", "Tombs of Amascut: Expert Mode".
+const RAID_HISCORE_HARD_MODE_LABEL = {
+  [normalizeStatToken("Chambers of Xeric")]: "Challenge Mode",
+  [normalizeStatToken("Theatre of Blood")]: "Hard Mode",
+  [normalizeStatToken("Tombs of Amascut")]: "Expert Mode",
+};
+
+/**
+ * An EXACT (no base-raid fallback) Hiscores activity name lookup -- unlike
+ * findHiscoreActivityForCollectionLogPage, which deliberately falls back to
+ * a raid's base-mode entry when queried with a suffixed name that isn't
+ * itself ranked (so a !log category named with a mode suffix still shows
+ * SOME completions line). That fallback is wrong for finding a raid's
+ * harder-difficulty entry specifically: if the harder difficulty has never
+ * been completed, this must resolve to null, not silently substitute the
+ * base raid's own (unrelated) completion count as if it were the harder
+ * difficulty's.
+ */
+function findHiscoreActivityExact(hiscoreData, activityName) {
+  const activities = hiscoreData && Array.isArray(hiscoreData.activities) ? hiscoreData.activities : [];
+  const key = hiscoreMatchKey(activityName);
+  const entry = activities.find((a) => hiscoreMatchKey(a.name) === key);
+  return entry && Number(entry.score) > 0 ? entry : null;
+}
+
+/**
+ * Looks up BOTH a collection log page's normal-mode Hiscores entry (see
+ * findHiscoreActivityForCollectionLogPage) AND, for the three raids above,
+ * that raid's separately-tracked harder-difficulty entry -- so !log can
+ * show both completion counts side by side (e.g. "150 normal / 80 expert")
+ * instead of only ever showing the normal-mode count for a raid where the
+ * harder difficulty is a meaningfully different (and often much rarer)
+ * accomplishment. Returns `{ normal, hardMode, hardModeLabel }`;
+ * `hardMode`/`hardModeLabel` are null for anything that isn't one of these
+ * three raids, or when that raid's harder difficulty has never actually
+ * been completed.
+ */
+function findHiscoreActivitiesForCollectionLogPage(hiscoreData, pageName) {
+  const normal = findHiscoreActivityForCollectionLogPage(hiscoreData, pageName);
+  const basePageName = stripRaidModeSuffix(pageName);
+  const hardModeLabel = RAID_HISCORE_HARD_MODE_LABEL[normalizeStatToken(basePageName)] || null;
+  const hardMode = hardModeLabel ? findHiscoreActivityExact(hiscoreData, `${basePageName}: ${hardModeLabel}`) : null;
+  return { normal, hardMode, hardModeLabel };
+}
+
+/**
+ * Builds the trailing ", N kills/completions recorded" header clause from
+ * the result of findHiscoreActivitiesForCollectionLogPage. For an ordinary
+ * boss/activity (no harder difficulty to merge in), or a raid where the
+ * harder difficulty has never been completed, this is unchanged from
+ * before: a single plain count. For one of the three raids where the
+ * harder difficulty HAS been completed, both counts are shown side by side
+ * instead, labeled by difficulty.
+ */
+function formatHiscoreCompletionsClause({ normal, hardMode, hardModeLabel }) {
+  if (hardModeLabel && hardMode) {
+    const normalScore = normal ? Number(normal.score) : 0;
+    const hardScore = Number(hardMode.score);
+    return `, **${normalScore.toLocaleString()}** normal / **${hardScore.toLocaleString()}** ${hardModeLabel} kills/completions recorded`;
+  }
+  if (!normal) return "";
+  const kc = Number(normal.score);
+  return `, **${kc.toLocaleString()}** kill${kc === 1 ? "" : "s"}/completion${kc === 1 ? "" : "s"} recorded`;
+}
+
 /**
  * Posts the "!log <category>" result — see sendItemListMessage.
- * `hiscoreEntry` is optional, from findHiscoreActivityForCollectionLogPage.
- * Items are enriched with their current GE value (scoped by item name, since
- * price isn't source-specific) and the wiki's listed drop rate for THIS
- * specific source (scoped by `page.name`, so e.g. an item obtainable from
- * multiple places shows the rate for the boss/category actually being
- * looked at here, not some unrelated source of the same item). The banner
- * picture is the category's own OSRS Wiki picture (the same lookup !kc uses
- * for a boss, since a collection log category name is almost always the
- * exact same boss/raid/minigame name) -- one picture for the whole result,
- * not one per item.
+ * `hiscoreActivities` is from findHiscoreActivitiesForCollectionLogPage (may
+ * be `{ normal: null, hardMode: null, hardModeLabel: null }` if there's no
+ * Hiscores match at all). Items are enriched with their current GE value
+ * (scoped by item name, since price isn't source-specific) and the wiki's
+ * listed drop rate for THIS specific source (scoped by `page.name`, so e.g.
+ * an item obtainable from multiple places shows the rate for the
+ * boss/category actually being looked at here, not some unrelated source of
+ * the same item). The banner picture is the category's own OSRS Wiki
+ * picture (the same lookup !kc uses for a boss, since a collection log
+ * category name is almost always the exact same boss/raid/minigame name) --
+ * one picture for the whole result, not one per item. The GE-price lookup
+ * and the banner-picture lookup are independent of each other, so they run
+ * concurrently rather than one after the other.
  */
-async function sendCollectionLogResult(channel, rsn, page, ownedItems, hiscoreEntry) {
+async function sendCollectionLogResult(channel, rsn, page, ownedItems, hiscoreActivities) {
   const progress = Number.isFinite(page.obtained) && Number.isFinite(page.total) ? ` (**${page.obtained}/${page.total}**)` : "";
-  const kc = hiscoreEntry ? Number(hiscoreEntry.score) : 0;
-  const kcLine = hiscoreEntry && kc > 0 ? `, **${kc.toLocaleString()}** kill${kc === 1 ? "" : "s"}/completion${kc === 1 ? "" : "s"} recorded` : "";
+  const kcLine = formatHiscoreCompletionsClause(hiscoreActivities || {});
   const header = `**${rsn}**'s **${page.name}**${progress} collection log — **${ownedItems.length}** item${ownedItems.length === 1 ? "" : "s"} obtained${kcLine}:`;
-  const enriched = await enrichItemsWithExtras(ownedItems, { includePrice: true, pageNameHint: page.name });
-  const bannerImageUrl = await fetchWikiImage(wikiTitleForBoss(page.name)).catch(() => null);
+  const [enriched, bannerImageUrl] = await Promise.all([
+    enrichItemsWithExtras(ownedItems, { includePrice: true, pageNameHint: page.name }),
+    fetchWikiImage(wikiTitleForBoss(page.name)).catch(() => null),
+  ]);
   // Colored red per request, so the category name/stats stand out distinctly
   // from the item list underneath it.
   await sendItemListMessage(channel, header, enriched, { bannerImageUrl, headerColor: COLOR.bad, warnLabel: "!log" });
@@ -3391,7 +3664,11 @@ async function handleOsrsStatsCommand(message) {
   }
 
   if (parsed.type === "log") {
-    const result = await fetchRuneProfileCollectionLog(parsed.rsn);
+    // The collection log and the Hiscores are two entirely separate
+    // RuneProfile/Jagex lookups for the same RSN -- fetched concurrently
+    // rather than one after the other, since the Hiscores result doesn't
+    // depend on the collection log result at all.
+    const [result, hiscoreData] = await Promise.all([fetchRuneProfileCollectionLog(parsed.rsn), fetchPlayerHiscores(parsed.rsn).catch(() => null)]);
     if (result.notFound) {
       await sendRuneProfileSetupNotice(message.author, parsed.rsn, message.channel);
       return true;
@@ -3415,9 +3692,8 @@ async function handleOsrsStatsCommand(message) {
         .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** hasn't obtained anything from **${page.name}** yet.`)], allowedMentions: { parse: [] } })
         .catch(() => {});
     } else {
-      const hiscoreData = await fetchPlayerHiscores(parsed.rsn).catch(() => null);
-      const hiscoreEntry = hiscoreData ? findHiscoreActivityForCollectionLogPage(hiscoreData, page.name) : null;
-      await sendCollectionLogResult(message.channel, parsed.rsn, page, owned, hiscoreEntry);
+      const hiscoreActivities = hiscoreData ? findHiscoreActivitiesForCollectionLogPage(hiscoreData, page.name) : {};
+      await sendCollectionLogResult(message.channel, parsed.rsn, page, owned, hiscoreActivities);
     }
     return true;
   }
@@ -9360,12 +9636,15 @@ module.exports = {
   stripRaidModeSuffix,
   fetchWikiPageImages,
   fetchWikiImage,
+  fetchWikiItemImage,
   sendItemListMessage,
   sendPetsResult,
   sendCollectionLogResult,
   batchItemListLines,
   ITEM_LIST_CHAR_BUDGET,
   findHiscoreActivityForCollectionLogPage,
+  findHiscoreActivitiesForCollectionLogPage,
+  formatHiscoreCompletionsClause,
   // GE price + wiki drop-rate lookups for !log (price) / !pets & !log (drop rate)
   fetchGeItemMapping,
   fetchGeLatestPrices,
@@ -9375,11 +9654,15 @@ module.exports = {
   fetchWikiDropRates,
   buildItemExtraLabel,
   enrichItemsWithExtras,
+  parseDropRateDenominator,
+  findRarestItemName,
+  mapWithConcurrency,
   _geItemMappingCacheForTests: () => geItemMappingCache,
   _geLatestPricesCacheForTests: () => geLatestPricesCache,
   _resetGePriceCachesForTests: () => { geItemMappingCache = null; geLatestPricesCache = null; },
   _wikiDropRateCacheForTests: wikiDropRateCache,
   _wikiPageImageCacheForTests: wikiPageImageCache,
+  _wikiItemImageCacheForTests: wikiItemImageCache,
   // Server Privacy exports
   CLAN_FRIEND_ROLE_ID,
   SOCIAL_CHATTER_ROLE_ID,
