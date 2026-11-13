@@ -380,9 +380,9 @@ const REAL_WORLD_HISCORES = {
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
-  // ================= handleOsrsStatsCommand: !pets images come from the OSRS Wiki's small item icon, not the big creature render =================
-  // !pets uses fetchWikiFileImages (the wiki's small "<Item name>.png" inventory
-  // icon, e.g. https://oldschool.runescape.wiki/images/Huberte.png) rather than
+  // ================= handleOsrsStatsCommand: !pets images come from fetchWikiFileImages, not !kc's big creature render =================
+  // !pets uses fetchWikiFileImages (an item's own detail/icon image, e.g.
+  // https://oldschool.runescape.wiki/images/Huberte.png) rather than
   // fetchWikiPageImages (the wiki's big infobox/creature render used by !kc) --
   // reported live as "huge and spammy" when the big renders were tried for pets.
   {
@@ -415,25 +415,61 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiImageFetcher = prevWikiPageFetcher;
   }
 
-  // ================= fetchWikiFileImages: queries the wiki's File: namespace with the exact "<name>.png" convention =================
+  // ================= fetchWikiFileImages: queries both the wiki's high-res "<name> detail.png" and the flat "<name>.png" icon, preferring the detail image =================
+  // Reported live: the flat inventory icon is often only ~15-40px at its
+  // real native size (e.g. Masori chaps.png is a literal 13x26 image) --
+  // fine as a full embed image, but Discord's Section Thumbnail accessory
+  // upscales whatever source it's given to fill a small fixed box, which
+  // showed up live as a blown-up, blurry, pixelated "huge"-looking image.
+  // The much-higher-resolution "detail" image (typically 500-1500px) is
+  // preferred instead, since scaling a big image DOWN to fit that box stays
+  // sharp.
   {
     const prevFileFetcher = bot.config.wikiFileImageFetcher;
     delete bot.config.wikiFileImageFetcher; // exercise the real (live-call) code path, with fetch() itself stubbed
     bot._wikiFileImageCacheForTests.clear();
     const originalFetch = global.fetch;
     global.fetch = async (url) => {
-      check("the live file-image lookup queries MediaWiki's File: namespace using the exact '<name>.png' convention", String(url).includes("titles=File%3AHuberte.png"));
+      check("the live file-image lookup queries both the detail image and the flat icon as a fallback, in one request", String(url).includes("titles=File%3AHuberte%20detail.png%7CFile%3AHuberte.png"));
       check("it asks for imageinfo/url, not pageimages", String(url).includes("prop=imageinfo") && String(url).includes("iiprop=url"));
       return {
         ok: true,
         json: async () => ({
-          query: { pages: { "1": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] } } },
+          query: {
+            pages: {
+              "1": { title: "File:Huberte detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte_detail.png" }] },
+              "2": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] },
+            },
+          },
         }),
       };
     };
     const result = await bot.fetchWikiFileImages(["Huberte"]);
     global.fetch = originalFetch;
-    check("resolves to the wiki's actual small icon URL", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
+    check("resolves to the wiki's high-res detail image, not the flat icon, when both exist", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte_detail.png");
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= fetchWikiFileImages: falls back to the flat icon when an item has no dedicated detail image =================
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        query: {
+          pages: {
+            "-1": { title: "File:Huberte detail.png", missing: true },
+            "2": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] },
+          },
+        },
+      }),
+    });
+    const result = await bot.fetchWikiFileImages(["Huberte"]);
+    global.fetch = originalFetch;
+    check("falls back to the flat icon when the detail image doesn't exist for this item", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
     bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 
@@ -453,14 +489,14 @@ const REAL_WORLD_HISCORES = {
       return {
         ok: true,
         json: async () => ({
-          query: { pages: { "1": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] } } },
+          query: { pages: { "1": { title: "File:Huberte detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte_detail.png" }] } } },
         }),
       };
     };
     const result = await bot.fetchWikiFileImages(["Huberte"]);
     global.fetch = originalFetch;
     check("a failed first attempt is retried exactly once", callCount === 2);
-    check("the retry's success is still returned to the caller", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
+    check("the retry's success is still returned to the caller", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte_detail.png");
     bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 
@@ -473,7 +509,17 @@ const REAL_WORLD_HISCORES = {
     let callCount = 0;
     global.fetch = async () => {
       callCount++;
-      return { ok: true, json: async () => ({ query: { pages: { "-1": { title: "File:NoSuchItem.png", missing: true } } } }) };
+      return {
+        ok: true,
+        json: async () => ({
+          query: {
+            pages: {
+              "-1": { title: "File:NoSuchItem detail.png", missing: true },
+              "-2": { title: "File:NoSuchItem.png", missing: true },
+            },
+          },
+        }),
+      };
     };
     const result = await bot.fetchWikiFileImages(["NoSuchItem"]);
     global.fetch = originalFetch;
@@ -494,6 +540,36 @@ const REAL_WORLD_HISCORES = {
     global.fetch = originalFetch;
     check("exactly 2 attempts are made (1 initial + 1 retry), not an unbounded retry loop", callCount === 2);
     check("after both attempts fail, the title resolves to null instead of the whole command crashing", result.get("Huberte") === null);
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= fetchWikiFileImages: queries more than one item's detail+icon title pair in a single chunked request =================
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+    global.fetch = async (url) => {
+      callCount++;
+      check("both items' title pairs are queried in one request, not one request per item", String(url).includes("Masori%20chaps") && String(url).includes("Lightbearer"));
+      return {
+        ok: true,
+        json: async () => ({
+          query: {
+            pages: {
+              "1": { title: "File:Masori chaps detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Masori_chaps_detail.png" }] },
+              "2": { title: "File:Lightbearer detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Lightbearer_detail.png" }] },
+            },
+          },
+        }),
+      };
+    };
+    const result = await bot.fetchWikiFileImages(["Masori chaps", "Lightbearer"]);
+    global.fetch = originalFetch;
+    check("exactly one HTTP request handles both items (well under the chunk size), not two separate round trips", callCount === 1);
+    check("the first item's detail image resolves correctly", result.get("Masori chaps") === "https://oldschool.runescape.wiki/images/Masori_chaps_detail.png");
+    check("the second item's detail image resolves correctly", result.get("Lightbearer") === "https://oldschool.runescape.wiki/images/Lightbearer_detail.png");
     bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 

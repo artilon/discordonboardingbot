@@ -2756,18 +2756,72 @@ async function fetchWikiPageImagesLive(titles) {
 }
 
 /**
- * Looks up the OSRS Wiki's small ITEM ICON for one or more pet names, as
- * opposed to fetchWikiPageImages' big infobox/creature render -- for !pets,
- * a whole page of those full-size renders stacked up was reported as "huge
- * and spammy". The wiki's own file-naming convention for an item's inventory
- * icon is literally "<Item name>.png" (e.g. "Huberte.png"), a different,
- * much smaller file than whatever image the pet's own article uses as its
- * lead picture -- so this queries that exact file directly (MediaWiki's
- * File: namespace + imageinfo) instead of going through pageimages at all.
- * `config.wikiFileImageFetcher`, when set, replaces the real HTTP call (test hook).
+ * Looks up an OSRS Wiki item/pet image for display at small size next to its
+ * name in !pets / !log <category> -- as opposed to fetchWikiPageImages' big
+ * infobox/creature render, a whole page of which stacked up was reported as
+ * "huge and spammy". Prefers the wiki's "detail" image (file-naming
+ * convention "<name> detail.png", e.g. "Masori chaps detail.png" or "Baby
+ * Mole detail.png") -- a high-resolution (typically 500-1500px) "examine"
+ * render -- over the flat inventory icon ("<name>.png", e.g. "Huberte.png").
+ * The inventory icon is the item's actual native in-game size, often only
+ * ~15-40px -- fine for a full-size embed image, but when placed in Discord's
+ * Components V2 Section Thumbnail accessory (a small, fixed-size box) it was
+ * reported live as a blown-up, blurry, pixelated "huge"-looking image, since
+ * Discord upscales whatever source it's given to fill that box rather than
+ * leaving a tiny source at its native size. The much-higher-resolution
+ * detail image gets scaled DOWN to fit the same box instead, which looks
+ * sharp. Falls back to the inventory icon for the rare item with no detail
+ * image on the wiki. `config.wikiFileImageFetcher`, when set, replaces the
+ * real HTTP call (test hook).
  */
 async function fetchWikiFileImages(names) {
   return fetchWikiImagesCached(names, wikiFileImageCache, config.wikiFileImageFetcher, fetchWikiFileImagesLive);
+}
+
+/** Exact MediaWiki File: title for an item's detail ("examine" render) image. */
+function wikiDetailFileTitle(name) {
+  return `File:${name} detail.png`;
+}
+/** Exact MediaWiki File: title for an item's flat inventory icon (the detail image's fallback). */
+function wikiIconFileTitle(name) {
+  return `File:${name}.png`;
+}
+
+// MediaWiki doesn't document a titles-per-request cap for this wiki's API,
+// but querying 2 file titles per item (detail + icon fallback) doubles the
+// title count of a plain icon-only lookup -- chunk defensively to stay well
+// under the common 50-titles-per-query default used elsewhere in MediaWiki.
+const WIKI_FILE_IMAGE_TITLES_PER_REQUEST = 40;
+
+/** One real HTTP GET for one chunk of file titles, resolving MediaWiki's redirects/normalization back to the exact titles that were asked for. */
+async function fetchWikiFileImageTitlesChunk(fileTitles, timeoutMs) {
+  const url =
+    `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
+    `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof timeout.unref === "function") timeout.unref();
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
+    if (!res.ok) throw new Error(`wiki file-image lookup returned HTTP ${res.status}`);
+    const data = await res.json();
+
+    const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
+    const redirectMap = new Map((data?.query?.redirects || []).map((r) => [r.from, r.to]));
+    const pages = Object.values(data?.query?.pages || {});
+    const urlByResolvedTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
+
+    const out = new Map();
+    for (const originalTitle of fileTitles) {
+      let finalTitle = originalTitle;
+      if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
+      if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
+      out.set(originalTitle, urlByResolvedTitle.get(finalTitle) || null);
+    }
+    return out;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /** The real network call behind fetchWikiFileImages — isolated so tests never need to hit the live wiki. */
@@ -2777,35 +2831,20 @@ async function fetchWikiFileImages(names) {
 // network error, non-2xx, bad JSON) so the retry wrapper below only retries
 // genuine transient failures, not items that simply don't have a wiki icon.
 async function fetchWikiFileImagesAttempt(names, timeoutMs) {
-  const fileTitles = names.map((n) => `File:${n}.png`);
-  const url =
-    `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
-    `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  if (typeof timeout.unref === "function") timeout.unref();
+  const allTitles = names.flatMap((n) => [wikiDetailFileTitle(n), wikiIconFileTitle(n)]);
 
-  try {
-    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
-    if (!res.ok) throw new Error(`wiki file-image lookup returned HTTP ${res.status}`);
-    const data = await res.json();
-
-    const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
-    const redirectMap = new Map((data?.query?.redirects || []).map((r) => [r.from, r.to]));
-    const pages = Object.values(data?.query?.pages || {});
-    const urlByFileTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
-
-    const out = new Map(names.map((n) => [n, null]));
-    for (let i = 0; i < names.length; i++) {
-      let finalTitle = fileTitles[i];
-      if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
-      if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
-      out.set(names[i], urlByFileTitle.get(finalTitle) || null);
-    }
-    return out;
-  } finally {
-    clearTimeout(timeout);
+  const urlByFileTitle = new Map();
+  for (let i = 0; i < allTitles.length; i += WIKI_FILE_IMAGE_TITLES_PER_REQUEST) {
+    const chunk = allTitles.slice(i, i + WIKI_FILE_IMAGE_TITLES_PER_REQUEST);
+    const chunkResult = await fetchWikiFileImageTitlesChunk(chunk, timeoutMs);
+    for (const [title, imageUrl] of chunkResult) urlByFileTitle.set(title, imageUrl);
   }
+
+  const out = new Map();
+  for (const name of names) {
+    out.set(name, urlByFileTitle.get(wikiDetailFileTitle(name)) || urlByFileTitle.get(wikiIconFileTitle(name)) || null);
+  }
+  return out;
 }
 
 /**
