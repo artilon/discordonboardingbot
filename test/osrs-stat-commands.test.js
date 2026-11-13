@@ -22,21 +22,36 @@ function check(label, cond) {
 
 // ================= Components V2 gallery test helpers =================
 // sendItemGalleryWithImages (!pets / !log <category>) posts Components V2
-// messages (a Container holding a TextDisplay for the header and/or a
-// MediaGallery for the item icons) instead of classic embeds, specifically
-// so each item's wiki icon keeps its own real aspect ratio in the tiled
-// gallery rather than being force-cropped square. These helpers pull the
-// plain-JSON shape back out of a captured `_sent` entry for assertions.
+// messages: a Container holding one overall header Text Display (first
+// batch only), followed by one row per item -- a Section pairing that
+// item's name/quantity/price/drop-rate label with a small Thumbnail
+// accessory of its wiki icon, right next to the text, when an icon could be
+// resolved; otherwise a bare Text Display with just the label. These
+// helpers pull the plain-JSON shape back out of a captured `_sent` entry for
+// assertions.
 function galleryContainerJSON(sentEntry) {
   return sentEntry.payload.components[0].toJSON();
 }
+/** The overall header line -- only present on a batch that has one (always the first component when it does). */
 function galleryHeaderText(sentEntry) {
-  const textDisplay = galleryContainerJSON(sentEntry).components.find((c) => c.type === ComponentType.TextDisplay);
-  return textDisplay ? textDisplay.content : null;
+  const first = galleryContainerJSON(sentEntry).components[0];
+  return first && first.type === ComponentType.TextDisplay ? first.content : null;
 }
-function galleryImageItems(sentEntry) {
-  const mediaGallery = galleryContainerJSON(sentEntry).components.find((c) => c.type === ComponentType.MediaGallery);
-  return mediaGallery ? mediaGallery.items : [];
+/**
+ * Every per-item row in a batch, normalized to `{ text, imageUrl }` --
+ * `imageUrl` is null for an item whose wiki icon couldn't be resolved.
+ * `hasHeader` (default true) skips the leading header Text Display, which
+ * is only present on the first batch of a multi-batch send.
+ */
+function galleryItemRows(sentEntry, { hasHeader = true } = {}) {
+  const components = galleryContainerJSON(sentEntry).components;
+  const rows = hasHeader ? components.slice(1) : components;
+  return rows.map((row) => {
+    if (row.type === ComponentType.Section) {
+      return { text: row.components.map((c) => c.content).join("\n"), imageUrl: row.accessory?.media?.url || null };
+    }
+    return { text: row.content, imageUrl: null };
+  });
 }
 
 function makeFakeChannel() {
@@ -353,11 +368,14 @@ const REAL_WORLD_HISCORES = {
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!pets is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("with no resolvable wiki icons (the default test stub), only the header is posted -- no empty picture-gallery message", message._channel._sent.length === 1);
+    check("with no resolvable wiki icons (the default test stub), everything still fits in a single message", message._channel._sent.length === 1);
     const headerText = galleryHeaderText(message._channel._sent[0]);
     check("the header states the pet count", headerText.includes("2"));
-    check("a pet obtained once is named in the header's list, without a dupe badge", headerText.includes("Baby Mole,"));
-    check("a pet obtained more than once shows an 'xN' dupe count in the header's list", headerText.includes("Pet Zilyana x3"));
+    const rows = galleryItemRows(message._channel._sent[0]);
+    check("each pet gets its own row rather than being crammed into one giant header line", rows.length === 2);
+    check("none of the rows have a thumbnail, since no wiki icon could be resolved for either pet", rows.every((r) => r.imageUrl === null));
+    check("a pet obtained once is named in its own row, without a dupe badge", rows.some((r) => r.text === "**Baby Mole**"));
+    check("a pet obtained more than once shows an 'xN' dupe count in its own row", rows.some((r) => r.text === "**Pet Zilyana** x3"));
     check("!pets' header keeps the normal (non-red) color -- only !log's header is colored red", galleryContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.main);
     bot.config.runeProfileFetcher = prevFetcher;
   }
@@ -383,12 +401,15 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiImageFetcher = async () => { throw new Error("!pets must not use the big-image (pageimages) fetcher at all"); };
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    check("the header and the (single-batch) gallery combine into one Components V2 message, since everything fits in one Media Gallery", message._channel._sent.length === 1);
+    check("the header and both item rows combine into one Components V2 message, since everything fits in one message", message._channel._sent.length === 1);
     const headerText = galleryHeaderText(message._channel._sent[0]);
-    check("both pets are still named in the header regardless of whether their icon resolved", headerText.includes("Baby Mole") && headerText.includes("Herbi"));
-    const galleryItems = galleryImageItems(message._channel._sent[0]);
-    check("only the pet with a resolved wiki icon appears in the picture gallery (the other is simply omitted, not a broken tile)", galleryItems.length === 1);
-    check("a pet with a resolved wiki icon is shown at its own real aspect ratio via a Media Gallery item (not force-cropped square)", galleryItems[0].media.url === "https://wiki.example/baby-mole.png");
+    check("the header states the pet count, without listing the pets by name itself", headerText.includes("2"));
+    const rows = galleryItemRows(message._channel._sent[0]);
+    check("both pets still get their own row regardless of whether their icon resolved", rows.length === 2);
+    const babyMoleRow = rows.find((r) => r.text.includes("Baby Mole"));
+    const herbiRow = rows.find((r) => r.text.includes("Herbi"));
+    check("a pet with a resolved wiki icon shows its name/label right next to a thumbnail of its own real icon (not force-cropped square)", babyMoleRow && babyMoleRow.imageUrl === "https://wiki.example/baby-mole.png");
+    check("a pet whose wiki icon couldn't be resolved is still listed as a plain text row -- not silently dropped, and not a broken image tile", herbiRow && herbiRow.imageUrl === null);
     bot.config.runeProfileFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
     bot.config.wikiImageFetcher = prevWikiPageFetcher;
@@ -711,7 +732,7 @@ const REAL_WORLD_HISCORES = {
     bot._wikiDropRateCacheForTests.clear();
   }
 
-  // ================= handleOsrsStatsCommand: !pets batches images across messages past Discord's 10-embed cap =================
+  // ================= handleOsrsStatsCommand: !pets batches items across messages past the per-message component cap =================
   {
     const prevFetcher = bot.config.runeProfileFetcher;
     const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
@@ -721,14 +742,16 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/\s+/g, "-").toLowerCase()}.png`]));
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    // header + first 10-item gallery batch combine into one message, with
-    // the remaining 3 items spilling into a second, gallery-only message
+    // header + first 10-item batch combine into one message, with the
+    // remaining 3 items spilling into a second, header-less message
     // (2 messages total).
-    check("more than 10 pictured pets are split across multiple gallery messages, respecting the Media Gallery's 10-item cap", message._channel._sent.length === 2);
-    check("the first message's header text is still present alongside its (first) gallery batch", galleryHeaderText(message._channel._sent[0]).includes("13"));
-    check("the first gallery batch has exactly 10 items", galleryImageItems(message._channel._sent[0]).length === 10);
-    check("the second, header-less message has the remaining 3 items", galleryImageItems(message._channel._sent[1]).length === 3);
-    check("every item across both batches resolves to its own distinct, correctly-shaped icon url (no shared-url cropping hack needed)", new Set([...galleryImageItems(message._channel._sent[0]), ...galleryImageItems(message._channel._sent[1])].map((i) => i.media.url)).size === 13);
+    check("more than 10 pictured pets are split across multiple messages, respecting Discord's per-message component cap", message._channel._sent.length === 2);
+    check("the first message's header text is still present alongside its (first) item batch", galleryHeaderText(message._channel._sent[0]).includes("13"));
+    const firstBatchRows = galleryItemRows(message._channel._sent[0]);
+    const secondBatchRows = galleryItemRows(message._channel._sent[1], { hasHeader: false });
+    check("the first batch has exactly 10 item rows", firstBatchRows.length === 10);
+    check("the second, header-less message has the remaining 3 item rows", secondBatchRows.length === 3);
+    check("every item across both batches resolves to its own distinct, correctly-shaped icon url shown right next to its row (no shared-url cropping hack needed)", new Set([...firstBatchRows, ...secondBatchRows].map((r) => r.imageUrl)).size === 13);
     bot.config.runeProfileFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
   }
@@ -943,17 +966,17 @@ const REAL_WORLD_HISCORES = {
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!log is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("the header and the (single-batch) gallery combine into one Components V2 message", message._channel._sent.length === 1);
-    check("!log's header container is colored red (COLOR.bad), distinct from the gallery underneath it", galleryContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.bad);
+    check("the header and both item rows combine into one Components V2 message", message._channel._sent.length === 1);
+    check("!log's header container is colored red (COLOR.bad), distinct from the item rows underneath it", galleryContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.bad);
     const headerText = galleryHeaderText(message._channel._sent[0]);
     check("the header names the player and the resolved category", headerText.includes("Zezima") && headerText.includes("Tombs of Amascut"));
     check("the header shows the category's obtained/total progress", headerText.includes("4/10"));
-    check("the header states how many items are shown (only the owned ones)", headerText.includes("2"));
-    check("an item obtained once is named in the header's list, without a dupe badge", headerText.includes("Masori mask,"));
-    check("an item obtained more than once shows its dupe count in the header's list", headerText.includes("Lightbearer x2"));
-    const itemImages = galleryImageItems(message._channel._sent[0]);
-    check("only owned items appear in the picture gallery (the unowned Osmumten's fang is excluded)", itemImages.length === 2);
-    check("gallery items use the item's wiki icon, each at its own real aspect ratio (not force-cropped square)", itemImages.every((i) => typeof i.media.url === "string"));
+    check("the header states how many items are shown (only the owned ones), without listing them itself", headerText.includes("2") && !headerText.includes("Masori"));
+    const rows = galleryItemRows(message._channel._sent[0]);
+    check("only owned items get their own row (the unowned Osmumten's fang is excluded)", rows.length === 2);
+    check("an item obtained once is named in its own row, without a dupe badge", rows.some((r) => r.text === "**Masori mask**"));
+    check("an item obtained more than once shows its dupe count in its own row", rows.some((r) => r.text === "**Lightbearer** x2"));
+    check("each row's item name/label sits right next to that item's own wiki icon thumbnail (not force-cropped square)", rows.every((r) => typeof r.imageUrl === "string"));
 
     bot.config.collectionLogFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
@@ -982,14 +1005,14 @@ const REAL_WORLD_HISCORES = {
 
     const logMessage = makeFakeMessage({ content: "!log toa Zezima" });
     await bot.handleOsrsStatsCommand(logMessage);
-    const logHeaderText = galleryHeaderText(logMessage._channel._sent[0]);
-    check("!log's name list includes a tradeable item's GE value", logHeaderText.includes("Masori mask — 8.5m (1/3,000)"));
-    check("!log's name list includes a dupe-count item's GE value alongside its count", logHeaderText.includes("Lightbearer x2 — 4.3m (1/1,500)"));
+    const logRows = galleryItemRows(logMessage._channel._sent[0]);
+    check("!log's item rows include a tradeable item's GE value next to its name", logRows.some((r) => r.text === "**Masori mask** — 8.5m (1/3,000)"));
+    check("!log's item rows include a dupe-count item's GE value alongside its count", logRows.some((r) => r.text === "**Lightbearer** x2 — 4.3m (1/1,500)"));
 
     const petsMessage = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(petsMessage);
-    const petsHeaderText = galleryHeaderText(petsMessage._channel._sent[0]);
-    check("!pets' name list shows the drop rate but NEVER a GE value, since pets are untradeable", petsHeaderText.includes("Baby Mole (1/3,000)") && !/—/.test(petsHeaderText));
+    const petsRows = galleryItemRows(petsMessage._channel._sent[0]);
+    check("!pets' item rows show the drop rate but NEVER a GE value, since pets are untradeable", petsRows.some((r) => r.text === "**Baby Mole** (1/3,000)") && !petsRows.some((r) => /—/.test(r.text)));
 
     bot.config.collectionLogFetcher = prevCollectionFetcher;
     bot.config.runeProfileFetcher = prevRuneProfileFetcher;

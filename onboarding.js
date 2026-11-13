@@ -50,16 +50,16 @@ const {
   ContainerBuilder,
   EmbedBuilder,
   GuildMemberFlags,
-  MediaGalleryBuilder,
-  MediaGalleryItemBuilder,
   MessageFlags,
   ModalBuilder,
   OverwriteType,
   PermissionFlagsBits,
+  SectionBuilder,
   StringSelectMenuBuilder,
   TextDisplayBuilder,
   TextInputBuilder,
   TextInputStyle,
+  ThumbnailBuilder,
   UserSelectMenuBuilder,
 } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
@@ -3300,79 +3300,69 @@ async function sendRuneProfileSetupNotice(user, rsn, fallbackChannel) {
   }
 }
 
-// Discord caps embeds at 10 per message, and also caps a Media Gallery
-// component at 10 items -- reused for both legacy chunk math and the
-// Components V2 gallery below.
-const DISCORD_MAX_EMBEDS_PER_MESSAGE = 10;
-
-// Keeps the header text comfortably under Discord's 4000-character
-// text-display component cap even for a very large haul.
-const ITEM_GALLERY_NAME_LIST_MAX_CHARS = 3500;
+// Each pictured item row costs 3 components (Section + its Text Display +
+// its Thumbnail accessory) towards Discord's 40-components-per-message cap;
+// an unpictured item row costs 1 (a bare Text Display); the header line and
+// the Container itself cost 1 each. Batching at 10 items per message keeps
+// every batch comfortably under that cap even in the worst case (every item
+// pictured): 1 (container) + 1 (header, first batch only) + 10*3 = 32.
+const ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE = 10;
 
 /**
- * Posts one message naming every `item` ({name, quantity, extra?}, with an
- * "xN" dupe count where quantity > 1 and an optional trailing `.extra` label,
- * e.g. GE price / drop rate from enrichItemsWithExtras), followed by a
- * compact photo gallery of their OSRS Wiki item icons, each shown at its own
- * correct aspect ratio -- NOT one full embed card per item (reported as huge
- * and spammy), and NOT the old "multiple embeds sharing one url" trick
- * either (that forces Discord to crop every image into a uniform square,
- * which mangled non-square icons into unrecognizable close-up slices). This
- * uses Discord's native Components V2 Media Gallery instead, which tiles
- * multiple images compactly while preserving each one's real shape.
- * Items with no resolvable icon are still named in the header text, just
- * left out of the picture gallery. Chunked into multiple messages if there
- * are more pictured items than fit in one Media Gallery (Discord's
- * 10-items-per-gallery cap). Shared by !pets and !log <category>, which both
- * ultimately show "which collection log items does this player own, and how
- * many of each".
+ * Posts one or more messages listing every `item` ({name, quantity, extra?},
+ * with an "xN" dupe count where quantity > 1 and an optional trailing
+ * `.extra` label, e.g. GE price / drop rate from enrichItemsWithExtras), one
+ * per line, each shown next to its own OSRS Wiki item icon at a small
+ * thumbnail size -- NOT one full embed card per item (reported as huge and
+ * spammy), NOT a single giant comma-separated block of names up top with a
+ * separate picture grid below it (reported as hard to read -- which item is
+ * which?), and NOT the old "multiple embeds sharing one url" trick either
+ * (that forces Discord to crop every image into a uniform square, which
+ * mangled non-square icons into unrecognizable close-up slices). This uses
+ * Discord's native Components V2 Section component instead, which pairs a
+ * line of text directly with a small thumbnail image beside it -- so the
+ * name/price/drop-rate label sits right next to the icon it describes.
+ * Items with no resolvable icon are still listed as a plain text line, just
+ * without a thumbnail next to them. Chunked into multiple messages if there
+ * are more items than fit in one message (see
+ * ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE above). Shared by !pets and
+ * !log <category>, which both ultimately show "which collection log items
+ * does this player own, and how many of each".
  */
 async function sendItemGalleryWithImages(channel, headerText, items, warnLabel, headerColor = COLOR.main) {
-  const labels = items.map((item) => {
-    const qtyPart = item.quantity > 1 ? ` x${item.quantity}` : "";
-    const extraPart = item.extra ? ` ${item.extra}` : "";
-    return `${item.name}${qtyPart}${extraPart}`;
-  });
-  let truncatedNameList = labels.join(", ");
-  if (truncatedNameList.length > ITEM_GALLERY_NAME_LIST_MAX_CHARS) {
-    let shown = 0;
-    let chars = 0;
-    for (const label of labels) {
-      const added = (shown === 0 ? 0 : 2) + label.length;
-      if (chars + added > ITEM_GALLERY_NAME_LIST_MAX_CHARS) break;
-      chars += added;
-      shown++;
-    }
-    truncatedNameList = `${labels.slice(0, shown).join(", ")} … (+${items.length - shown} more)`;
-  }
-
   const images = await fetchWikiFileImages(items.map((i) => i.name)).catch(() => new Map());
-  const pictured = items.filter((item) => images.get(item.name));
 
-  // Always at least one batch, even with zero pictured items, so the header
-  // text still gets posted on its own.
+  // Always at least one batch, even with zero items, so the header text
+  // still gets posted on its own.
   const batches = [];
-  for (let i = 0; i < pictured.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
-    batches.push(pictured.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE));
+  for (let i = 0; i < items.length; i += ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE) {
+    batches.push(items.slice(i, i + ITEM_GALLERY_MAX_ITEMS_PER_MESSAGE));
   }
   if (batches.length === 0) batches.push([]);
 
   for (let i = 0; i < batches.length; i++) {
     const container = new ContainerBuilder().setAccentColor(headerColor);
     if (i === 0) {
-      container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`${headerText} ${truncatedNameList}`));
+      container.addTextDisplayComponents(new TextDisplayBuilder().setContent(headerText));
     }
-    const batch = batches[i];
-    if (batch.length > 0) {
-      container.addMediaGalleryComponents(
-        new MediaGalleryBuilder().addItems(
-          batch.map((item) => new MediaGalleryItemBuilder().setURL(images.get(item.name)).setDescription(item.name.slice(0, 256)))
-        )
-      );
+    for (const item of batches[i]) {
+      const qtyPart = item.quantity > 1 ? ` x${item.quantity}` : "";
+      const extraPart = item.extra ? ` ${item.extra}` : "";
+      const label = `**${item.name}**${qtyPart}${extraPart}`;
+      const imageUrl = images.get(item.name);
+      if (imageUrl) {
+        container.addSectionComponents(
+          new SectionBuilder()
+            .addTextDisplayComponents(new TextDisplayBuilder().setContent(label))
+            .setThumbnailAccessory(new ThumbnailBuilder().setURL(imageUrl).setDescription(item.name.slice(0, 256)))
+        );
+      } else {
+        container.addTextDisplayComponents(new TextDisplayBuilder().setContent(label));
+      }
     }
     await channel
       .send({ components: [container], flags: MessageFlags.IsComponentsV2, allowedMentions: { parse: [] } })
-      .catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} ${i === 0 ? "header" : "image batch"}:`, e.message));
+      .catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} ${i === 0 ? "header" : "item batch"}:`, e.message));
   }
 }
 
