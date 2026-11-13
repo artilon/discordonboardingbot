@@ -71,6 +71,27 @@ const SAMPLE_HISCORES = {
   ],
 };
 
+// A real (trimmed) capture of a live account's Hiscores response, used to
+// reproduce a reported bug: "!kc hueycoatl" resolved the boss fine but then
+// claimed "hasn't recorded any kills" for a player who actually has 1,367.
+// Also exercises the real Hiscores' "The X" naming inconsistency (compare
+// "The Hueycoatl" and "The Royal Titans" against "Barrows Chests", which is
+// a genuinely different kind of name mismatch, not a "The " prefix one) and
+// confirms genuinely-separate co-located bosses (Callisto vs Artio,
+// Nightmare vs Phosani's Nightmare) are never conflated with each other.
+const REAL_WORLD_HISCORES = {
+  skills: [{ id: 0, name: "Overall", rank: 146470, level: 2275, xp: 409184231 }],
+  activities: [
+    { id: 24, name: "Artio", rank: -1, score: 1 },
+    { id: 28, name: "Callisto", rank: -1, score: 0 },
+    { id: 25, name: "Barrows Chests", rank: 46564, score: 833 },
+    { id: 58, name: "Nightmare", rank: -1, score: 2 },
+    { id: 59, name: "Phosani's Nightmare", rank: -1, score: 0 },
+    { id: 72, name: "The Hueycoatl", rank: 1226, score: 1367 },
+    { id: 74, name: "The Royal Titans", rank: 8390, score: 802 },
+  ],
+};
+
 (async () => {
   // ================= parseOsrsStatsCommand =================
   {
@@ -138,6 +159,50 @@ const SAMPLE_HISCORES = {
     check("an unranked boss is still a handled command (not an error)", handled === true);
     const text = message._channel._sent[0].payload.embeds[0].data.description;
     check("the reply reports no recorded kills rather than crashing", /hasn't recorded any kills/i.test(text));
+    bot.config.hiscoreFetcher = prevFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !kc regression -- "The X" vs "X" naming mismatches =================
+  // Reproduces a live bug report: "!kc hueycoatl torlokt" replied "hasn't
+  // recorded any kills ... (unranked)" for a player who actually has 1,367
+  // KC, because the resolved display name ("Hueycoatl") didn't textually
+  // match the real Hiscores entry name ("The Hueycoatl").
+  {
+    const prevFetcher = bot.config.hiscoreFetcher;
+    bot.config.hiscoreFetcher = async () => REAL_WORLD_HISCORES;
+
+    const cases = [
+      { cmd: "!kc hueycoatl torlokt", expectKc: "1,367", expectRank: "1,226" },
+      { cmd: "!kc huey torlokt", expectKc: "1,367", expectRank: "1,226" }, // via the short alias too
+      { cmd: "!kc barrows torlokt", expectKc: "833", expectRank: "46,564" }, // different mismatch kind (not a "The " prefix)
+      { cmd: "!kc titans torlokt", expectKc: "802", expectRank: "8,390" },
+    ];
+    for (const { cmd, expectKc, expectRank } of cases) {
+      const message = makeFakeMessage({ content: cmd });
+      const handled = await bot.handleOsrsStatsCommand(message);
+      check(`"${cmd}" is handled`, handled === true);
+      const text = message._channel._sent[0]?.payload?.embeds?.[0]?.data?.description || "";
+      check(`"${cmd}" reports the real KC (${expectKc}), not "hasn't recorded any kills"`, text.includes(expectKc) && !/hasn't recorded/i.test(text));
+      check(`"${cmd}" also reports the real rank (#${expectRank})`, text.includes(expectRank));
+    }
+
+    // Genuinely distinct, merely co-located bosses must never be conflated
+    // with each other even though they share a boss family / loot table.
+    const callisto = makeFakeMessage({ content: "!kc callisto torlokt" });
+    await bot.handleOsrsStatsCommand(callisto);
+    const callistoText = callisto._channel._sent[0].payload.embeds[0].data.description;
+    check("Callisto (0 kc) is not conflated with Artio's kc", /hasn't recorded any kills/i.test(callistoText) && callistoText.includes("Callisto"));
+
+    const artio = makeFakeMessage({ content: "!kc artio torlokt" });
+    await bot.handleOsrsStatsCommand(artio);
+    const artioText = artio._channel._sent[0].payload.embeds[0].data.description;
+    check("Artio (1 kc) is not conflated with Callisto's kc", /\*\*1\*\*/.test(artioText) && artioText.includes("Artio"));
+
+    const phosani = makeFakeMessage({ content: "!kc phosani torlokt" });
+    await bot.handleOsrsStatsCommand(phosani);
+    const phosaniText = phosani._channel._sent[0].payload.embeds[0].data.description;
+    check("Phosani's Nightmare (0 kc) is not conflated with regular Nightmare's kc", /hasn't recorded any kills/i.test(phosaniText));
+
     bot.config.hiscoreFetcher = prevFetcher;
   }
 
