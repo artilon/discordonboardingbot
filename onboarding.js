@@ -76,6 +76,11 @@ const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 const TWITCH_USERNAME = process.env.TWITCH_USERNAME;
 
+// Optional: a RuneProfile API key (https://runeprofile.com, join their Discord
+// to request one) raises the !pets lookup's rate limit from 30/min to
+// 120/min. Not required — !pets works fine without it at low clan-chat volume.
+const RUNEPROFILE_API_KEY = process.env.RUNEPROFILE_API_KEY || null;
+
 const UNVERIFIED_ROLE_ID    = "1547278787815804928";
 const CLAN_MEMBER_ROLE_ID   = "1546403975656505354";
 const OSRS_ROLE_ID          = "1546412132822810744";
@@ -222,6 +227,12 @@ const FRACTURED_ARCHIVES_UNLOCK_DATE = "2027-04-21"; // 6-month restriction from
 const WEEKLY_RECAP_CHANNEL_ID   = "1546413698979995678";
 const WEEKLY_RECAP_HOUR         = 17; // 5:00 PM, 24h clock, America/Chicago
 const WEEKLY_RECAP_ANCHOR_DATE  = { year: 2026, month: 11, day: 1 }; // First recap posts Sunday, Nov 1, 2026 at 17:00 Central
+
+// In-chat OSRS stat lookups (!lvl / !kc / !pets) only work in this channel.
+// NOTE: this is the same ID as WEEKLY_RECAP_CHANNEL_ID (it already also
+// carries rank-up congrats messages and Twitch live alerts) — confirmed
+// intentional by the clan, who refer to it as "the OSRS discussion channel".
+const OSRS_STATS_CHANNEL_ID = WEEKLY_RECAP_CHANNEL_ID;
 
 // Recruitment Drive Event — everything (announcement, leaderboard, per-member
 // evidence threads) lives in this single channel.
@@ -2347,6 +2358,382 @@ function extractHiscoreMetric(hiscoreData, eventType, targetName) {
   return totalKills;
 }
 
+// ================= IN-CHAT OSRS STAT COMMANDS (!lvl / !kc / !pets) =================
+// Mirrors the RuneLite-style in-game chat commands clan chats already use —
+// type the command in WEEKLY_RECAP_CHANNEL_ID (the "OSRS discussion" channel),
+// the bot deletes your command message and posts the looked-up stat publicly
+// (that's the whole point — showing it off). RSN is always typed explicitly
+// (works for any player, not just the one typing), since there's no in-game
+// "current chat name" equivalent to default to here.
+//
+//   !lvl <skill> <rsn...>   e.g. "!lvl woodcutting Lynx Titan"
+//   !kc <boss> <rsn...>     e.g. "!kc zulrah Lynx Titan"
+//   !pets <rsn...>          e.g. "!pets Lynx Titan"
+//
+// <skill>/<boss> must be ONE word (so everything after it can be a
+// multi-word RSN without ambiguity) — either the skill/boss's exact name
+// with spaces/punctuation removed (e.g. "kingblackdragon"), or one of the
+// short aliases below (e.g. "kbd"). Skills/bosses come from the Hiscores —
+// no setup needed. Pets come from RuneProfile, which requires the player to
+// have installed the free RuneProfile RuneLite plugin and opened their
+// Collection Log's Pets page at least once; see buildRuneProfileSetupEmbed.
+
+function normalizeStatToken(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+// Bosses players commonly want their personal KC for, beyond the subset this
+// bot already tracks for the Boss-of-the-Week rotation (OSRS_BOSSES above
+// deliberately excludes slayer-task-locked bosses from that rotation, but
+// members still want to flex their KC at them here).
+const EXTRA_KC_HISCORE_NAMES = [
+  "Araxxor",
+  "Kraken",
+  "Cerberus",
+  "Abyssal Sire",
+  "Alchemical Hydra",
+  "Grotesque Guardians",
+  "Hespori",
+  "Mimic",
+  "Skotizo",
+  "Thermonuclear Smoke Devil",
+];
+
+// Every individual (ungrouped) Hiscores activity name !kc can resolve to.
+// Deliberately NOT OSRS_BOSSES' own (grouped) names — someone asking
+// "!kc artio" wants just Artio, not this bot's combined "Callisto / Artio"
+// Boss-of-the-Week category total.
+const ALL_KC_HISCORE_NAMES = Array.from(
+  new Set([...OSRS_BOSSES.flatMap((b) => b.hiscoreNames), ...EXTRA_KC_HISCORE_NAMES])
+);
+
+// Short, single-word nicknames -> the exact name the Hiscores reports.
+const KC_ALIASES = {
+  cox: "Chambers of Xeric",
+  coxcm: "Chambers of Xeric: Challenge Mode",
+  tob: "Theatre of Blood",
+  tobhm: "Theatre of Blood: Hard Mode",
+  toa: "Tombs of Amascut",
+  toaem: "Tombs of Amascut: Expert Mode",
+  toaexpert: "Tombs of Amascut: Expert Mode",
+  zilyana: "Commander Zilyana",
+  sara: "Commander Zilyana",
+  saradomin: "Commander Zilyana",
+  graardor: "General Graardor",
+  bandos: "General Graardor",
+  kril: "K'ril Tsutsaroth",
+  zammy: "K'ril Tsutsaroth",
+  zamorak: "K'ril Tsutsaroth",
+  kree: "Kree'arra",
+  kreearra: "Kree'arra",
+  arma: "Kree'arra",
+  armadyl: "Kree'arra",
+  duke: "Duke Sucellus",
+  levi: "The Leviathan",
+  leviathan: "The Leviathan",
+  vard: "Vardorvis",
+  venenatis: "Venenatis",
+  vene: "Venenatis",
+  vetion: "Vet'ion",
+  calvarion: "Calvar'ion",
+  ce: "Chaos Elemental",
+  chaosele: "Chaos Elemental",
+  cf: "Chaos Fanatic",
+  fanatic: "Chaos Fanatic",
+  ca: "Crazy Archaeologist",
+  crazyarch: "Crazy Archaeologist",
+  da: "Deranged Archaeologist",
+  derangedarch: "Deranged Archaeologist",
+  amox: "Amoxliatl",
+  doom: "Doom of Mokhaiotl",
+  doa: "Doom of Mokhaiotl",
+  huey: "The Hueycoatl",
+  lunar: "Lunar Chests",
+  moons: "Lunar Chests",
+  moonsofperil: "Lunar Chests",
+  titans: "The Royal Titans",
+  royaltitans: "The Royal Titans",
+  bryo: "Bryophyta",
+  corp: "Corporeal Beast",
+  corporeal: "Corporeal Beast",
+  prime: "Dagannoth Prime",
+  rex: "Dagannoth Rex",
+  supreme: "Dagannoth Supreme",
+  dks: "Dagannoth Rex", // ambiguous shorthand — picks one DK; use the full names for the others
+  mole: "Giant Mole",
+  kq: "Kalphite Queen",
+  kbd: "King Black Dragon",
+  muspah: "Phantom Muspah",
+  nightmare: "Nightmare",
+  tnm: "Nightmare",
+  phosani: "Phosani's Nightmare",
+  phosanis: "Phosani's Nightmare",
+  vork: "Vorkath",
+  gaunt: "The Gauntlet",
+  gauntlet: "The Gauntlet",
+  cgaunt: "The Corrupted Gauntlet",
+  corrupted: "The Corrupted Gauntlet",
+  corruptedgauntlet: "The Corrupted Gauntlet",
+  temp: "Tempoross",
+  wt: "Wintertodt",
+  jad: "TzTok-Jad",
+  zuk: "TzKal-Zuk",
+  sol: "Sol Heredit",
+  heredit: "Sol Heredit",
+  colosseum: "Sol Heredit",
+  cerb: "Cerberus",
+  sire: "Abyssal Sire",
+  hydra: "Alchemical Hydra",
+  alchydra: "Alchemical Hydra",
+  ggs: "Grotesque Guardians",
+  grotesque: "Grotesque Guardians",
+  thermy: "Thermonuclear Smoke Devil",
+  tsd: "Thermonuclear Smoke Devil",
+};
+
+function resolveBossHiscoreName(input) {
+  const norm = normalizeStatToken(input);
+  if (!norm) return null;
+  if (KC_ALIASES[norm]) return KC_ALIASES[norm];
+  return ALL_KC_HISCORE_NAMES.find((n) => normalizeStatToken(n) === norm) || null;
+}
+
+const SKILL_ALIASES = {
+  atk: "Attack",
+  def: "Defence",
+  str: "Strength",
+  range: "Ranged",
+  pray: "Prayer",
+  mage: "Magic",
+  hp: "Hitpoints",
+  mine: "Mining",
+  fish: "Fishing",
+  wc: "Woodcutting",
+  farm: "Farming",
+  hunt: "Hunter",
+  rc: "Runecraft",
+  runecrafting: "Runecraft",
+  con: "Construction",
+  cons: "Construction",
+  herb: "Herblore",
+  craft: "Crafting",
+  fletch: "Fletching",
+  smith: "Smithing",
+  cook: "Cooking",
+  fm: "Firemaking",
+  agi: "Agility",
+  thieve: "Thieving",
+  thief: "Thieving",
+  slay: "Slayer",
+  sail: "Sailing",
+};
+
+function resolveSkillHiscoreName(input) {
+  const norm = normalizeStatToken(input);
+  if (!norm) return null;
+  if (norm === "overall" || norm === "total") return "Overall";
+  if (SKILL_ALIASES[norm]) return SKILL_ALIASES[norm];
+  const direct = OSRS_SKILLS.find((s) => normalizeStatToken(s.name) === norm);
+  return direct ? direct.name : null;
+}
+
+/** Parses a message's raw content into one of our three stat commands, or null if it isn't one. */
+function parseOsrsStatsCommand(content) {
+  const tokens = String(content || "").trim().split(/\s+/);
+  const cmd = (tokens[0] || "").toLowerCase();
+
+  if (cmd === "!lvl" && tokens.length >= 3) {
+    return { type: "lvl", alias: tokens[1], rsn: tokens.slice(2).join(" ") };
+  }
+  if (cmd === "!kc" && tokens.length >= 3) {
+    return { type: "kc", alias: tokens[1], rsn: tokens.slice(2).join(" ") };
+  }
+  if (cmd === "!pets" && tokens.length >= 2) {
+    return { type: "pets", rsn: tokens.slice(1).join(" ") };
+  }
+  return null;
+}
+
+/** Posts `content` to `channel`, tagging `userId`, and self-deletes after 15s — for command errors that shouldn't linger. */
+async function sendOsrsStatsNotice(channel, userId, content) {
+  const temp = await channel?.send({ content: `<@${userId}> ${content}`, allowedMentions: { users: [userId] } }).catch(() => null);
+  if (temp) {
+    const t = setTimeout(() => temp.delete().catch(() => {}), 15000);
+    if (typeof t.unref === "function") t.unref();
+  }
+}
+
+/**
+ * Looks up pet ownership via RuneProfile's public API. RuneProfile only has
+ * data for players who've installed its free RuneLite plugin and opened
+ * their Collection Log's Pets page at least once — a player simply not
+ * having a RuneProfile account is the expected/common case, not an error.
+ * `config.runeProfileFetcher`, when set, replaces this entirely (test hook).
+ */
+async function fetchRuneProfilePets(rsn) {
+  if (typeof config.runeProfileFetcher === "function") {
+    return config.runeProfileFetcher(rsn);
+  }
+  const cleanRsn = String(rsn || "").trim();
+  if (!cleanRsn) return { ok: false, notFound: true };
+
+  const url = `https://api.runeprofile.com/v1/accounts/${encodeURIComponent(cleanRsn)}/collection-log`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  if (typeof timeout.unref === "function") timeout.unref();
+
+  try {
+    const headers = { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (RuneProfile pets lookup)" };
+    if (RUNEPROFILE_API_KEY) headers["X-API-Key"] = RUNEPROFILE_API_KEY;
+    const res = await fetch(url, { headers, signal: controller.signal });
+    if (res.status === 404) return { ok: false, notFound: true };
+    if (!res.ok) return { ok: false, notFound: false, error: `RuneProfile request failed: ${res.status}` };
+    const data = await res.json();
+    // Pets live as a page named "Pets" somewhere under the tabs (normally
+    // "Other", but we scan every tab so this keeps working even if
+    // RuneProfile ever reorganizes it).
+    const petsPage = (data?.tabs || []).flatMap((t) => t.pages || []).find((p) => normalizeHiscoreName(p.name) === "pets");
+    const pets = petsPage ? (petsPage.items || []).filter((i) => Number(i.quantity) > 0).map((i) => i.name) : [];
+    return { ok: true, notFound: false, pets };
+  } catch (e) {
+    return { ok: false, notFound: false, error: e.message };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * The "you need to set this up" notice for !pets when RuneProfile has no
+ * account for the given RSN. Sent as a DM — the closest equivalent to an
+ * ephemeral reply available outside of slash-command interactions — so it
+ * never clutters the public channel. Falls back to a short-lived, self-
+ * deleting channel message only if the user's DMs are closed to the bot.
+ */
+function buildRuneProfileSetupEmbed(rsn) {
+  return new EmbedBuilder()
+    .setColor(COLOR.warn)
+    .setTitle("RuneProfile Not Set Up")
+    .setDescription(
+      `I couldn't find **${rsn}** on RuneProfile, so I can't pull pet data for that account.\n\n` +
+        "**To show up here, that account needs the free RuneProfile RuneLite plugin:**\n" +
+        "1. In RuneLite, open the wrench (Configuration) and go to **Plugin Hub**.\n" +
+        "2. Search **RuneProfile** and click **Install**.\n" +
+        "3. Log into OSRS, open the **Collection Log**, and click into the **Pets** page at least once — the plugin only uploads pages you've actually opened.\n" +
+        "4. It uploads automatically from there (or right-click its sidebar panel and choose **Upload**).\n\n" +
+        "Set up at: https://runeprofile.com"
+    );
+}
+
+async function sendRuneProfileSetupNotice(user, rsn, fallbackChannel) {
+  const embed = buildRuneProfileSetupEmbed(rsn);
+  const dmSent = await user.send({ embeds: [embed] }).catch(() => null);
+  if (dmSent) return;
+  // DMs closed — fall back to a brief, self-deleting channel message instead
+  // of silently doing nothing.
+  const temp = await fallbackChannel?.send({ content: `<@${user.id}>`, embeds: [embed] }).catch(() => null);
+  if (temp) {
+    const t = setTimeout(() => temp.delete().catch(() => {}), 20000);
+    if (typeof t.unref === "function") t.unref();
+  }
+}
+
+/**
+ * Handles one message in the OSRS stats channel. Returns false (and leaves
+ * the message untouched) if it isn't a recognized !lvl/!kc/!pets command at
+ * all — e.g. ordinary chat that happens to mention "kc" in passing. Once a
+ * message IS recognized as a command attempt, it's always deleted (even on
+ * a typo'd boss/skill name or an RSN that isn't on the Hiscores) so the
+ * channel stays clean, matching how these commands behave in-game.
+ */
+async function handleOsrsStatsCommand(message) {
+  const parsed = parseOsrsStatsCommand(message.content);
+  if (!parsed) return false;
+
+  await message.delete().catch((e) =>
+    console.warn(`[OsrsStats] Could not delete command message (channel ${message.channelId}, message ${message.id}):`, e.message)
+  );
+
+  if (parsed.type === "pets") {
+    const result = await fetchRuneProfilePets(parsed.rsn);
+    if (result.notFound) {
+      await sendRuneProfileSetupNotice(message.author, parsed.rsn, message.channel);
+    } else if (!result.ok) {
+      await sendOsrsStatsNotice(message.channel, message.author.id, `Couldn't reach RuneProfile to look up **${parsed.rsn}**'s pets right now — try again in a bit.`);
+    } else if (result.pets.length === 0) {
+      await message.channel
+        .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** doesn't have any pets logged on RuneProfile yet.`)], allowedMentions: { parse: [] } })
+        .catch(() => {});
+    } else {
+      await message.channel
+        .send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(COLOR.main)
+              .setDescription(`**${parsed.rsn}** has **${result.pets.length}** pet${result.pets.length === 1 ? "" : "s"}: ${result.pets.join(", ")}`),
+          ],
+          allowedMentions: { parse: [] },
+        })
+        .catch((e) => console.warn("[OsrsStats] Could not post !pets result:", e.message));
+    }
+    return true;
+  }
+
+  const isLvl = parsed.type === "lvl";
+  const canonicalName = isLvl ? resolveSkillHiscoreName(parsed.alias) : resolveBossHiscoreName(parsed.alias);
+  if (!canonicalName) {
+    await sendOsrsStatsNotice(
+      message.channel,
+      message.author.id,
+      isLvl
+        ? `I don't recognize the skill "${parsed.alias}". Use the skill's name with no spaces, e.g. \`!lvl woodcutting ${parsed.rsn}\`.`
+        : `I don't recognize the boss "${parsed.alias}". Use the boss's name with no spaces (e.g. \`kbd\`, \`cox\`, \`zulrah\`), e.g. \`!kc zulrah ${parsed.rsn}\`.`
+    );
+    return true;
+  }
+
+  const hiscoreData = await fetchPlayerHiscores(parsed.rsn);
+  if (!hiscoreData) {
+    await sendOsrsStatsNotice(message.channel, message.author.id, `Couldn't find **${parsed.rsn}** on the OSRS Hiscores — double check the spelling/capitalization.`);
+    return true;
+  }
+
+  if (isLvl) {
+    const entry = (hiscoreData.skills || []).find((s) => normalizeHiscoreName(s.name) === normalizeHiscoreName(canonicalName));
+    const level = entry ? Number(entry.level) : 0;
+    if (!entry || level <= 0) {
+      await sendOsrsStatsNotice(message.channel, message.author.id, `**${parsed.rsn}** doesn't have a recorded ${canonicalName} level yet.`);
+      return true;
+    }
+    const rank = Number(entry.rank);
+    const xp = Number(entry.xp);
+    const embed = new EmbedBuilder()
+      .setColor(COLOR.main)
+      .setDescription(
+        `**${parsed.rsn}** has level **${level}** ${canonicalName} (**${xp.toLocaleString()}** XP${rank > 0 ? `, rank #${rank.toLocaleString()}` : ""}).`
+      );
+    await message.channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((e) => console.warn("[OsrsStats] Could not post !lvl result:", e.message));
+    return true;
+  }
+
+  // kc
+  const entry = (hiscoreData.activities || []).find((a) => normalizeHiscoreName(a.name) === normalizeHiscoreName(canonicalName));
+  const kc = entry ? Number(entry.score) : -1;
+  if (!entry || kc < 0) {
+    await message.channel
+      .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** hasn't recorded any kills at **${canonicalName}** yet (unranked).`)], allowedMentions: { parse: [] } })
+      .catch(() => {});
+    return true;
+  }
+  const rank = Number(entry.rank);
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setDescription(`**${parsed.rsn}** has a Kill Count of **${kc.toLocaleString()}** at **${canonicalName}**${rank > 0 ? ` (rank #${rank.toLocaleString()})` : ""}.`);
+  await message.channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((e) => console.warn("[OsrsStats] Could not post !kc result:", e.message));
+  return true;
+}
+
 // ================= WEEKLY HISCORES SNAPSHOT & RECAP =================
 // Every Sunday at 5:00 PM Central, Heimdall snapshots every active member's OSRS
 // hiscores (skills + bosses/raids/minigames) plus their current Rank XP, diffs
@@ -4286,6 +4673,22 @@ async function logXpAwardToDiscord(memberRsn, events, totalXp, eligibleRankName)
       );
     await channel.send({ embeds: [embed] }).catch((e) => console.warn("[RankLog] Failed to post XP summary log:", e.message));
   }
+}
+
+// Guards the final ("2nd confirmation") step of the Rank-Up and Member-Left
+// staff alerts against being processed twice for the exact same alert
+// message — e.g. a staff member double-clicking "Yes, Confirm" before the
+// alert message visibly disappears sends Discord two separate button-click
+// interactions. Checked and recorded synchronously (no `await` in between),
+// so this is race-free even for two interactions arriving back-to-back,
+// since a single Node process only runs one event handler at a time.
+// Returns true the first time a given message id is seen, false after.
+const claimedAlertConfirmations = new Set();
+function claimAlertConfirmation(messageId) {
+  if (!messageId) return true; // nothing to key on (shouldn't happen outside tests) — don't block
+  if (claimedAlertConfirmations.has(messageId)) return false;
+  claimedAlertConfirmations.add(messageId);
+  return true;
 }
 
 async function logRankUpConfirmedToDiscord({ rsn, oldRank, newRank, totalXp, staffUser }) {
@@ -7269,6 +7672,14 @@ async function handleRecruitmentDriveMessage(message) {
 async function handleMessageCreate(message) {
   if (!message || message.author?.bot) return;
 
+  if (message.guildId && message.channelId === OSRS_STATS_CHANNEL_ID) {
+    const handled = await handleOsrsStatsCommand(message).catch((e) => {
+      console.error("[OsrsStats] message handler error:", e.message);
+      return false;
+    });
+    if (handled) return; // leave other channel-wide behaviors (e.g. attachments) alone if it wasn't one of our commands
+  }
+
   if (message.guildId && message.channelId === RECRUITMENT_DRIVE_CHANNEL_ID) {
     await handleRecruitmentDriveMessage(message).catch((e) => console.error("[RecruitmentDrive] message handler error:", e.message));
     return; // this channel is fully bot-managed — nothing else should act on it
@@ -7315,9 +7726,13 @@ async function handleMessageCreate(message) {
     return;
   }
 
-  // Delete the uploaded file message from the guild channel so the channel stays clean
+  // Delete the uploaded file message from the guild channel so the channel stays clean.
+  // Logged on failure (instead of silently swallowed) so a stuck message is
+  // diagnosable from the logs rather than just mysteriously reappearing.
   if (message.guildId && message.deletable !== false) {
-    await message.delete().catch(() => {});
+    await message.delete().catch((e) =>
+      console.warn(`[RosterUpload] Could not delete the uploaded roster message (channel ${message.channelId}, message ${message.id}):`, e.message)
+    );
   }
 
   const rows = parseRosterText(rawText);
@@ -7396,6 +7811,16 @@ async function onRankUpCancel(interaction, encodedRsn, targetRank) {
 
 async function onRankUpConfirm2(interaction, encodedRsn, targetRank) {
   const rsn = decodeName(encodedRsn);
+
+  // Guard against double-processing the exact same confirmation — e.g. an
+  // impatient double-click on "Yes, Confirm" before the alert message gets
+  // deleted/disabled sends two separate interactions for the same button.
+  // Without this, each one would independently promote the member again and
+  // post its own duplicate congrats announcement. See claimAlertConfirmation.
+  if (!claimAlertConfirmation(interaction.message?.id)) {
+    return interaction.deferUpdate().catch(() => {});
+  }
+
   await interaction.deferUpdate();
 
   const supabase = getSupabase();
@@ -7406,6 +7831,14 @@ async function onRankUpConfirm2(interaction, encodedRsn, targetRank) {
   if (supabase) {
     const member = await findMemberByRsn(supabase, rsn);
     if (member) {
+      // Defense in depth beyond the in-memory guard above (e.g. covers two
+      // overlapping bot processes during a deploy): if this exact alert was
+      // already resolved — its pending_alert_message_id no longer matches
+      // the message this click came from — someone else already handled it.
+      if (interaction.message?.id && member.pending_alert_message_id !== interaction.message.id) {
+        return;
+      }
+
       oldRank = member.confirmed_rank || "Bronze";
       xp = Number(member.xp) || 0;
       promotedTo = targetRank || member.eligible_rank || getRankForXp(xp).name;
@@ -7465,6 +7898,12 @@ async function onMemberLeftCancel(interaction, encodedRsn) {
 
 async function onMemberLeftConfirm2(interaction, encodedRsn) {
   const rsn = decodeName(encodedRsn);
+
+  // Same double-click guard as onRankUpConfirm2 — see claimAlertConfirmation.
+  if (!claimAlertConfirmation(interaction.message?.id)) {
+    return interaction.deferUpdate().catch(() => {});
+  }
+
   await interaction.deferUpdate();
 
   const supabase = getSupabase();
@@ -7478,6 +7917,12 @@ async function onMemberLeftConfirm2(interaction, encodedRsn) {
   if (supabase) {
     const member = await findMemberByRsn(supabase, rsn);
     if (member) {
+      // Defense in depth beyond the in-memory guard above — see the matching
+      // check in onRankUpConfirm2.
+      if (interaction.message?.id && member.pending_alert_message_id !== interaction.message.id) {
+        return;
+      }
+
       memberRecord = member;
       await supabase
         .from("clan_members")
@@ -7992,8 +8437,10 @@ module.exports = {
   buildRankUpCongratsAnnouncement,
   postRankUpCongratsAnnouncement,
   onRankUpConfirm2,
+  claimAlertConfirmation,
   buildMemberLeftAlertStep1,
   buildMemberLeftAlertStep2,
+  onMemberLeftConfirm2,
   ensureRankListMessage,
   onGrowthRangeButton,
   onRankListPageButton,
@@ -8125,6 +8572,20 @@ module.exports = {
   primeTwitchLiveState,
   startTwitchLiveLoop,
   isTwitchConfigured,
+  // OSRS in-chat stat command exports (!lvl / !kc / !pets)
+  OSRS_STATS_CHANNEL_ID,
+  normalizeStatToken,
+  resolveSkillHiscoreName,
+  resolveBossHiscoreName,
+  SKILL_ALIASES,
+  KC_ALIASES,
+  ALL_KC_HISCORE_NAMES,
+  parseOsrsStatsCommand,
+  fetchRuneProfilePets,
+  buildRuneProfileSetupEmbed,
+  sendRuneProfileSetupNotice,
+  sendOsrsStatsNotice,
+  handleOsrsStatsCommand,
   // Server Privacy exports
   CLAN_FRIEND_ROLE_ID,
   SOCIAL_CHATTER_ROLE_ID,
