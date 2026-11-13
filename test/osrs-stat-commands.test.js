@@ -10,6 +10,7 @@
 // handler tests in this repo (e.g. recruitment-drive-upload-flow.test.js).
 const assert = require("assert");
 const path = require("path");
+const { ComponentType } = require("discord.js");
 
 const bot = require(path.join(__dirname, "..", "onboarding.js"));
 
@@ -17,6 +18,25 @@ let passed = 0;
 function check(label, cond) {
   assert.ok(cond, label);
   passed++;
+}
+
+// ================= Components V2 gallery test helpers =================
+// sendItemGalleryWithImages (!pets / !log <category>) posts Components V2
+// messages (a Container holding a TextDisplay for the header and/or a
+// MediaGallery for the item icons) instead of classic embeds, specifically
+// so each item's wiki icon keeps its own real aspect ratio in the tiled
+// gallery rather than being force-cropped square. These helpers pull the
+// plain-JSON shape back out of a captured `_sent` entry for assertions.
+function galleryContainerJSON(sentEntry) {
+  return sentEntry.payload.components[0].toJSON();
+}
+function galleryHeaderText(sentEntry) {
+  const textDisplay = galleryContainerJSON(sentEntry).components.find((c) => c.type === ComponentType.TextDisplay);
+  return textDisplay ? textDisplay.content : null;
+}
+function galleryImageItems(sentEntry) {
+  const mediaGallery = galleryContainerJSON(sentEntry).components.find((c) => c.type === ComponentType.MediaGallery);
+  return mediaGallery ? mediaGallery.items : [];
 }
 
 function makeFakeChannel() {
@@ -334,11 +354,11 @@ const REAL_WORLD_HISCORES = {
     check("!pets is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
     check("with no resolvable wiki icons (the default test stub), only the header is posted -- no empty picture-gallery message", message._channel._sent.length === 1);
-    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    const headerText = galleryHeaderText(message._channel._sent[0]);
     check("the header states the pet count", headerText.includes("2"));
     check("a pet obtained once is named in the header's list, without a dupe badge", headerText.includes("Baby Mole,"));
     check("a pet obtained more than once shows an 'xN' dupe count in the header's list", headerText.includes("Pet Zilyana x3"));
-    check("!pets' header keeps the normal (non-red) color -- only !log's header is colored red", message._channel._sent[0].payload.embeds[0].data.color === bot.COLOR.main);
+    check("!pets' header keeps the normal (non-red) color -- only !log's header is colored red", galleryContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.main);
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
@@ -363,13 +383,12 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiImageFetcher = async () => { throw new Error("!pets must not use the big-image (pageimages) fetcher at all"); };
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    check("a header plus one gallery message are posted, since at least one pet has a resolvable icon", message._channel._sent.length === 2);
-    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header and the (single-batch) gallery combine into one Components V2 message, since everything fits in one Media Gallery", message._channel._sent.length === 1);
+    const headerText = galleryHeaderText(message._channel._sent[0]);
     check("both pets are still named in the header regardless of whether their icon resolved", headerText.includes("Baby Mole") && headerText.includes("Herbi"));
-    const galleryEmbeds = message._channel._sent[1].payload.embeds;
-    check("only the pet with a resolved wiki icon appears in the picture gallery (the other is simply omitted, not a broken tile)", galleryEmbeds.length === 1);
-    check("a pet with a resolved wiki icon is shown via the embed's full image (not a thumbnail)", galleryEmbeds[0].data.image?.url === "https://wiki.example/baby-mole.png");
-    check("gallery embeds set a shared url -- Discord's same-url trick for tiling multiple images into one compact grid", typeof galleryEmbeds[0].data.url === "string" && galleryEmbeds[0].data.url.length > 0);
+    const galleryItems = galleryImageItems(message._channel._sent[0]);
+    check("only the pet with a resolved wiki icon appears in the picture gallery (the other is simply omitted, not a broken tile)", galleryItems.length === 1);
+    check("a pet with a resolved wiki icon is shown at its own real aspect ratio via a Media Gallery item (not force-cropped square)", galleryItems[0].media.url === "https://wiki.example/baby-mole.png");
     bot.config.runeProfileFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
     bot.config.wikiImageFetcher = prevWikiPageFetcher;
@@ -483,9 +502,15 @@ const REAL_WORLD_HISCORES = {
     };
     bot.config.geLatestPriceFetcher = async () => {
       latestCalls++;
+      // The real /latest endpoint wraps its results in a top-level "data"
+      // key -- {"data": {"4151": {...}}} -- confirmed against a live
+      // request. This test hook must mirror that exact shape since it's a
+      // drop-in replacement for the real fetch.
       return {
-        "11832": { high: 22000000, low: 21500000 },
-        "4151": { high: null, low: 1200000 }, // only ever seen an instant-sell
+        data: {
+          "11832": { high: 22000000, low: 21500000 },
+          "4151": { high: null, low: 1200000 }, // only ever seen an instant-sell
+        },
       };
     };
     const prices = await bot.fetchGePrices(["Bandos chestplate", "Abyssal whip", "Some Untradeable Thing"]);
@@ -498,6 +523,34 @@ const REAL_WORLD_HISCORES = {
     await bot.fetchGePrices(["Bandos chestplate"]);
     check("the mapping dataset is only fetched once while cached", mappingCalls === 1);
     check("the latest-price dataset is only fetched once while cached", latestCalls === 1);
+
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot.config.geLatestPriceFetcher = prevLatestFetcher;
+    bot._resetGePriceCachesForTests();
+  }
+
+  // ================= fetchGePrices: the real /latest response is wrapped in a top-level "data" key -- confirmed against a live request -- and must be unwrapped correctly =================
+  {
+    bot._resetGePriceCachesForTests();
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    const prevLatestFetcher = bot.config.geLatestPriceFetcher;
+    bot.config.geMappingFetcher = async () => [{ id: 4151, name: "Abyssal whip" }];
+
+    // The real shape: {"data": {"4151": {...}}}. An earlier version of this
+    // code assumed a bare itemId-keyed object instead, which made every
+    // single item resolve to "no price" in production (there's no "data"
+    // key in the GE mapping, so nothing ever matched).
+    bot.config.geLatestPriceFetcher = async () => ({ data: { "4151": { high: 686034, low: 668662 } } });
+    const wrapped = await bot.fetchGePrices(["Abyssal whip"]);
+    check("the real, data-wrapped /latest shape resolves a price", wrapped.get("Abyssal whip") === 686034);
+    bot._resetGePriceCachesForTests();
+
+    // A bare itemId-keyed object (no "data" wrapper) is also accepted, as a
+    // defensive fallback in case that ever changes back -- it should not be
+    // required to match the live shape exactly to keep working.
+    bot.config.geLatestPriceFetcher = async () => ({ "4151": { high: 686034, low: 668662 } });
+    const bare = await bot.fetchGePrices(["Abyssal whip"]);
+    check("a bare (non-data-wrapped) /latest response is also tolerated", bare.get("Abyssal whip") === 686034);
 
     bot.config.geMappingFetcher = prevMappingFetcher;
     bot.config.geLatestPriceFetcher = prevLatestFetcher;
@@ -542,6 +595,85 @@ const REAL_WORLD_HISCORES = {
     bot.config.dropRateFetcher = prevDropRateFetcher;
   }
 
+  // ================= fetchWikiDropRateLive: queries the real `dropsline` Bucket schema correctly =================
+  // Regression coverage for a real production bug: an earlier version of
+  // this function queried/selected a `page_name` column that does not exist
+  // on the `dropsline` bucket (confirmed directly against the OSRS Wiki's
+  // own Module:DropsLine / Module:Get_drop_info Lua source -- the bucket's
+  // only columns are `item_name`, `rare_drop_table`, and `drop_json`, with
+  // the source page living INSIDE `drop_json` as "Dropped from"). Querying a
+  // nonexistent column made the Bucket API reject every request, so NO item
+  // ever showed a drop rate in production, for either !log or !pets.
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    delete bot.config.dropRateFetcher;
+    const originalFetch = global.fetch;
+
+    let capturedUrl = null;
+    global.fetch = async (url) => {
+      capturedUrl = url;
+      return {
+        ok: true,
+        json: async () => ({
+          bucket: [
+            { rare_drop_table: [false], drop_json: [JSON.stringify({ Rarity: "1/512", "Dropped from": "Zulrah" })] },
+            { rare_drop_table: [true], drop_json: [JSON.stringify({ Rarity: "1/5000", "Dropped from": "Rare drop table" })] },
+          ],
+        }),
+      };
+    };
+    const scoped = await bot.fetchWikiDropRate("Tanzanite fang", "Zulrah");
+    global.fetch = originalFetch;
+
+    check("the query never references the nonexistent 'page_name' bucket column", !String(capturedUrl).includes("page_name"));
+    check("the query selects the bucket's real columns (item_name is filtered via .where, not .select, so just rare_drop_table/drop_json here)", String(capturedUrl).includes("rare_drop_table") && String(capturedUrl).includes("drop_json"));
+    check("a row whose decoded 'Dropped from' matches the requested source page is preferred", scoped === "1/512");
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot._wikiDropRateCacheForTests.clear();
+  }
+
+  // ================= fetchWikiDropRateLive: falls back to a non-rare-drop-table entry when no source-page match is found =================
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    delete bot.config.dropRateFetcher;
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        bucket: [
+          { rare_drop_table: [true], drop_json: [JSON.stringify({ Rarity: "1/5000", "Dropped from": "Rare drop table" })] },
+          { rare_drop_table: [false], drop_json: [JSON.stringify({ Rarity: "1/128", "Dropped from": "Some Other Boss" })] },
+        ],
+      }),
+    });
+    const noScopeMatch = await bot.fetchWikiDropRate("Clue scroll (elite)", "A Source That Doesn't Appear In Any Row");
+    global.fetch = originalFetch;
+    check("when no row matches the requested source, the first non-rare-drop-table row is preferred over the RDT catch-all", noScopeMatch === "1/128");
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot._wikiDropRateCacheForTests.clear();
+  }
+
+  // ================= fetchWikiDropRateLive: a versioned source ("Zulrah#Core") still matches a plain pageNameHint of "Zulrah" =================
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    delete bot.config.dropRateFetcher;
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        bucket: [{ rare_drop_table: [false], drop_json: [JSON.stringify({ Rarity: "1/512", "Dropped from": "Zulrah#Core" })] }],
+      }),
+    });
+    const result = await bot.fetchWikiDropRate("Tanzanite fang", "Zulrah");
+    global.fetch = originalFetch;
+    check("a '#Variant' suffix on the stored source is ignored when matching against pageNameHint", result === "1/512");
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot._wikiDropRateCacheForTests.clear();
+  }
+
   // ================= buildItemExtraLabel: combines price + rate into one trailing label =================
   {
     check("both present: price first, then rate in parens", bot.buildItemExtraLabel("4.3m", "1/512") === "— 4.3m (1/512)");
@@ -558,7 +690,7 @@ const REAL_WORLD_HISCORES = {
     const prevLatestFetcher = bot.config.geLatestPriceFetcher;
     const prevDropRateFetcher = bot.config.dropRateFetcher;
     bot.config.geMappingFetcher = async () => [{ id: 1, name: "Lightbearer" }];
-    bot.config.geLatestPriceFetcher = async () => ({ "1": { high: 4300000, low: 4200000 } });
+    bot.config.geLatestPriceFetcher = async () => ({ data: { "1": { high: 4300000, low: 4200000 } } });
     bot.config.dropRateFetcher = async (itemName) => (itemName === "Lightbearer" ? "1/200" : null);
 
     const items = [
@@ -589,12 +721,14 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/\s+/g, "-").toLowerCase()}.png`]));
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    // 1 header + 2 gallery batches (10 + 3) = 3 messages total
-    check("more than 10 pictured pets are split across multiple gallery messages, respecting Discord's embed cap", message._channel._sent.length === 3);
-    check("the first gallery batch has exactly 10 embeds", message._channel._sent[1].payload.embeds.length === 10);
-    check("the second gallery batch has the remaining 3 embeds", message._channel._sent[2].payload.embeds.length === 3);
-    const allUrls = new Set([...message._channel._sent[1].payload.embeds, ...message._channel._sent[2].payload.embeds].map((e) => e.data.url));
-    check("every gallery embed across both batches shares the identical url -- that's what makes Discord tile them into one gallery", allUrls.size === 1);
+    // header + first 10-item gallery batch combine into one message, with
+    // the remaining 3 items spilling into a second, gallery-only message
+    // (2 messages total).
+    check("more than 10 pictured pets are split across multiple gallery messages, respecting the Media Gallery's 10-item cap", message._channel._sent.length === 2);
+    check("the first message's header text is still present alongside its (first) gallery batch", galleryHeaderText(message._channel._sent[0]).includes("13"));
+    check("the first gallery batch has exactly 10 items", galleryImageItems(message._channel._sent[0]).length === 10);
+    check("the second, header-less message has the remaining 3 items", galleryImageItems(message._channel._sent[1]).length === 3);
+    check("every item across both batches resolves to its own distinct, correctly-shaped icon url (no shared-url cropping hack needed)", new Set([...galleryImageItems(message._channel._sent[0]), ...galleryImageItems(message._channel._sent[1])].map((i) => i.media.url)).size === 13);
     bot.config.runeProfileFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
   }
@@ -809,18 +943,17 @@ const REAL_WORLD_HISCORES = {
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!log is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("a header message plus one gallery message are posted", message._channel._sent.length === 2);
-    check("!log's header embed is colored red (COLOR.bad), distinct from the gallery underneath it", message._channel._sent[0].payload.embeds[0].data.color === bot.COLOR.bad);
-    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header and the (single-batch) gallery combine into one Components V2 message", message._channel._sent.length === 1);
+    check("!log's header container is colored red (COLOR.bad), distinct from the gallery underneath it", galleryContainerJSON(message._channel._sent[0]).accent_color === bot.COLOR.bad);
+    const headerText = galleryHeaderText(message._channel._sent[0]);
     check("the header names the player and the resolved category", headerText.includes("Zezima") && headerText.includes("Tombs of Amascut"));
     check("the header shows the category's obtained/total progress", headerText.includes("4/10"));
     check("the header states how many items are shown (only the owned ones)", headerText.includes("2"));
     check("an item obtained once is named in the header's list, without a dupe badge", headerText.includes("Masori mask,"));
     check("an item obtained more than once shows its dupe count in the header's list", headerText.includes("Lightbearer x2"));
-    const itemEmbeds = message._channel._sent[1].payload.embeds;
-    check("only owned items appear in the picture gallery (the unowned Osmumten's fang is excluded)", itemEmbeds.length === 2);
-    check("gallery embeds use the item's wiki icon as the full embed image (not a per-item caption)", itemEmbeds.every((e) => typeof e.data.image?.url === "string"));
-    check("gallery embeds share one identical url so Discord tiles them into a compact grid", new Set(itemEmbeds.map((e) => e.data.url)).size === 1);
+    const itemImages = galleryImageItems(message._channel._sent[0]);
+    check("only owned items appear in the picture gallery (the unowned Osmumten's fang is excluded)", itemImages.length === 2);
+    check("gallery items use the item's wiki icon, each at its own real aspect ratio (not force-cropped square)", itemImages.every((i) => typeof i.media.url === "string"));
 
     bot.config.collectionLogFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
@@ -839,7 +972,7 @@ const REAL_WORLD_HISCORES = {
     bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
     bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: [{ name: "Baby Mole", quantity: 1 }] });
     bot.config.geMappingFetcher = async () => [{ id: 1, name: "Masori mask" }, { id: 2, name: "Lightbearer" }];
-    bot.config.geLatestPriceFetcher = async () => ({ "1": { high: 8_500_000, low: 8_300_000 }, "2": { high: 4_300_000, low: 4_200_000 } });
+    bot.config.geLatestPriceFetcher = async () => ({ data: { "1": { high: 8_500_000, low: 8_300_000 }, "2": { high: 4_300_000, low: 4_200_000 } } });
     bot.config.dropRateFetcher = async (itemName) => {
       if (itemName === "Masori mask") return "1/3,000";
       if (itemName === "Lightbearer") return "1/1,500";
@@ -849,13 +982,13 @@ const REAL_WORLD_HISCORES = {
 
     const logMessage = makeFakeMessage({ content: "!log toa Zezima" });
     await bot.handleOsrsStatsCommand(logMessage);
-    const logHeaderText = logMessage._channel._sent[0].payload.embeds[0].data.description;
+    const logHeaderText = galleryHeaderText(logMessage._channel._sent[0]);
     check("!log's name list includes a tradeable item's GE value", logHeaderText.includes("Masori mask — 8.5m (1/3,000)"));
     check("!log's name list includes a dupe-count item's GE value alongside its count", logHeaderText.includes("Lightbearer x2 — 4.3m (1/1,500)"));
 
     const petsMessage = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(petsMessage);
-    const petsHeaderText = petsMessage._channel._sent[0].payload.embeds[0].data.description;
+    const petsHeaderText = galleryHeaderText(petsMessage._channel._sent[0]);
     check("!pets' name list shows the drop rate but NEVER a GE value, since pets are untradeable", petsHeaderText.includes("Baby Mole (1/3,000)") && !/—/.test(petsHeaderText));
 
     bot.config.collectionLogFetcher = prevCollectionFetcher;
@@ -914,7 +1047,7 @@ const REAL_WORLD_HISCORES = {
 
     const message = makeFakeMessage({ content: "!log huey Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    const headerText = galleryHeaderText(message._channel._sent[0]);
     check("the header includes the matched Hiscores kill count for a boss category", headerText.includes("1,367"));
     check("the header phrases it as kills/completions recorded", /kills?\/completions? recorded/i.test(headerText));
 
@@ -932,7 +1065,7 @@ const REAL_WORLD_HISCORES = {
     const message = makeFakeMessage({ content: "!log toa Zezima" });
     const handled = await bot.handleOsrsStatsCommand(message);
     check("a failed/unmatched Hiscores lookup doesn't break the !log command itself", handled === true);
-    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    const headerText = galleryHeaderText(message._channel._sent[0]);
     check("the header simply omits the kills/completions clause rather than crashing or showing a bogus number", !/kills?\/completions?/i.test(headerText));
 
     bot.config.collectionLogFetcher = prevCollectionFetcher;
