@@ -22,24 +22,40 @@ function check(label, cond) {
 
 // ================= Components V2 result test helpers =================
 // sendItemListMessage (!pets / !log <category>) posts Components V2
-// messages: a Container holding an optional single-item Media Gallery (the
-// one overall banner picture, !log <category> only -- !pets has none), an
-// overall header Text Display (first batch only), and an item-list Text
-// Display whose content is one line per item (name/quantity/price/
-// drop-rate label), newline-separated -- NOT a picture per item, which was
-// reported live as turning into a huge scrolling mess once an account had a
-// lot of items. These helpers pull the plain-JSON shape back out of a
-// captured `_sent` entry for assertions.
+// messages: a Container holding either a bare header Text Display (no
+// banner picture, e.g. most !pets results) OR a Section pairing the header
+// Text Display with a small Thumbnail accessory (the one overall banner
+// picture -- the category's boss/activity picture for !log, or the rarest
+// pet's picture for !pets when one of the pets has a comparable rarity on
+// file), followed by an item-list Text Display whose content is one line
+// per item (name/quantity/price/drop-rate label), newline-separated -- NOT
+// a picture per item, which was reported live as turning into a huge
+// scrolling mess once an account had a lot of items. The banner picture
+// renders as a small Thumbnail accessory (rather than a full-size Media
+// Gallery) since a full-size image was reported live as far too large.
+// These helpers pull the plain-JSON shape back out of a captured `_sent`
+// entry for assertions.
 function resultContainerJSON(sentEntry) {
   return sentEntry.payload.components[0].toJSON();
 }
 /** The single overall banner picture's URL, or null if this message has none. */
 function resultBannerUrl(sentEntry) {
-  const gallery = resultContainerJSON(sentEntry).components.find((c) => c.type === ComponentType.MediaGallery);
-  return gallery ? gallery.items[0]?.media?.url || null : null;
+  const section = resultContainerJSON(sentEntry).components.find((c) => c.type === ComponentType.Section);
+  return section ? section.accessory?.media?.url || null : null;
 }
+/**
+ * Every top-level Text Display in a batch, INCLUDING the header line when
+ * it's nested inside a Section (alongside the banner picture) rather than a
+ * bare Text Display of its own -- sendItemListMessage only wraps the header
+ * in a Section when there's a banner picture to show next to it.
+ */
 function resultTextDisplays(sentEntry) {
-  return resultContainerJSON(sentEntry).components.filter((c) => c.type === ComponentType.TextDisplay);
+  const out = [];
+  for (const c of resultContainerJSON(sentEntry).components) {
+    if (c.type === ComponentType.TextDisplay) out.push(c);
+    else if (c.type === ComponentType.Section) out.push(...c.components);
+  }
+  return out;
 }
 /** The overall header line -- only present on a batch that has one (always the first Text Display when it does). */
 function resultHeaderText(sentEntry) {
@@ -142,6 +158,7 @@ const REAL_WORLD_HISCORES = {
   // otherwise an earlier test's cached "no image found" result for the same
   // title would shadow a later test's differently-stubbed fetcher.
   bot.config.wikiImageFetcher = async () => new Map();
+  bot.config.wikiItemImageFetcher = async () => null;
   // Same idea for the GE price + wiki drop-rate lookups: no price, no rate,
   // by default. Tests that specifically exercise that behavior override
   // these locally AND reset the (permanent, process-lifetime) caches first.
@@ -376,7 +393,7 @@ const REAL_WORLD_HISCORES = {
     check("everything still fits in a single message", message._channel._sent.length === 1);
     const headerText = resultHeaderText(message._channel._sent[0]);
     check("the header states the pet count", headerText.includes("2"));
-    check("!pets never shows a banner picture -- no single image represents a mixed pet list", resultBannerUrl(message._channel._sent[0]) === null);
+    check("with no resolvable drop rate for either pet (the default test stub), there's no rarest pet to pick a banner picture from", resultBannerUrl(message._channel._sent[0]) === null);
     const lines = resultItemLines(message._channel._sent[0]);
     check("each pet gets its own compact text line rather than its own image/row", lines.length === 2);
     check("a pet obtained once is named on its own line, without a dupe badge", lines.includes("**Baby Mole**"));
@@ -388,22 +405,64 @@ const REAL_WORLD_HISCORES = {
   // ================= handleOsrsStatsCommand: !pets with a lot of pets stays compact, with no per-pet image =================
   // Reported live as "a huge scrolling mess" when !pets showed one image per
   // pet: an account with ~20 pets produced an excessively long post. !pets
-  // now shows no image at all (no single picture represents a mixed pet
-  // list) and packs every pet into plain text lines instead.
+  // now shows at most ONE banner picture (the rarest pet -- not relevant to
+  // this particular test, since the default test stub has no drop rate on
+  // file for anything) and packs every pet into plain text lines instead.
   {
     const prevFetcher = bot.config.runeProfileFetcher;
     const prevWikiPageFetcher = bot.config.wikiImageFetcher;
     const pets = Array.from({ length: 20 }, (_, i) => ({ name: `Pet ${i}`, quantity: 1 }));
     bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets });
-    bot.config.wikiImageFetcher = async () => { throw new Error("!pets must never look up any image at all"); };
+    bot.config.wikiImageFetcher = async () => { throw new Error("!pets must never look up the big boss/activity picture !log uses"); };
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
     check("20 pets as plain text lines comfortably fit in a single message, with no scrolling mess of per-item images", message._channel._sent.length === 1);
-    check("still no banner picture even with a large pet list", resultBannerUrl(message._channel._sent[0]) === null);
+    check("no comparable rarity on file for any of them, so no rarest pet to show a banner picture of", resultBannerUrl(message._channel._sent[0]) === null);
     const lines = resultItemLines(message._channel._sent[0]);
     check("all 20 pets are listed", lines.length === 20);
     bot.config.runeProfileFetcher = prevFetcher;
     bot.config.wikiImageFetcher = prevWikiPageFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !pets shows the rarest pet's own picture as its one banner picture =================
+  // A mixed pet list has no single picture that represents "all of them" the
+  // way a boss's own wiki picture does for !log -- but the rarest pet
+  // someone actually owns is a natural, meaningful highlight instead.
+  {
+    const prevFetcher = bot.config.runeProfileFetcher;
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    const prevItemImageFetcher = bot.config.wikiItemImageFetcher;
+    bot._wikiItemImageCacheForTests.clear();
+    bot.config.runeProfileFetcher = async () => ({
+      ok: true,
+      notFound: false,
+      pets: [
+        { name: "Baby Mole", quantity: 1 },
+        { name: "Pet Zilyana", quantity: 1 },
+        { name: "Scurry", quantity: 1 },
+      ],
+    });
+    bot.config.dropRateFetcher = async (itemName) => {
+      if (itemName === "Baby Mole") return "1/3,000";
+      if (itemName === "Pet Zilyana") return "1/5,000";
+      if (itemName === "Scurry") return "1/2,000,000"; // by far the rarest of the three
+      return null;
+    };
+    let imageFetcherCalls = 0;
+    bot.config.wikiItemImageFetcher = async (name) => {
+      imageFetcherCalls++;
+      check("the single-item image lookup is only ever done for the rarest pet, not every pet in the list", name === "Scurry");
+      return "https://wiki.example/scurry-detail.png";
+    };
+
+    const message = makeFakeMessage({ content: "!pets Zezima" });
+    await bot.handleOsrsStatsCommand(message);
+    check("the rarest pet's picture is used as the one banner picture", resultBannerUrl(message._channel._sent[0]) === "https://wiki.example/scurry-detail.png");
+    check("the single-item image lookup is called exactly once, not once per pet", imageFetcherCalls === 1);
+
+    bot.config.runeProfileFetcher = prevFetcher;
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot.config.wikiItemImageFetcher = prevItemImageFetcher;
   }
 
   // ================= formatGpAmount: formats GP the way OSRS players actually write it =================
@@ -513,6 +572,112 @@ const REAL_WORLD_HISCORES = {
     bot.config.dropRateFetcher = prevDropRateFetcher;
   }
 
+  // ================= fetchWikiDropRates: looks up every item concurrently instead of one at a time =================
+  // Reported live as "pretty slow" -- an earlier version awaited each item's
+  // lookup one at a time in a sequential loop, so a category with many items
+  // (e.g. Tombs of Amascut's 13) paid that lookup's latency 13 times over
+  // instead of just once.
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    let concurrentCalls = 0;
+    let maxConcurrentCalls = 0;
+    bot.config.dropRateFetcher = async (itemName) => {
+      concurrentCalls++;
+      maxConcurrentCalls = Math.max(maxConcurrentCalls, concurrentCalls);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      concurrentCalls--;
+      return "1/100";
+    };
+    const names = Array.from({ length: 5 }, (_, i) => `Item ${i}`);
+    await bot.fetchWikiDropRates(names);
+    check("more than one item's lookup is ever in flight at the same time -- not a strictly sequential one-at-a-time loop", maxConcurrentCalls > 1);
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+  }
+
+  // ================= mapWithConcurrency: runs async work in parallel, capped at a max number in flight =================
+  {
+    let concurrentCalls = 0;
+    let maxConcurrentCalls = 0;
+    const items = Array.from({ length: 20 }, (_, i) => i);
+    const results = await bot.mapWithConcurrency(items, 3, async (item) => {
+      concurrentCalls++;
+      maxConcurrentCalls = Math.max(maxConcurrentCalls, concurrentCalls);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      concurrentCalls--;
+      return item * 2;
+    });
+    check("every item is processed, in its original order", results.length === 20 && results.every((r, i) => r === i * 2));
+    check("concurrency never exceeds the given limit", maxConcurrentCalls <= 3);
+    check("concurrency does get used -- it's not secretly still sequential", maxConcurrentCalls > 1);
+  }
+
+  // ================= parseDropRateDenominator: extracts the comparable "N" from a "1/N" rarity string =================
+  {
+    check("a plain fraction parses to its denominator", bot.parseDropRateDenominator("1/512") === 512);
+    check("thousands separators are stripped before parsing", bot.parseDropRateDenominator("1/2,000,000") === 2000000);
+    check("a non-fraction rarity label isn't comparable this way", bot.parseDropRateDenominator("Always") === null);
+    check("a missing rate isn't comparable either", bot.parseDropRateDenominator(null) === null);
+  }
+
+  // ================= findRarestItemName: picks the item with the lowest drop probability =================
+  {
+    const items = [{ name: "Common Pet" }, { name: "Rare Pet" }, { name: "No Rate Pet" }];
+    const rates = new Map([["Common Pet", "1/500"], ["Rare Pet", "1/50,000"]]);
+    check("the item with the largest 1/N denominator (the lowest probability) is picked", bot.findRarestItemName(items, rates) === "Rare Pet");
+    check("an item with no comparable rate on file is never picked over one that has one", bot.findRarestItemName(items, new Map([["No Rate Pet", null]])) === null);
+    check("when NONE of the items have a comparable rate, there's no rarest item to pick", bot.findRarestItemName(items, new Map()) === null);
+  }
+
+  // ================= fetchWikiItemImage: prefers an item's high-res "detail" image over its flat icon, same reasoning as the single banner picture's Thumbnail sizing =================
+  {
+    bot._wikiItemImageCacheForTests.clear();
+    const prevItemImageFetcher = bot.config.wikiItemImageFetcher;
+    delete bot.config.wikiItemImageFetcher; // exercise the real (live-call) code path, with fetch() itself stubbed
+    const originalFetch = global.fetch;
+    global.fetch = async (url) => {
+      check("the live lookup queries both the detail image and the flat icon fallback, in one request", String(url).includes("titles=File%3AHuberte%20detail.png%7CFile%3AHuberte.png"));
+      return {
+        ok: true,
+        json: async () => ({
+          query: {
+            pages: {
+              "1": { title: "File:Huberte detail.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte_detail.png" }] },
+              "2": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] },
+            },
+          },
+        }),
+      };
+    };
+    const result = await bot.fetchWikiItemImage("Huberte");
+    global.fetch = originalFetch;
+    check("resolves to the wiki's high-res detail image, not the flat icon, when both exist", result === "https://oldschool.runescape.wiki/images/Huberte_detail.png");
+    bot.config.wikiItemImageFetcher = prevItemImageFetcher;
+  }
+
+  // ================= fetchWikiItemImage: falls back to the flat icon when an item has no dedicated detail image =================
+  {
+    bot._wikiItemImageCacheForTests.clear();
+    const prevItemImageFetcher = bot.config.wikiItemImageFetcher;
+    delete bot.config.wikiItemImageFetcher;
+    const originalFetch = global.fetch;
+    global.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        query: {
+          pages: {
+            "-1": { title: "File:Huberte detail.png", missing: true },
+            "2": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] },
+          },
+        },
+      }),
+    });
+    const result = await bot.fetchWikiItemImage("Huberte");
+    global.fetch = originalFetch;
+    check("falls back to the flat icon when the detail image doesn't exist for this item", result === "https://oldschool.runescape.wiki/images/Huberte.png");
+    bot.config.wikiItemImageFetcher = prevItemImageFetcher;
+  }
+
   // ================= fetchWikiDropRate: caches a hit indefinitely but retries a miss later =================
   {
     bot._wikiDropRateCacheForTests.clear();
@@ -606,10 +771,13 @@ const REAL_WORLD_HISCORES = {
 
   // ================= buildItemExtraLabel: combines price + rate into one trailing label =================
   {
-    check("both present: price first, then rate in parens", bot.buildItemExtraLabel("4.3m", "1/512") === "— 4.3m (1/512)");
-    check("price only", bot.buildItemExtraLabel("4.3m", null) === "— 4.3m");
+    check("both present, quantity 1 (default): price first, then rate in parens, no 'ea' qualifier", bot.buildItemExtraLabel("4.3m", "1/512") === "— 4.3m (1/512)");
+    check("price only, quantity 1 (default)", bot.buildItemExtraLabel("4.3m", null) === "— 4.3m");
     check("rate only", bot.buildItemExtraLabel(null, "1/512") === "(1/512)");
     check("neither present is an empty string", bot.buildItemExtraLabel(null, null) === "");
+    check("price + quantity > 1 gets an 'ea' qualifier, so the shown price is unambiguously per item, not a total", bot.buildItemExtraLabel("4.3m", "1/512", 3) === "— 4.3m ea (1/512)");
+    check("price + quantity > 1 with no rate still gets the 'ea' qualifier", bot.buildItemExtraLabel("4.3m", null, 2) === "— 4.3m ea");
+    check("rate only + quantity > 1: no price to qualify, so no 'ea' appears anywhere", bot.buildItemExtraLabel(null, "1/512", 5) === "(1/512)");
   }
 
   // ================= enrichItemsWithExtras: wires price + drop rate into the gallery's item labels =================
@@ -628,7 +796,7 @@ const REAL_WORLD_HISCORES = {
       { name: "Masori mask", quantity: 1 }, // untradeable-in-this-test (not in the mapping) and no drop rate on file
     ];
     const enrichedWithPrice = await bot.enrichItemsWithExtras(items, { includePrice: true, pageNameHint: "Tombs of Amascut" });
-    check("an item with both a price and a rate gets both in its extra label", enrichedWithPrice[0].extra === "— 4.3m (1/200)");
+    check("an item with both a price and a rate gets both in its extra label, plus an 'ea' qualifier since quantity > 1", enrichedWithPrice[0].extra === "— 4.3m ea (1/200)");
     check("an item with neither gets no .extra field at all", enrichedWithPrice[1].extra === undefined);
 
     const enrichedNoPrice = await bot.enrichItemsWithExtras(items, { includePrice: false, pageNameHint: "Tombs of Amascut" });
@@ -938,8 +1106,8 @@ const REAL_WORLD_HISCORES = {
     const logMessage = makeFakeMessage({ content: "!log toa Zezima" });
     await bot.handleOsrsStatsCommand(logMessage);
     const logLines = resultItemLines(logMessage._channel._sent[0]);
-    check("!log's item lines include a tradeable item's GE value next to its name", logLines.includes("**Masori mask** — 8.5m (1/3,000)"));
-    check("!log's item lines include a dupe-count item's GE value alongside its count", logLines.includes("**Lightbearer** x2 — 4.3m (1/1,500)"));
+    check("!log's item lines include a tradeable item's GE value next to its name (no 'ea' qualifier for a single item)", logLines.includes("**Masori mask** — 8.5m (1/3,000)"));
+    check("!log's item lines include a dupe-count item's GE value, with an 'ea' qualifier so it's clearly a per-item price", logLines.includes("**Lightbearer** x2 — 4.3m ea (1/1,500)"));
 
     const petsMessage = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(petsMessage);
@@ -993,6 +1161,59 @@ const REAL_WORLD_HISCORES = {
     check("a missing/null hiscoreData is handled gracefully", bot.findHiscoreActivityForCollectionLogPage(null, "Zulrah") === null);
   }
 
+  // ================= findHiscoreActivitiesForCollectionLogPage / formatHiscoreCompletionsClause: raids with a separately-tracked harder difficulty show both counts =================
+  // A raid's collection log merges every difficulty's loot into ONE page
+  // (!log toa's item list covers normal/entry/expert all at once), but the
+  // Hiscores tracks each raid's harder difficulty as its own completely
+  // separate activity -- requested so e.g. a normal-mode-only vs. an
+  // expert-heavy ToA account is visible at a glance, same idea for Chambers
+  // of Xeric's Challenge Mode and Theatre of Blood's Hard Mode.
+  {
+    const hiscoreData = {
+      activities: [
+        { name: "Tombs of Amascut", rank: 500, score: 150 },
+        { name: "Tombs of Amascut: Expert Mode", rank: 800, score: 80 },
+        { name: "Chambers of Xeric", rank: 100, score: 300 },
+        { name: "Chambers of Xeric: Challenge Mode", rank: -1, score: 0 }, // never done CM
+        { name: "Theatre of Blood", rank: 50, score: 60 },
+        { name: "Theatre of Blood: Hard Mode", rank: 900, score: 5 },
+        { name: "Zulrah", rank: 10, score: 900 }, // an ordinary boss -- no harder-difficulty counterpart at all
+      ],
+    };
+
+    const toa = bot.findHiscoreActivitiesForCollectionLogPage(hiscoreData, "Tombs of Amascut");
+    check("ToA's normal-mode entry resolves", toa.normal?.score === 150);
+    check("ToA's Expert Mode entry resolves as its own separate activity", toa.hardMode?.score === 80);
+    check("ToA's hard-mode label is 'Expert Mode'", toa.hardModeLabel === "Expert Mode");
+    check(
+      "both ToA difficulties are shown side by side, normal first",
+      bot.formatHiscoreCompletionsClause(toa) === ", **150** normal / **80** Expert Mode kills/completions recorded"
+    );
+
+    const cox = bot.findHiscoreActivitiesForCollectionLogPage(hiscoreData, "Chambers of Xeric");
+    check("CoX's hard-mode label is 'Challenge Mode'", cox.hardModeLabel === "Challenge Mode");
+    check("a raid's harder difficulty with 0 recorded completions is treated as not-yet-done, not a real result", cox.hardMode === null);
+    check(
+      "with no Challenge Mode completions yet, CoX falls back to the original plain single-count phrasing (no '0 Challenge Mode' noise)",
+      bot.formatHiscoreCompletionsClause(cox) === ", **300** kills/completions recorded"
+    );
+
+    const tob = bot.findHiscoreActivitiesForCollectionLogPage(hiscoreData, "Theatre of Blood");
+    check(
+      "ToB's two difficulties are also both shown, labeled 'Hard Mode'",
+      bot.formatHiscoreCompletionsClause(tob) === ", **60** normal / **5** Hard Mode kills/completions recorded"
+    );
+
+    const zulrah = bot.findHiscoreActivitiesForCollectionLogPage(hiscoreData, "Zulrah");
+    check("an ordinary boss has no hard-mode label at all", zulrah.hardModeLabel === null);
+    check(
+      "an ordinary boss keeps the original single-count phrasing, unaffected by the raid-specific dual-difficulty logic",
+      bot.formatHiscoreCompletionsClause(zulrah) === ", **900** kills/completions recorded"
+    );
+
+    check("a category with no Hiscores match at all produces no clause", bot.formatHiscoreCompletionsClause({}) === "");
+  }
+
   // ================= handleOsrsStatsCommand: !log <category> shows Hiscores KC/completions alongside the item count =================
   {
     const prevCollectionFetcher = bot.config.collectionLogFetcher;
@@ -1005,6 +1226,27 @@ const REAL_WORLD_HISCORES = {
     const headerText = resultHeaderText(message._channel._sent[0]);
     check("the header includes the matched Hiscores kill count for a boss category", headerText.includes("1,367"));
     check("the header phrases it as kills/completions recorded", /kills?\/completions? recorded/i.test(headerText));
+
+    bot.config.collectionLogFetcher = prevCollectionFetcher;
+    bot.config.hiscoreFetcher = prevHiscoreFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> shows both difficulties' completions for a raid =================
+  {
+    const prevCollectionFetcher = bot.config.collectionLogFetcher;
+    const prevHiscoreFetcher = bot.config.hiscoreFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.hiscoreFetcher = async () => ({
+      activities: [
+        { name: "Tombs of Amascut", rank: 500, score: 150 },
+        { name: "Tombs of Amascut: Expert Mode", rank: 800, score: 80 },
+      ],
+    });
+
+    const message = makeFakeMessage({ content: "!log toa Zezima" });
+    await bot.handleOsrsStatsCommand(message);
+    const headerText = resultHeaderText(message._channel._sent[0]);
+    check("the header shows both ToA difficulties' completion counts side by side", headerText.includes("**150** normal / **80** Expert Mode kills/completions recorded"));
 
     bot.config.collectionLogFetcher = prevCollectionFetcher;
     bot.config.hiscoreFetcher = prevHiscoreFetcher;
