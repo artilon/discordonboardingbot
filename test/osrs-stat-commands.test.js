@@ -111,9 +111,12 @@ const REAL_WORLD_HISCORES = {
       JSON.stringify({ type: "kc", alias: "zulrah", rsn: "Lynx Titan" }));
     check("!pets with multi-word rsn parses", JSON.stringify(bot.parseOsrsStatsCommand("!pets Lynx Titan")) ===
       JSON.stringify({ type: "pets", rsn: "Lynx Titan" }));
+    check("!log with category + multi-word rsn parses", JSON.stringify(bot.parseOsrsStatsCommand("!log toa Lynx Titan")) ===
+      JSON.stringify({ type: "log", alias: "toa", rsn: "Lynx Titan" }));
     check("plain chat mentioning 'kc' in passing is not treated as a command", bot.parseOsrsStatsCommand("gz on the kc") === null);
     check("!kc with no rsn argument is not treated as a command", bot.parseOsrsStatsCommand("!kc zulrah") === null);
     check("!pets with no rsn argument is not treated as a command", bot.parseOsrsStatsCommand("!pets") === null);
+    check("!log with no rsn argument is not treated as a command", bot.parseOsrsStatsCommand("!log toa") === null);
     check("unrelated ! command is ignored", bot.parseOsrsStatsCommand("!help") === null);
   }
 
@@ -319,7 +322,7 @@ const REAL_WORLD_HISCORES = {
   // ================= handleOsrsStatsCommand: !pets with pets owned =================
   {
     const prevFetcher = bot.config.runeProfileFetcher;
-    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: ["Baby Mole", "Pet Zilyana"] });
+    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: [{ name: "Baby Mole", quantity: 1 }, { name: "Pet Zilyana", quantity: 3 }] });
     const message = makeFakeMessage({ content: "!pets Zezima" });
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!pets is recognized as a handled command", handled === true);
@@ -328,7 +331,8 @@ const REAL_WORLD_HISCORES = {
     const headerText = message._channel._sent[0].payload.embeds[0].data.description;
     check("the header states the pet count", headerText.includes("2"));
     const petEmbeds = message._channel._sent[1].payload.embeds;
-    check("one embed is posted per pet, named correctly", petEmbeds.length === 2 && petEmbeds[0].data.description === "Baby Mole" && petEmbeds[1].data.description === "Pet Zilyana");
+    check("a pet obtained once is shown by name alone (no dupe badge)", petEmbeds[0].data.description === "Baby Mole");
+    check("a pet obtained more than once shows an 'xN' dupe count", petEmbeds[1].data.description === "Pet Zilyana x3");
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
@@ -342,7 +346,7 @@ const REAL_WORLD_HISCORES = {
     const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
     const prevWikiPageFetcher = bot.config.wikiImageFetcher;
     bot._wikiFileImageCacheForTests.clear(); // an earlier test already cached "Baby Mole" as a miss under the default stub
-    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: ["Baby Mole", "Herbi"] });
+    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: [{ name: "Baby Mole", quantity: 1 }, { name: "Herbi", quantity: 1 }] });
     bot.config.wikiFileImageFetcher = async (titles) => {
       check("the wiki's small-icon lookup is queried with the exact pet names, in one batch", titles.length === 2 && titles.includes("Baby Mole") && titles.includes("Herbi"));
       const m = new Map();
@@ -386,7 +390,7 @@ const REAL_WORLD_HISCORES = {
   // ================= handleOsrsStatsCommand: !pets batches images across messages past Discord's 10-embed cap =================
   {
     const prevFetcher = bot.config.runeProfileFetcher;
-    const manyPets = Array.from({ length: 13 }, (_, i) => `Pet ${i + 1}`);
+    const manyPets = Array.from({ length: 13 }, (_, i) => ({ name: `Pet ${i + 1}`, quantity: 1 }));
     bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: manyPets });
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
@@ -508,10 +512,12 @@ const REAL_WORLD_HISCORES = {
     const result = await bot.fetchRuneProfilePets("Iron EZ Pets");
     global.fetch = originalFetch;
 
+    const petNames = result.pets.map((p) => p.name);
     check("a real populated account resolves ok", result.ok === true && result.notFound === false);
     check("exactly the 3 actually-owned pets are returned (from the \"All Pets\" page, not the per-boss pages)", result.pets.length === 3);
-    check("owned pets are named correctly", result.pets.includes("Pet chaos elemental") && result.pets.includes("Pet Zilyana") && result.pets.includes("TzRek-Jad"));
-    check("unowned pets (quantity 0) are excluded", !result.pets.includes("Hellpuppy") && !result.pets.includes("Pet Dagannoth Prime"));
+    check("owned pets are named correctly", petNames.includes("Pet chaos elemental") && petNames.includes("Pet Zilyana") && petNames.includes("TzRek-Jad"));
+    check("unowned pets (quantity 0) are excluded", !petNames.includes("Hellpuppy") && !petNames.includes("Pet Dagannoth Prime"));
+    check("each returned pet keeps its quantity (for dupe counts)", result.pets.every((p) => p.quantity === 1));
   }
 
   // ================= fetchRuneProfilePets: account exists but has 404'd / malformed collection-log =================
@@ -530,6 +536,125 @@ const REAL_WORLD_HISCORES = {
     const result = await bot.fetchRuneProfilePets("NobodyHasThis123");
     global.fetch = originalFetch;
     check("a 404 from RuneProfile is reported as notFound", result.ok === false && result.notFound === true);
+  }
+
+  // ================= resolveCollectionLogPage: !log <category> isn't limited to the !kc boss list =================
+  // RuneProfile's data is organized as tabs -> pages, one page per
+  // boss/raid/minigame/clue tier etc. !log must be able to find ANY of
+  // these by name (not just the curated OSRS_BOSSES/KC_ALIASES universe
+  // !kc uses), matched dynamically against whatever pages THIS player's
+  // own collection log actually contains.
+  const SAMPLE_COLLECTION_LOG = {
+    obtained: 50,
+    total: 100,
+    tabs: [
+      {
+        name: "Raids",
+        pages: [
+          { name: "Tombs of Amascut", obtained: 4, total: 10, items: [
+            { id: 1, name: "Masori mask", quantity: 1 },
+            { id: 2, name: "Lightbearer", quantity: 2 },
+            { id: 3, name: "Osmumten's fang", quantity: 0 },
+          ] },
+        ],
+      },
+      {
+        name: "Bosses",
+        pages: [
+          // Deliberately named WITHOUT the leading "The " that resolveBossHiscoreName("huey")
+          // resolves to ("The Hueycoatl") -- exercises the hiscoreMatchKey "The "-tolerant match.
+          { name: "Hueycoatl", obtained: 1, total: 3, items: [{ id: 4, name: "Huasca", quantity: 1 }] },
+          { name: "Zulrah", obtained: 0, total: 5, items: [{ id: 5, name: "Tanzanite fang", quantity: 0 }] },
+        ],
+      },
+      {
+        name: "Minigames",
+        pages: [
+          // Not a !kc boss at all -- only resolvable via direct name matching, not the boss alias table.
+          { name: "Barbarian Assault", obtained: 2, total: 6, items: [{ id: 6, name: "Fighter torso", quantity: 1 }] },
+        ],
+      },
+      {
+        name: "Clues",
+        pages: [
+          { name: "Clue Scrolls (easy)", obtained: 1, total: 4, items: [{ id: 7, name: "Clue scroll (easy) reward", quantity: 1 }] },
+          { name: "Clue Scrolls (medium)", obtained: 0, total: 4, items: [] },
+        ],
+      },
+    ],
+  };
+
+  {
+    check("a known !kc boss alias resolves against the real page name even across a 'The '-prefix mismatch ('huey' -> 'Hueycoatl' page)",
+      bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "huey")?.name === "Hueycoatl");
+    check("the full boss name also resolves the same way", bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "hueycoatl")?.name === "Hueycoatl");
+    check("a known raid alias resolves normally ('toa' -> Tombs of Amascut)",
+      bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "toa")?.name === "Tombs of Amascut");
+    check("a category outside the !kc boss list resolves via an exact name match ('barbarianassault')",
+      bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "barbarianassault")?.name === "Barbarian Assault");
+    check("a shortened, non-boss category name resolves via the unambiguous-prefix fallback ('barb')",
+      bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "barb")?.name === "Barbarian Assault");
+    check("an ambiguous shortened category (could be easy or medium clues) safely refuses rather than guessing",
+      bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "cluescrolls") === null);
+    check("a completely unrecognized category resolves to null", bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "bananas") === null);
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> end-to-end =================
+  {
+    const prevFetcher = bot.config.collectionLogFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+
+    const message = makeFakeMessage({ content: "!log toa Zezima" });
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("!log is recognized as a handled command", handled === true);
+    check("the command message is deleted", message._deleted === true);
+    check("a header message plus one image-batch message are posted", message._channel._sent.length === 2);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header names the player and the resolved category", headerText.includes("Zezima") && headerText.includes("Tombs of Amascut"));
+    check("the header shows the category's obtained/total progress", headerText.includes("4/10"));
+    check("the header states how many items are shown (only the owned ones)", headerText.includes("2"));
+    const itemEmbeds = message._channel._sent[1].payload.embeds;
+    check("only owned items are listed (the unowned Osmumten's fang is excluded)", itemEmbeds.length === 2);
+    check("an item obtained once is shown by name alone", itemEmbeds.some((e) => e.data.description === "Masori mask"));
+    check("an item obtained more than once shows its dupe count", itemEmbeds.some((e) => e.data.description === "Lightbearer x2"));
+
+    bot.config.collectionLogFetcher = prevFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> with nothing obtained yet =================
+  {
+    const prevFetcher = bot.config.collectionLogFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    const message = makeFakeMessage({ content: "!log zulrah Zezima" });
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("a category with zero owned items is still a handled command", handled === true);
+    const text = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the reply states nothing's been obtained yet rather than crashing", /hasn't obtained anything/i.test(text) && text.includes("Zulrah"));
+    bot.config.collectionLogFetcher = prevFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> with an unrecognized category =================
+  {
+    const prevFetcher = bot.config.collectionLogFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    const message = makeFakeMessage({ content: "!log bananas Zezima" });
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("an unrecognized !log category is still a handled (and cleaned-up) command", handled === true);
+    check("the command message is still deleted", message._deleted === true);
+    check("a transient notice (not a permanent channel post) is sent", message._channel._sent.length === 1);
+    bot.config.collectionLogFetcher = prevFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log, no RuneProfile account (the anti-spam case) =================
+  {
+    const prevFetcher = bot.config.collectionLogFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: false, notFound: true, data: null });
+    const message = makeFakeMessage({ content: "!log toa NobodyHasThis123" });
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("a missing RuneProfile account is still a handled command", handled === true);
+    check("NOTHING is posted publicly to the channel for a missing RuneProfile account", message._channel._sent.length === 0);
+    check("instead, the setup instructions are DMed to the invoker", message._dmsSent.length === 1);
+    bot.config.collectionLogFetcher = prevFetcher;
   }
 
   // ================= messages outside OSRS_STATS_CHANNEL_ID are left completely alone =================
