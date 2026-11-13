@@ -228,7 +228,7 @@ const WEEKLY_RECAP_CHANNEL_ID   = "1546413698979995678";
 const WEEKLY_RECAP_HOUR         = 17; // 5:00 PM, 24h clock, America/Chicago
 const WEEKLY_RECAP_ANCHOR_DATE  = { year: 2026, month: 11, day: 1 }; // First recap posts Sunday, Nov 1, 2026 at 17:00 Central
 
-// In-chat OSRS stat lookups (!lvl / !kc / !pets) only work in this channel.
+// In-chat OSRS stat lookups (!lvl / !kc / !pets / !log) only work in this channel.
 // NOTE: this is the same ID as WEEKLY_RECAP_CHANNEL_ID (it already also
 // carries rank-up congrats messages and Twitch live alerts) — confirmed
 // intentional by the clan, who refer to it as "the OSRS discussion channel".
@@ -2361,7 +2361,7 @@ function extractHiscoreMetric(hiscoreData, eventType, targetName) {
   return totalKills;
 }
 
-// ================= IN-CHAT OSRS STAT COMMANDS (!lvl / !kc / !pets) =================
+// ================= IN-CHAT OSRS STAT COMMANDS (!lvl / !kc / !pets / !log) =================
 // Mirrors the RuneLite-style in-game chat commands clan chats already use —
 // type the command in WEEKLY_RECAP_CHANNEL_ID (the "OSRS discussion" channel),
 // the bot deletes your command message and posts the looked-up stat publicly
@@ -2369,17 +2369,24 @@ function extractHiscoreMetric(hiscoreData, eventType, targetName) {
 // (works for any player, not just the one typing), since there's no in-game
 // "current chat name" equivalent to default to here.
 //
-//   !lvl <skill> <rsn...>   e.g. "!lvl woodcutting Lynx Titan"
-//   !kc <boss> <rsn...>     e.g. "!kc zulrah Lynx Titan"
-//   !pets <rsn...>          e.g. "!pets Lynx Titan"
+//   !lvl <skill> <rsn...>    e.g. "!lvl woodcutting Lynx Titan"
+//   !kc <boss> <rsn...>      e.g. "!kc zulrah Lynx Titan"
+//   !pets <rsn...>           e.g. "!pets Lynx Titan"
+//   !log <category> <rsn...> e.g. "!log toa Lynx Titan" -- that player's obtained
+//                            Tombs of Amascut collection log items (with dupe counts)
 //
-// <skill>/<boss> must be ONE word (so everything after it can be a
-// multi-word RSN without ambiguity) — either the skill/boss's exact name
-// with spaces/punctuation removed (e.g. "kingblackdragon"), or one of the
-// short aliases below (e.g. "kbd"). Skills/bosses come from the Hiscores —
-// no setup needed. Pets come from RuneProfile, which requires the player to
-// have installed the free RuneProfile RuneLite plugin and opened their
-// Collection Log's Pets page at least once; see buildRuneProfileSetupEmbed.
+// <skill>/<boss>/<category> must be ONE word (so everything after it can be
+// a multi-word RSN without ambiguity) — either the exact name with
+// spaces/punctuation removed (e.g. "kingblackdragon"), or one of the short
+// aliases below (e.g. "kbd"). Skills/bosses come from the Hiscores — no
+// setup needed. !pets and !log come from RuneProfile, which requires the
+// player to have installed the free RuneProfile RuneLite plugin and opened
+// their Collection Log at least once; see buildRuneProfileSetupEmbed.
+// Unlike !kc (limited to our curated boss list), !log <category> can look
+// up ANY of that player's real collection log pages — clue tiers,
+// minigames, whatever RuneProfile actually reports for them — matched
+// dynamically against their own data rather than a fixed name list; see
+// resolveCollectionLogPage.
 
 function normalizeStatToken(s) {
   return String(s || "")
@@ -2590,10 +2597,10 @@ function resolveSkillHiscoreName(input) {
   return resolveViaUnambiguousPrefix(norm, SKILL_ALIASES, OSRS_SKILLS.map((s) => s.name));
 }
 
-// ================= WIKI IMAGES FOR !lvl / !kc / !pets =================
+// ================= WIKI IMAGES FOR !lvl / !kc / !pets / !log =================
 // Pulls the thumbnail image the OSRS Wiki itself shows for a given page
 // (via MediaWiki's "pageimages" API, the same mechanism Google/Discord link
-// previews use) so !lvl/!kc/!pets replies can show the skill cape, boss, or
+// previews use) so !lvl/!kc/!pets/!log replies can show the skill cape, boss, or
 // pet alongside the numbers. This is a nice-to-have, never load-bearing: any
 // failure (wiki down, title not found, network hiccup) just means the embed
 // posts without a picture -- it must never block or break the actual stat
@@ -2607,9 +2614,54 @@ const WIKI_API_BASE = "https://oldschool.runescape.wiki/api.php";
 // A found image is cached indefinitely (wiki art for a given page doesn't
 // change); a miss/failure is only cached briefly so a transient wiki hiccup
 // (or a title we haven't added an override for yet) gets retried instead of
-// being "stuck" broken for the life of the process.
-const wikiImageCache = new Map();
+// being "stuck" broken for the life of the process. Kept as two separate
+// caches since they're two different kinds of lookup against two different
+// MediaWiki endpoints (see fetchWikiPageImages vs fetchWikiFileImages below).
+const wikiPageImageCache = new Map();
+const wikiFileImageCache = new Map();
 const WIKI_IMAGE_MISS_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Shared cache-then-fetch plumbing for both fetchWikiPageImages and
+ * fetchWikiFileImages below. `liveFetcher(titles)` and `configFetcher`
+ * (e.g. config.wikiImageFetcher) must both resolve to a Map/object of
+ * title -> image URL (or null) for exactly the titles they were given.
+ */
+async function fetchWikiImagesCached(titles, cache, configFetcher, liveFetcher) {
+  const uniqueTitles = [...new Set((titles || []).map((t) => String(t || "").trim()).filter(Boolean))];
+  const result = new Map();
+  if (uniqueTitles.length === 0) return result;
+
+  const now = Date.now();
+  const toFetch = [];
+  for (const title of uniqueTitles) {
+    const cached = cache.get(normalizeHiscoreName(title));
+    if (cached && cached.expiresAt > now) {
+      result.set(title, cached.url);
+    } else {
+      toFetch.push(title);
+    }
+  }
+  if (toFetch.length === 0) return result;
+
+  let fetched;
+  if (typeof configFetcher === "function") {
+    fetched = await configFetcher(toFetch).catch(() => null);
+  } else {
+    fetched = await liveFetcher(toFetch).catch(() => null);
+  }
+  const fetchedMap = fetched instanceof Map ? fetched : new Map(Object.entries(fetched || {}));
+
+  for (const title of toFetch) {
+    const url = fetchedMap.get(title) || null;
+    result.set(title, url);
+    cache.set(normalizeHiscoreName(title), {
+      url,
+      expiresAt: now + (url ? Number.POSITIVE_INFINITY : WIKI_IMAGE_MISS_TTL_MS),
+    });
+  }
+  return result;
+}
 
 // A few boss names where the Hiscores' own name (what resolveBossHiscoreName
 // returns) doesn't match the wiki's article title at all -- not just a
@@ -2642,45 +2694,16 @@ function wikiTitleForSkill(canonicalName) {
 }
 
 /**
- * Looks up the OSRS Wiki's page image for one or more article titles in a
+ * Looks up the OSRS Wiki's PAGE image for one or more article titles in a
  * single request (MediaWiki's query API accepts multiple `|`-separated
- * titles at once). Returns a Map of the ORIGINAL requested title -> image
- * URL, or null for any title with no image / that couldn't be resolved.
+ * titles at once) -- i.e. whatever image the wiki's own infobox shows for
+ * that article, which for a boss is its full creature render. Used for
+ * !kc/!lvl, where that full picture is exactly what's wanted. Returns a Map
+ * of the ORIGINAL requested title -> image URL, or null if unresolved.
+ * `config.wikiImageFetcher`, when set, replaces the real HTTP call (test hook).
  */
 async function fetchWikiPageImages(titles) {
-  const uniqueTitles = [...new Set((titles || []).map((t) => String(t || "").trim()).filter(Boolean))];
-  const result = new Map();
-  if (uniqueTitles.length === 0) return result;
-
-  const now = Date.now();
-  const toFetch = [];
-  for (const title of uniqueTitles) {
-    const cached = wikiImageCache.get(normalizeHiscoreName(title));
-    if (cached && cached.expiresAt > now) {
-      result.set(title, cached.url);
-    } else {
-      toFetch.push(title);
-    }
-  }
-  if (toFetch.length === 0) return result;
-
-  let fetched;
-  if (typeof config.wikiImageFetcher === "function") {
-    fetched = await config.wikiImageFetcher(toFetch).catch(() => null);
-  } else {
-    fetched = await fetchWikiPageImagesLive(toFetch).catch(() => null);
-  }
-  const fetchedMap = fetched instanceof Map ? fetched : new Map(Object.entries(fetched || {}));
-
-  for (const title of toFetch) {
-    const url = fetchedMap.get(title) || null;
-    result.set(title, url);
-    wikiImageCache.set(normalizeHiscoreName(title), {
-      url,
-      expiresAt: now + (url ? Number.POSITIVE_INFINITY : WIKI_IMAGE_MISS_TTL_MS),
-    });
-  }
-  return result;
+  return fetchWikiImagesCached(titles, wikiPageImageCache, config.wikiImageFetcher, fetchWikiPageImagesLive);
 }
 
 /** The real network call behind fetchWikiPageImages — isolated so tests never need to hit the live wiki. */
@@ -2719,13 +2742,63 @@ async function fetchWikiPageImagesLive(titles) {
   }
 }
 
+/**
+ * Looks up the OSRS Wiki's small ITEM ICON for one or more pet names, as
+ * opposed to fetchWikiPageImages' big infobox/creature render -- for !pets,
+ * a whole page of those full-size renders stacked up was reported as "huge
+ * and spammy". The wiki's own file-naming convention for an item's inventory
+ * icon is literally "<Item name>.png" (e.g. "Huberte.png"), a different,
+ * much smaller file than whatever image the pet's own article uses as its
+ * lead picture -- so this queries that exact file directly (MediaWiki's
+ * File: namespace + imageinfo) instead of going through pageimages at all.
+ * `config.wikiFileImageFetcher`, when set, replaces the real HTTP call (test hook).
+ */
+async function fetchWikiFileImages(names) {
+  return fetchWikiImagesCached(names, wikiFileImageCache, config.wikiFileImageFetcher, fetchWikiFileImagesLive);
+}
+
+/** The real network call behind fetchWikiFileImages — isolated so tests never need to hit the live wiki. */
+async function fetchWikiFileImagesLive(names) {
+  const fileTitles = names.map((n) => `File:${n}.png`);
+  const url =
+    `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
+    `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  if (typeof timeout.unref === "function") timeout.unref();
+
+  const out = new Map(names.map((n) => [n, null]));
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
+    if (!res.ok) return out;
+    const data = await res.json();
+
+    const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
+    const redirectMap = new Map((data?.query?.redirects || []).map((r) => [r.from, r.to]));
+    const pages = Object.values(data?.query?.pages || {});
+    const urlByFileTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
+
+    for (let i = 0; i < names.length; i++) {
+      let finalTitle = fileTitles[i];
+      if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
+      if (redirectMap.has(finalTitle)) finalTitle = redirectMap.get(finalTitle);
+      out.set(names[i], urlByFileTitle.get(finalTitle) || null);
+    }
+    return out;
+  } catch {
+    return out;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /** Convenience single-title wrapper around fetchWikiPageImages. */
 async function fetchWikiImage(title) {
   const map = await fetchWikiPageImages([title]);
   return map.get(title) || null;
 }
 
-/** Parses a message's raw content into one of our three stat commands, or null if it isn't one. */
+/** Parses a message's raw content into one of our four stat commands, or null if it isn't one. */
 function parseOsrsStatsCommand(content) {
   const tokens = String(content || "").trim().split(/\s+/);
   const cmd = (tokens[0] || "").toLowerCase();
@@ -2738,6 +2811,9 @@ function parseOsrsStatsCommand(content) {
   }
   if (cmd === "!pets" && tokens.length >= 2) {
     return { type: "pets", rsn: tokens.slice(1).join(" ") };
+  }
+  if (cmd === "!log" && tokens.length >= 3) {
+    return { type: "log", alias: tokens[1], rsn: tokens.slice(2).join(" ") };
   }
   return null;
 }
@@ -2752,18 +2828,21 @@ async function sendOsrsStatsNotice(channel, userId, content) {
 }
 
 /**
- * Looks up pet ownership via RuneProfile's public API. RuneProfile only has
- * data for players who've installed its free RuneLite plugin and opened
- * their Collection Log's Pets page at least once — a player simply not
- * having a RuneProfile account is the expected/common case, not an error.
- * `config.runeProfileFetcher`, when set, replaces this entirely (test hook).
+ * Fetches a player's full RuneProfile collection log (every tab/page, raw
+ * shape) -- the shared building block behind both !pets (which only cares
+ * about the "All Pets" page) and !log <category> (which looks up whichever
+ * page the player typed). RuneProfile only has data for players who've
+ * installed its free RuneLite plugin and opened their Collection Log at
+ * least once — a player simply not having a RuneProfile account is the
+ * expected/common case, not an error. `config.collectionLogFetcher`, when
+ * set, replaces this entirely (test hook).
  */
-async function fetchRuneProfilePets(rsn) {
-  if (typeof config.runeProfileFetcher === "function") {
-    return config.runeProfileFetcher(rsn);
+async function fetchRuneProfileCollectionLog(rsn) {
+  if (typeof config.collectionLogFetcher === "function") {
+    return config.collectionLogFetcher(rsn);
   }
   const cleanRsn = String(rsn || "").trim();
-  if (!cleanRsn) return { ok: false, notFound: true };
+  if (!cleanRsn) return { ok: false, notFound: true, data: null };
 
   const url = `https://api.runeprofile.com/v1/accounts/${encodeURIComponent(cleanRsn)}/collection-log`;
   const controller = new AbortController();
@@ -2771,30 +2850,88 @@ async function fetchRuneProfilePets(rsn) {
   if (typeof timeout.unref === "function") timeout.unref();
 
   try {
-    const headers = { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (RuneProfile pets lookup)" };
+    const headers = { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (RuneProfile collection log lookup)" };
     if (RUNEPROFILE_API_KEY) headers["X-API-Key"] = RUNEPROFILE_API_KEY;
     const res = await fetch(url, { headers, signal: controller.signal });
-    if (res.status === 404) return { ok: false, notFound: true };
-    if (!res.ok) return { ok: false, notFound: false, error: `RuneProfile request failed: ${res.status}` };
+    if (res.status === 404) return { ok: false, notFound: true, data: null };
+    if (!res.ok) return { ok: false, notFound: false, data: null, error: `RuneProfile request failed: ${res.status}` };
     const data = await res.json();
-    // Every pet in the game is aggregated onto one page named "All Pets"
-    // (confirmed against a live RuneProfile account: it lives under the
-    // "Other" tab, alongside each pet ALSO appearing on its own boss/skill's
-    // page — e.g. "Pet chaos elemental" shows up on both "Chaos Elemental"
-    // and "All Pets"). We match "All Pets" specifically rather than any
-    // page whose name merely contains "pet", since page names like
-    // "Barbarian Assault" or "Nex" don't mention pets at all but still
-    // nest a pet item inside them, and we only want the de-duplicated
-    // all-up list. We scan every tab (not just "Other") so this keeps
-    // working even if RuneProfile ever reorganizes it.
-    const petsPage = (data?.tabs || []).flatMap((t) => t.pages || []).find((p) => normalizeHiscoreName(p.name) === "all pets");
-    const pets = petsPage ? (petsPage.items || []).filter((i) => Number(i.quantity) > 0).map((i) => i.name) : [];
-    return { ok: true, notFound: false, pets };
+    return { ok: true, notFound: false, data };
   } catch (e) {
-    return { ok: false, notFound: false, error: e.message };
+    return { ok: false, notFound: false, data: null, error: e.message };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/** Every {tabName, page} pair across a RuneProfile collection log response, flattened for easy searching. */
+function flattenCollectionLogPages(data) {
+  return (data?.tabs || []).flatMap((t) => (t.pages || []).map((p) => ({ tabName: t.name, ...p })));
+}
+
+/**
+ * Resolves a typed !log category (e.g. "toa", "huey", "barbassault") to one
+ * actual collection log page from this specific player's data. Unlike
+ * !kc/!lvl, !log isn't limited to our curated boss list — any real
+ * collection log category (clue scrolls, minigames, etc.) should work, so
+ * matching is done dynamically against whatever pages this player's own
+ * RuneProfile data actually contains, in three passes:
+ *   1. A known !kc-style boss alias/name (e.g. "huey" -> "The Hueycoatl"),
+ *      matched against the real page names tolerating a leading "The ".
+ *   2. An exact (punctuation/case-insensitive) match of the typed text
+ *      itself against a page name.
+ *   3. An unambiguous prefix match of the typed text against the page
+ *      names themselves -- refuses rather than guessing if it could mean
+ *      more than one page, same safety rule as resolveViaUnambiguousPrefix.
+ */
+function resolveCollectionLogPage(data, input) {
+  const pages = flattenCollectionLogPages(data);
+  if (pages.length === 0) return null;
+  const norm = normalizeStatToken(input);
+  if (!norm) return null;
+
+  const bossGuess = resolveBossHiscoreName(input);
+  if (bossGuess) {
+    const match = pages.find((p) => hiscoreMatchKey(p.name) === hiscoreMatchKey(bossGuess));
+    if (match) return match;
+  }
+
+  const exact = pages.find((p) => normalizeStatToken(p.name) === norm);
+  if (exact) return exact;
+
+  if (norm.length >= 3) {
+    const candidates = pages.filter((p) => normalizeStatToken(p.name).startsWith(norm));
+    if (candidates.length === 1) return candidates[0];
+  }
+  return null;
+}
+
+/**
+ * Looks up pet ownership via RuneProfile. Every pet in the game is
+ * aggregated onto one page named "All Pets" (confirmed against a live
+ * RuneProfile account: it lives under the "Other" tab, alongside each pet
+ * ALSO appearing on its own boss/skill's page — e.g. "Pet chaos elemental"
+ * shows up on both "Chaos Elemental" and "All Pets"). We match "All Pets"
+ * specifically rather than any page whose name merely contains "pet", since
+ * page names like "Barbarian Assault" or "Nex" don't mention pets at all
+ * but still nest a pet item inside them, and we only want the de-duplicated
+ * all-up list. We scan every tab (not just "Other") so this keeps working
+ * even if RuneProfile ever reorganizes it. Each returned pet keeps its
+ * quantity (RuneProfile tracks re-obtaining the same pet as a dupe count,
+ * same as any other collection log item), so a player can be shown "xN" for
+ * any pet they've gotten more than once.
+ * `config.runeProfileFetcher`, when set, replaces this entirely (test hook).
+ */
+async function fetchRuneProfilePets(rsn) {
+  if (typeof config.runeProfileFetcher === "function") {
+    return config.runeProfileFetcher(rsn);
+  }
+  const result = await fetchRuneProfileCollectionLog(rsn);
+  if (!result.ok) return { ok: false, notFound: result.notFound, error: result.error };
+
+  const petsPage = flattenCollectionLogPages(result.data).find((p) => normalizeHiscoreName(p.name) === "all pets");
+  const pets = petsPage ? (petsPage.items || []).filter((i) => Number(i.quantity) > 0).map((i) => ({ name: i.name, quantity: Number(i.quantity) })) : [];
+  return { ok: true, notFound: false, pets };
 }
 
 /**
@@ -2836,37 +2973,50 @@ async function sendRuneProfileSetupNotice(user, rsn, fallbackChannel) {
 const DISCORD_MAX_EMBEDS_PER_MESSAGE = 10;
 
 /**
- * Posts the "!pets" result as a header line (player + pet count) followed by
- * one small embed per pet, each showing that pet's own OSRS Wiki picture
- * next to its name — i.e. a scrollable little gallery rather than one wall
- * of plain text. Chunked into multiple messages if the player owns more
- * pets than fit in a single message (Discord's 10-embeds-per-message cap).
+ * Posts a header line followed by one small embed per `item` ({name,
+ * quantity}), each showing that item's small OSRS Wiki item icon next to its
+ * name (with an "xN" dupe count if quantity > 1) — i.e. a compact little
+ * gallery rather than one wall of plain text (or, worse, the wiki's big
+ * full-size creature renders, which made !pets huge and spammy when tried).
+ * Chunked into multiple messages if there are more items than fit in one
+ * message (Discord's 10-embeds-per-message cap). Shared by !pets and
+ * !log <category>, which both ultimately show "which collection log items
+ * does this player own, and how many of each".
  */
-async function sendPetsResultWithImages(channel, rsn, pets) {
+async function sendItemGalleryWithImages(channel, headerText, items, warnLabel) {
   const header = await channel
-    .send({
-      embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`)],
-      allowedMentions: { parse: [] },
-    })
-    .catch((e) => console.warn("[OsrsStats] Could not post !pets header:", e.message));
+    .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(headerText)], allowedMentions: { parse: [] } })
+    .catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} header:`, e.message));
   if (!header) return;
 
-  const images = await fetchWikiPageImages(pets).catch(() => new Map());
-  for (let i = 0; i < pets.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
-    const batch = pets.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
-    const embeds = batch.map((pet) => {
-      const embed = new EmbedBuilder().setColor(COLOR.main).setDescription(pet);
-      const img = images.get(pet);
+  const images = await fetchWikiFileImages(items.map((i) => i.name)).catch(() => new Map());
+  for (let i = 0; i < items.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
+    const batch = items.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
+    const embeds = batch.map((item) => {
+      const embed = new EmbedBuilder().setColor(COLOR.main).setDescription(item.quantity > 1 ? `${item.name} x${item.quantity}` : item.name);
+      const img = images.get(item.name);
       if (img) embed.setThumbnail(img);
       return embed;
     });
-    await channel.send({ embeds, allowedMentions: { parse: [] } }).catch((e) => console.warn("[OsrsStats] Could not post !pets image batch:", e.message));
+    await channel.send({ embeds, allowedMentions: { parse: [] } }).catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} image batch:`, e.message));
   }
+}
+
+/** Posts the "!pets" result — see sendItemGalleryWithImages. */
+async function sendPetsResultWithImages(channel, rsn, pets) {
+  await sendItemGalleryWithImages(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, pets, "!pets");
+}
+
+/** Posts the "!log <category>" result — see sendItemGalleryWithImages. */
+async function sendCollectionLogResultWithImages(channel, rsn, page, ownedItems) {
+  const progress = Number.isFinite(page.obtained) && Number.isFinite(page.total) ? ` (**${page.obtained}/${page.total}**)` : "";
+  const header = `**${rsn}**'s **${page.name}**${progress} collection log — **${ownedItems.length}** item${ownedItems.length === 1 ? "" : "s"} obtained:`;
+  await sendItemGalleryWithImages(channel, header, ownedItems, "!log");
 }
 
 /**
  * Handles one message in the OSRS stats channel. Returns false (and leaves
- * the message untouched) if it isn't a recognized !lvl/!kc/!pets command at
+ * the message untouched) if it isn't a recognized !lvl/!kc/!pets/!log command at
  * all — e.g. ordinary chat that happens to mention "kc" in passing. Once a
  * message IS recognized as a command attempt, it's always deleted (even on
  * a typo'd boss/skill name or an RSN that isn't on the Hiscores) so the
@@ -2892,6 +3042,36 @@ async function handleOsrsStatsCommand(message) {
         .catch(() => {});
     } else {
       await sendPetsResultWithImages(message.channel, parsed.rsn, result.pets);
+    }
+    return true;
+  }
+
+  if (parsed.type === "log") {
+    const result = await fetchRuneProfileCollectionLog(parsed.rsn);
+    if (result.notFound) {
+      await sendRuneProfileSetupNotice(message.author, parsed.rsn, message.channel);
+      return true;
+    }
+    if (!result.ok) {
+      await sendOsrsStatsNotice(message.channel, message.author.id, `Couldn't reach RuneProfile to look up **${parsed.rsn}**'s collection log right now — try again in a bit.`);
+      return true;
+    }
+    const page = resolveCollectionLogPage(result.data, parsed.alias);
+    if (!page) {
+      await sendOsrsStatsNotice(
+        message.channel,
+        message.author.id,
+        `I couldn't match "${parsed.alias}" to one of **${parsed.rsn}**'s collection log categories. Try the full name, e.g. \`!log zulrah ${parsed.rsn}\`.`
+      );
+      return true;
+    }
+    const owned = (page.items || []).filter((i) => Number(i.quantity) > 0).map((i) => ({ name: i.name, quantity: Number(i.quantity) }));
+    if (owned.length === 0) {
+      await message.channel
+        .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** hasn't obtained anything from **${page.name}** yet.`)], allowedMentions: { parse: [] } })
+        .catch(() => {});
+    } else {
+      await sendCollectionLogResultWithImages(message.channel, parsed.rsn, page, owned);
     }
     return true;
   }
@@ -8797,7 +8977,7 @@ module.exports = {
   primeTwitchLiveState,
   startTwitchLiveLoop,
   isTwitchConfigured,
-  // OSRS in-chat stat command exports (!lvl / !kc / !pets)
+  // OSRS in-chat stat command exports (!lvl / !kc / !pets / !log)
   OSRS_STATS_CHANNEL_ID,
   normalizeStatToken,
   hiscoreMatchKey,
@@ -8810,18 +8990,25 @@ module.exports = {
   EXTRA_KC_HISCORE_NAMES,
   parseOsrsStatsCommand,
   fetchRuneProfilePets,
+  fetchRuneProfileCollectionLog,
+  flattenCollectionLogPages,
+  resolveCollectionLogPage,
   buildRuneProfileSetupEmbed,
   sendRuneProfileSetupNotice,
   sendOsrsStatsNotice,
   handleOsrsStatsCommand,
-  // Wiki image lookups for !lvl / !kc / !pets
+  // Wiki image lookups for !lvl / !kc / !pets / !log
   wikiTitleForBoss,
   wikiTitleForSkill,
   stripRaidModeSuffix,
   fetchWikiPageImages,
+  fetchWikiFileImages,
   fetchWikiImage,
+  sendItemGalleryWithImages,
   sendPetsResultWithImages,
-  _wikiImageCacheForTests: wikiImageCache,
+  sendCollectionLogResultWithImages,
+  _wikiPageImageCacheForTests: wikiPageImageCache,
+  _wikiFileImageCacheForTests: wikiFileImageCache,
   // Server Privacy exports
   CLAN_FRIEND_ROLE_ID,
   SOCIAL_CHATTER_ROLE_ID,
