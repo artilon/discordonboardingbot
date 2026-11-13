@@ -129,6 +129,12 @@ const LEADER_CHANNEL_ID       = "1546416683684593724";
 const OWNER_CHAT_CHANNEL_ID   = "1560000052435619901";
 const CLAN_CHAT_CHANNEL_ID    = "1561154983120863303";
 
+// The clan's general announcements channel -- doesn't live under any of the
+// categories above, so it gets its own standalone static rule (see
+// SERVER_PRIVACY_CATEGORIES; a plain channel ID works fine as a "category"
+// key there since applyServerPrivacyCategory fetches it directly by ID).
+const CLAN_ANNOUNCEMENTS_CHANNEL_ID = "1560034690340102164";
+
 // #server-logs is restricted to this one Discord account specifically, not a
 // role — so it stays private even if more people are ever given the Owner role.
 const SERVER_LOGS_OWNER_USER_ID = "351190870416031744";
@@ -410,6 +416,9 @@ const config = {
   rankListPage: 0,                    // 0-indexed; which 20-member page of the Rank List is shown
   supabase: null,                     // Initialized on startup or injected for tests
   hiscoreFetcher: null,               // Optional override for testing OSRS HiScores fetches
+  geMappingFetcher: null,             // Optional override for testing GE /mapping fetches
+  geLatestPriceFetcher: null,         // Optional override for testing GE /latest price fetches
+  dropRateFetcher: null,              // Optional override for testing OSRS Wiki drop-rate (Bucket API) fetches
   twitchPollIntervalMs: 90 * 1000,    // Check Twitch for a live-status change every 90 seconds
   twitchStreamFetcher: null,          // Optional override for testing Twitch API fetches
   // Remembers whether the last poll saw the channel live, and which stream's
@@ -2758,19 +2767,23 @@ async function fetchWikiFileImages(names) {
 }
 
 /** The real network call behind fetchWikiFileImages — isolated so tests never need to hit the live wiki. */
-async function fetchWikiFileImagesLive(names) {
+// One real attempt at the live file-image lookup. Unlike a per-title "no
+// icon exists for this name" miss (a legitimate, expected result that
+// should NOT be retried), this THROWS on a whole-request failure (timeout,
+// network error, non-2xx, bad JSON) so the retry wrapper below only retries
+// genuine transient failures, not items that simply don't have a wiki icon.
+async function fetchWikiFileImagesAttempt(names, timeoutMs) {
   const fileTitles = names.map((n) => `File:${n}.png`);
   const url =
     `${WIKI_API_BASE}?action=query&format=json&redirects=1&prop=imageinfo&iiprop=url` +
     `&titles=${encodeURIComponent(fileTitles.join("|"))}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   if (typeof timeout.unref === "function") timeout.unref();
 
-  const out = new Map(names.map((n) => [n, null]));
   try {
     const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki icon lookup)" }, signal: controller.signal });
-    if (!res.ok) return out;
+    if (!res.ok) throw new Error(`wiki file-image lookup returned HTTP ${res.status}`);
     const data = await res.json();
 
     const normalizedMap = new Map((data?.query?.normalized || []).map((n) => [n.from, n.to]));
@@ -2778,6 +2791,7 @@ async function fetchWikiFileImagesLive(names) {
     const pages = Object.values(data?.query?.pages || {});
     const urlByFileTitle = new Map(pages.map((p) => [p.title, p?.imageinfo?.[0]?.url || null]));
 
+    const out = new Map(names.map((n) => [n, null]));
     for (let i = 0; i < names.length; i++) {
       let finalTitle = fileTitles[i];
       if (normalizedMap.has(finalTitle)) finalTitle = normalizedMap.get(finalTitle);
@@ -2785,10 +2799,30 @@ async function fetchWikiFileImagesLive(names) {
       out.set(names[i], urlByFileTitle.get(finalTitle) || null);
     }
     return out;
-  } catch {
-    return out;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+/**
+ * Live file-image lookup with one automatic retry on a whole-request
+ * failure -- added after a live report of some (but not all) item icons in
+ * the same batch intermittently failing to load, which pointed at a
+ * transient wiki/CDN hiccup under load rather than a permanently-missing
+ * icon. Also bumped the per-attempt timeout from the original 8s to 10s,
+ * since a slow-but-eventually-successful response was being cut off early.
+ */
+async function fetchWikiFileImagesLive(names) {
+  try {
+    return await fetchWikiFileImagesAttempt(names, 10000);
+  } catch (err) {
+    console.warn("[OsrsStats] Wiki file-image lookup failed, retrying once:", err.message);
+    try {
+      return await fetchWikiFileImagesAttempt(names, 10000);
+    } catch (err2) {
+      console.warn("[OsrsStats] Wiki file-image lookup failed again, giving up for this batch:", err2.message);
+      return new Map(names.map((n) => [n, null]));
+    }
   }
 }
 
@@ -2796,6 +2830,234 @@ async function fetchWikiFileImagesLive(names) {
 async function fetchWikiImage(title) {
   const map = await fetchWikiPageImages([title]);
   return map.get(title) || null;
+}
+
+// ================= GE prices (for !log item values) =================
+// The OSRS Wiki's real-time price API, built on real Jagex trade data. Its
+// acceptable-use policy asks for a descriptive User-Agent, hence the same
+// style used for the wiki image lookups above. Per that same policy, we
+// fetch the FULL /mapping and /latest datasets once and cache them, rather
+// than hitting ?id=<item> per item -- exactly what the docs ask callers to
+// do instead of looping requests over every item.
+const GE_PRICES_API_BASE = "https://prices.runescape.wiki/api/v2/osrs";
+const GE_PRICES_USER_AGENT = "Odinheim-Heimdall-DiscordBot/1.0 (!log GE price lookup)";
+const GE_MAPPING_TTL_MS = 6 * 60 * 60 * 1000; // item metadata (name -> id) essentially never changes mid-session
+const GE_LATEST_PRICES_TTL_MS = 5 * 60 * 1000; // prices move constantly; keep this short
+
+let geItemMappingCache = null; // { map: Map(normalizedName -> itemId), expiresAt }
+let geLatestPricesCache = null; // { map: Map(String(itemId) -> {high, low}), expiresAt }
+
+/** Pets are untradeable in OSRS -- this is NOT reused for !pets, only for !log. */
+async function fetchGeItemMappingLive() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  if (typeof timeout.unref === "function") timeout.unref();
+  try {
+    const res = await fetch(`${GE_PRICES_API_BASE}/mapping`, { headers: { "User-Agent": GE_PRICES_USER_AGENT }, signal: controller.signal });
+    if (!res.ok) throw new Error(`GE price mapping lookup returned HTTP ${res.status}`);
+    const data = await res.json();
+    return Array.isArray(data) ? data : [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** `config.geMappingFetcher`, when set, replaces the real HTTP call (test hook). */
+async function fetchGeItemMapping() {
+  const now = Date.now();
+  if (geItemMappingCache && geItemMappingCache.expiresAt > now) return geItemMappingCache.map;
+  const data = typeof config.geMappingFetcher === "function" ? await config.geMappingFetcher() : await fetchGeItemMappingLive();
+  const map = new Map();
+  for (const item of Array.isArray(data) ? data : []) {
+    if (item && item.name && item.id != null) map.set(normalizeHiscoreName(item.name), item.id);
+  }
+  geItemMappingCache = { map, expiresAt: now + GE_MAPPING_TTL_MS };
+  return map;
+}
+
+async function fetchGeLatestPricesLive() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  if (typeof timeout.unref === "function") timeout.unref();
+  try {
+    const res = await fetch(`${GE_PRICES_API_BASE}/latest`, { headers: { "User-Agent": GE_PRICES_USER_AGENT }, signal: controller.signal });
+    if (!res.ok) throw new Error(`GE latest-price lookup returned HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** `config.geLatestPriceFetcher`, when set, replaces the real HTTP call (test hook). */
+async function fetchGeLatestPrices() {
+  const now = Date.now();
+  if (geLatestPricesCache && geLatestPricesCache.expiresAt > now) return geLatestPricesCache.map;
+  const data = typeof config.geLatestPriceFetcher === "function" ? await config.geLatestPriceFetcher() : await fetchGeLatestPricesLive();
+  const map = new Map();
+  for (const [id, entry] of Object.entries(data || {})) {
+    if (!entry) continue;
+    const high = entry.high === null || entry.high === undefined ? NaN : Number(entry.high);
+    const low = entry.low === null || entry.low === undefined ? NaN : Number(entry.low);
+    map.set(String(id), { high: Number.isFinite(high) ? high : null, low: Number.isFinite(low) ? low : null });
+  }
+  geLatestPricesCache = { map, expiresAt: now + GE_LATEST_PRICES_TTL_MS };
+  return map;
+}
+
+/**
+ * Resolves the current GE value for each of `names`, via the cached
+ * mapping+latest-price datasets above. Items that aren't tradeable on the
+ * GE at all (never in /mapping), or that are tradeable but have no recorded
+ * price yet, are simply absent from the returned Map rather than being a
+ * hard error -- callers should treat a missing entry as "no price to show",
+ * not a failure.
+ */
+async function fetchGePrices(names) {
+  const out = new Map();
+  const mapping = await fetchGeItemMapping().catch(() => null);
+  if (!mapping) return out;
+  const latest = await fetchGeLatestPrices().catch(() => null);
+  if (!latest) return out;
+  for (const name of names) {
+    const id = mapping.get(normalizeHiscoreName(name));
+    if (id == null) continue;
+    const entry = latest.get(String(id));
+    if (!entry) continue;
+    // "high" (instant-buy) is the more commonly quoted "GE price"; fall back
+    // to "low" (instant-sell) if we've only ever seen one side traded.
+    const price = entry.high ?? entry.low;
+    if (price != null) out.set(name, price);
+  }
+  return out;
+}
+
+/** Formats a GP amount the way OSRS players actually write it -- "1.2m", "850k", "999", "2.1b". */
+function formatGpAmount(amount) {
+  if (amount === null || amount === undefined || amount === "") return null;
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return null;
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1).replace(/\.0$/, "")}b`;
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(Math.round(n));
+}
+
+// ================= Wiki drop rates (for !pets / !log) =================
+// The OSRS Wiki stores every drop table in a queryable "Bucket" database
+// (the same MediaWiki extension backs both the OSRS and RS3 wikis) rather
+// than just rendered page HTML. See https://meta.weirdgloop.org/w/Extension:Bucket/Api.
+// NOTE: this couldn't be verified against the live wiki from this sandbox
+// (no outbound network access to it) -- built against the documented query
+// format/response shape, with defensive parsing, but may need a follow-up
+// tweak once it's actually exercised against the real API.
+const wikiDropRateCache = new Map(); // key: `${pageNameHint||""}::${normalizedItemName}` -> { rate, expiresAt }
+const WIKI_DROP_RATE_HIT_TTL_MS = 24 * 60 * 60 * 1000; // drop rates essentially never change
+const WIKI_DROP_RATE_MISS_TTL_MS = 10 * 60 * 1000; // but "not found yet" should retry periodically
+
+/** Escapes a value for safe interpolation into a Bucket query's single-quoted Lua string literals. */
+function escapeBucketQueryString(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+/** A Bucket field can come back as a bare scalar OR a single-element array depending on its declared type -- normalize to a scalar. */
+function firstBucketValue(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * Looks up one item's drop-rate rarity string exactly as shown on the wiki
+ * (e.g. "1/5,000"), optionally scoped to a specific source page (so a
+ * !log item's rate comes from the exact boss/raid it was just resolved
+ * against, rather than some other, unrelated source of the same item).
+ * Returns null if the item has no drop-table entry at all (e.g. most
+ * skilling pets, which aren't modeled as a "drop" the same way).
+ */
+async function fetchWikiDropRateLive(itemName, pageNameHint) {
+  const clauses = [`.where('item_name','${escapeBucketQueryString(itemName)}')`];
+  if (pageNameHint) clauses.push(`.where('page_name','${escapeBucketQueryString(pageNameHint)}')`);
+  const query = `bucket('dropsline').select('item_name','page_name','drop_json')${clauses.join("")}.limit(5).run()`;
+  const url = `${WIKI_API_BASE}?action=bucket&format=json&query=${encodeURIComponent(query)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  if (typeof timeout.unref === "function") timeout.unref();
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Odinheim-Heimdall-DiscordBot/1.0 (wiki drop-rate lookup)" }, signal: controller.signal });
+    if (!res.ok) throw new Error(`wiki drop-rate lookup returned HTTP ${res.status}`);
+    const data = await res.json();
+    const rows = Array.isArray(data?.bucket) ? data.bucket : [];
+    for (const row of rows) {
+      const dropJsonRaw = firstBucketValue(row?.drop_json);
+      if (!dropJsonRaw) continue;
+      let dropJson;
+      try {
+        dropJson = JSON.parse(dropJsonRaw);
+      } catch {
+        continue;
+      }
+      const rarity = dropJson?.Rarity || dropJson?.rarity;
+      if (rarity) return String(rarity);
+    }
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** `config.dropRateFetcher`, when set, replaces the real HTTP call (test hook) -- receives (itemName, pageNameHint), returns a rarity string or null. */
+async function fetchWikiDropRate(itemName, pageNameHint) {
+  const cacheKey = `${pageNameHint || ""}::${normalizeHiscoreName(itemName)}`;
+  const now = Date.now();
+  const cached = wikiDropRateCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.rate;
+
+  let rate = null;
+  try {
+    rate = typeof config.dropRateFetcher === "function" ? await config.dropRateFetcher(itemName, pageNameHint) : await fetchWikiDropRateLive(itemName, pageNameHint);
+  } catch (e) {
+    console.warn(`[OsrsStats] Wiki drop-rate lookup failed for "${itemName}":`, e.message);
+  }
+  wikiDropRateCache.set(cacheKey, { rate, expiresAt: now + (rate ? WIKI_DROP_RATE_HIT_TTL_MS : WIKI_DROP_RATE_MISS_TTL_MS) });
+  return rate;
+}
+
+/** Looks up drop rates for every name in `names`, scoped to the same optional `pageNameHint`. Returns a Map of name -> rarity string (only for names where one was found). */
+async function fetchWikiDropRates(names, pageNameHint) {
+  const out = new Map();
+  for (const name of names) {
+    const rate = await fetchWikiDropRate(name, pageNameHint).catch(() => null);
+    if (rate) out.set(name, rate);
+  }
+  return out;
+}
+
+/** Combines an optional GE-price string and an optional drop-rate string into one trailing label, e.g. "— 4.3m (1/512)". */
+function buildItemExtraLabel(priceText, rateText) {
+  const parts = [];
+  if (priceText) parts.push(`— ${priceText}`);
+  if (rateText) parts.push(`(${rateText})`);
+  return parts.join(" ");
+}
+
+/**
+ * Enriches {name, quantity} items with an `.extra` label (GE price and/or
+ * drop rate) for sendItemGalleryWithImages to display. `includePrice`
+ * should be false for !pets -- OSRS pets are untradeable, so they never
+ * have a meaningful GE value.
+ */
+async function enrichItemsWithExtras(items, { includePrice, pageNameHint } = {}) {
+  const names = items.map((i) => i.name);
+  const [prices, rates] = await Promise.all([
+    includePrice ? fetchGePrices(names).catch(() => new Map()) : Promise.resolve(new Map()),
+    fetchWikiDropRates(names, pageNameHint).catch(() => new Map()),
+  ]);
+  return items.map((item) => {
+    const priceText = includePrice ? formatGpAmount(prices.get(item.name)) : null;
+    const rateText = rates.get(item.name) || null;
+    const extra = buildItemExtraLabel(priceText, rateText);
+    return extra ? { ...item, extra } : item;
+  });
 }
 
 /** Parses a message's raw content into one of our four stat commands, or null if it isn't one. */
@@ -2972,46 +3234,110 @@ async function sendRuneProfileSetupNotice(user, rsn, fallbackChannel) {
 // Discord caps embeds at 10 per message.
 const DISCORD_MAX_EMBEDS_PER_MESSAGE = 10;
 
+// Any valid, stable URL works here -- Discord renders multiple embeds in the
+// same message that all share an identical `url` as one compact tiled photo
+// gallery, instead of stacking a full card per embed. That's the whole
+// reason this is set at all: it's never meant to be clicked, just to trigger
+// that grouping behavior. Pointed at the wiki since that's genuinely where
+// the pictures come from.
+const ITEM_GALLERY_URL = "https://oldschool.runescape.wiki/";
+
+// Keeps the header embed's one-line name list comfortably under Discord's
+// 4096-character embed description cap even for a very large haul.
+const ITEM_GALLERY_NAME_LIST_MAX_CHARS = 3500;
+
 /**
- * Posts a header line followed by one small embed per `item` ({name,
- * quantity}), each showing that item's small OSRS Wiki item icon next to its
- * name (with an "xN" dupe count if quantity > 1) — i.e. a compact little
- * gallery rather than one wall of plain text (or, worse, the wiki's big
- * full-size creature renders, which made !pets huge and spammy when tried).
- * Chunked into multiple messages if there are more items than fit in one
- * message (Discord's 10-embeds-per-message cap). Shared by !pets and
- * !log <category>, which both ultimately show "which collection log items
- * does this player own, and how many of each".
+ * Posts one header embed naming every `item` ({name, quantity, extra?}, with
+ * an "xN" dupe count where quantity > 1 and an optional trailing `.extra`
+ * label, e.g. GE price / drop rate from enrichItemsWithExtras), followed by
+ * a compact tiled photo gallery of their OSRS Wiki item icons — NOT one full
+ * embed card per item, which (for a big pet collection or a large
+ * collection log category) was reported as huge and spammy. Items with no
+ * resolvable icon are still named in the header, just left out of the
+ * picture gallery. Chunked into multiple gallery messages if there are more
+ * pictured items than fit in one message (Discord's 10-embeds-per-message
+ * cap). Shared by !pets and !log <category>, which both ultimately show
+ * "which collection log items does this player own, and how many of each".
  */
-async function sendItemGalleryWithImages(channel, headerText, items, warnLabel) {
+async function sendItemGalleryWithImages(channel, headerText, items, warnLabel, headerColor = COLOR.main) {
+  const labels = items.map((item) => {
+    const qtyPart = item.quantity > 1 ? ` x${item.quantity}` : "";
+    const extraPart = item.extra ? ` ${item.extra}` : "";
+    return `${item.name}${qtyPart}${extraPart}`;
+  });
+  let truncatedNameList = labels.join(", ");
+  if (truncatedNameList.length > ITEM_GALLERY_NAME_LIST_MAX_CHARS) {
+    let shown = 0;
+    let chars = 0;
+    for (const label of labels) {
+      const added = (shown === 0 ? 0 : 2) + label.length;
+      if (chars + added > ITEM_GALLERY_NAME_LIST_MAX_CHARS) break;
+      chars += added;
+      shown++;
+    }
+    truncatedNameList = `${labels.slice(0, shown).join(", ")} … (+${items.length - shown} more)`;
+  }
+
   const header = await channel
-    .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(headerText)], allowedMentions: { parse: [] } })
+    .send({ embeds: [new EmbedBuilder().setColor(headerColor).setDescription(`${headerText} ${truncatedNameList}`)], allowedMentions: { parse: [] } })
     .catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} header:`, e.message));
   if (!header) return;
 
   const images = await fetchWikiFileImages(items.map((i) => i.name)).catch(() => new Map());
-  for (let i = 0; i < items.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
-    const batch = items.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
-    const embeds = batch.map((item) => {
-      const embed = new EmbedBuilder().setColor(COLOR.main).setDescription(item.quantity > 1 ? `${item.name} x${item.quantity}` : item.name);
-      const img = images.get(item.name);
-      if (img) embed.setThumbnail(img);
-      return embed;
-    });
+  const pictured = items.filter((item) => images.get(item.name));
+  for (let i = 0; i < pictured.length; i += DISCORD_MAX_EMBEDS_PER_MESSAGE) {
+    const batch = pictured.slice(i, i + DISCORD_MAX_EMBEDS_PER_MESSAGE);
+    const embeds = batch.map((item) => new EmbedBuilder().setColor(COLOR.main).setURL(ITEM_GALLERY_URL).setImage(images.get(item.name)));
     await channel.send({ embeds, allowedMentions: { parse: [] } }).catch((e) => console.warn(`[OsrsStats] Could not post ${warnLabel} image batch:`, e.message));
   }
 }
 
-/** Posts the "!pets" result — see sendItemGalleryWithImages. */
+/** Posts the "!pets" result — see sendItemGalleryWithImages. No GE price (pets are untradeable); drop rate only, where the wiki has one on file. */
 async function sendPetsResultWithImages(channel, rsn, pets) {
-  await sendItemGalleryWithImages(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, pets, "!pets");
+  const enriched = await enrichItemsWithExtras(pets, { includePrice: false });
+  await sendItemGalleryWithImages(channel, `**${rsn}** has **${pets.length}** pet${pets.length === 1 ? "" : "s"}:`, enriched, "!pets");
 }
 
-/** Posts the "!log <category>" result — see sendItemGalleryWithImages. */
-async function sendCollectionLogResultWithImages(channel, rsn, page, ownedItems) {
+/**
+ * Finds this collection log page's corresponding OSRS Hiscores activity
+ * entry (if any), so !log can show "how many kills/completions" alongside
+ * "how many items obtained" -- letting someone tell a mega-spooned (very
+ * few kills, lots of items) or cursed (tons of kills, barely any items)
+ * account apart at a glance. RuneProfile's own collection log data never
+ * includes kill counts, so this cross-references the same official OSRS
+ * Hiscores lookup !kc already uses. Not every collection log page has a
+ * Hiscores equivalent (plenty of minigames/misc categories aren't tracked
+ * there at all) -- returns null rather than guessing in that case.
+ */
+function findHiscoreActivityForCollectionLogPage(hiscoreData, pageName) {
+  const activities = hiscoreData && Array.isArray(hiscoreData.activities) ? hiscoreData.activities : [];
+  const candidateNames = [pageName, stripRaidModeSuffix(pageName)];
+  for (const candidate of candidateNames) {
+    const key = hiscoreMatchKey(candidate);
+    const entry = activities.find((a) => hiscoreMatchKey(a.name) === key);
+    if (entry && Number(entry.score) > 0) return entry;
+  }
+  return null;
+}
+
+/**
+ * Posts the "!log <category>" result — see sendItemGalleryWithImages.
+ * `hiscoreEntry` is optional, from findHiscoreActivityForCollectionLogPage.
+ * Items are enriched with their current GE value (scoped by item name, since
+ * price isn't source-specific) and the wiki's listed drop rate for THIS
+ * specific source (scoped by `page.name`, so e.g. an item obtainable from
+ * multiple places shows the rate for the boss/category actually being
+ * looked at here, not some unrelated source of the same item).
+ */
+async function sendCollectionLogResultWithImages(channel, rsn, page, ownedItems, hiscoreEntry) {
   const progress = Number.isFinite(page.obtained) && Number.isFinite(page.total) ? ` (**${page.obtained}/${page.total}**)` : "";
-  const header = `**${rsn}**'s **${page.name}**${progress} collection log — **${ownedItems.length}** item${ownedItems.length === 1 ? "" : "s"} obtained:`;
-  await sendItemGalleryWithImages(channel, header, ownedItems, "!log");
+  const kc = hiscoreEntry ? Number(hiscoreEntry.score) : 0;
+  const kcLine = hiscoreEntry && kc > 0 ? `, **${kc.toLocaleString()}** kill${kc === 1 ? "" : "s"}/completion${kc === 1 ? "" : "s"} recorded` : "";
+  const header = `**${rsn}**'s **${page.name}**${progress} collection log — **${ownedItems.length}** item${ownedItems.length === 1 ? "" : "s"} obtained${kcLine}:`;
+  const enriched = await enrichItemsWithExtras(ownedItems, { includePrice: true, pageNameHint: page.name });
+  // Colored red per request, so the category name/stats stand out distinctly
+  // from the picture gallery underneath it.
+  await sendItemGalleryWithImages(channel, header, enriched, "!log", COLOR.bad);
 }
 
 /**
@@ -3071,7 +3397,9 @@ async function handleOsrsStatsCommand(message) {
         .send({ embeds: [new EmbedBuilder().setColor(COLOR.main).setDescription(`**${parsed.rsn}** hasn't obtained anything from **${page.name}** yet.`)], allowedMentions: { parse: [] } })
         .catch(() => {});
     } else {
-      await sendCollectionLogResultWithImages(message.channel, parsed.rsn, page, owned);
+      const hiscoreData = await fetchPlayerHiscores(parsed.rsn).catch(() => null);
+      const hiscoreEntry = hiscoreData ? findHiscoreActivityForCollectionLogPage(hiscoreData, page.name) : null;
+      await sendCollectionLogResultWithImages(message.channel, parsed.rsn, page, owned, hiscoreEntry);
     }
     return true;
   }
@@ -5902,6 +6230,16 @@ const SERVER_PRIVACY_CATEGORIES = {
   [SERVER_LOGS_CATEGORY_ID]: {
     label: "Server Logs",
     default: { everyone: EVERYONE_DENY, allowRoleIds: [], allowUserIds: [SERVER_LOGS_OWNER_USER_ID] },
+    channels: {},
+  },
+  // Standalone channel, not a real category -- see the comment on
+  // CLAN_ANNOUNCEMENTS_CHANNEL_ID above for why this still works cleanly.
+  // Visible to every clan member tier (same roster as Clan Chat/Recruitment
+  // Drive/Rank List) PLUS Clan Friends, so announcements always reach
+  // everyone in the community, not just full members.
+  [CLAN_ANNOUNCEMENTS_CHANNEL_ID]: {
+    label: "Announcements",
+    default: { everyone: EVERYONE_DENY, allowRoleIds: [...CLAN_MEMBER_AND_ABOVE_ROLE_IDS, CLAN_FRIEND_ROLE_ID] },
     channels: {},
   },
 };
@@ -8746,6 +9084,7 @@ if (require.main === module) {
 
 module.exports = {
   client,
+  COLOR,
   validateRsn,
   encodeName,
   decodeName,
@@ -9007,6 +9346,20 @@ module.exports = {
   sendItemGalleryWithImages,
   sendPetsResultWithImages,
   sendCollectionLogResultWithImages,
+  findHiscoreActivityForCollectionLogPage,
+  // GE price + wiki drop-rate lookups for !log (price) / !pets & !log (drop rate)
+  fetchGeItemMapping,
+  fetchGeLatestPrices,
+  fetchGePrices,
+  formatGpAmount,
+  fetchWikiDropRate,
+  fetchWikiDropRates,
+  buildItemExtraLabel,
+  enrichItemsWithExtras,
+  _geItemMappingCacheForTests: () => geItemMappingCache,
+  _geLatestPricesCacheForTests: () => geLatestPricesCache,
+  _resetGePriceCachesForTests: () => { geItemMappingCache = null; geLatestPricesCache = null; },
+  _wikiDropRateCacheForTests: wikiDropRateCache,
   _wikiPageImageCacheForTests: wikiPageImageCache,
   _wikiFileImageCacheForTests: wikiFileImageCache,
   // Server Privacy exports
@@ -9020,6 +9373,7 @@ module.exports = {
   LEADER_CHANNEL_ID,
   OWNER_CHAT_CHANNEL_ID,
   CLAN_CHAT_CHANNEL_ID,
+  CLAN_ANNOUNCEMENTS_CHANNEL_ID,
   SERVER_LOGS_OWNER_USER_ID,
   SERVER_PRIVACY_CATEGORIES,
   EVERYONE_OPEN,

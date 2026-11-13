@@ -102,6 +102,12 @@ const REAL_WORLD_HISCORES = {
   // title would shadow a later test's differently-stubbed fetcher.
   bot.config.wikiImageFetcher = async () => new Map();
   bot.config.wikiFileImageFetcher = async () => new Map();
+  // Same idea for the GE price + wiki drop-rate lookups: no price, no rate,
+  // by default. Tests that specifically exercise that behavior override
+  // these locally AND reset the (permanent, process-lifetime) caches first.
+  bot.config.geMappingFetcher = async () => [];
+  bot.config.geLatestPriceFetcher = async () => ({});
+  bot.config.dropRateFetcher = async () => null;
 
   // ================= parseOsrsStatsCommand =================
   {
@@ -327,12 +333,12 @@ const REAL_WORLD_HISCORES = {
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!pets is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("a header message plus one image-batch message are posted", message._channel._sent.length === 2);
+    check("with no resolvable wiki icons (the default test stub), only the header is posted -- no empty picture-gallery message", message._channel._sent.length === 1);
     const headerText = message._channel._sent[0].payload.embeds[0].data.description;
     check("the header states the pet count", headerText.includes("2"));
-    const petEmbeds = message._channel._sent[1].payload.embeds;
-    check("a pet obtained once is shown by name alone (no dupe badge)", petEmbeds[0].data.description === "Baby Mole");
-    check("a pet obtained more than once shows an 'xN' dupe count", petEmbeds[1].data.description === "Pet Zilyana x3");
+    check("a pet obtained once is named in the header's list, without a dupe badge", headerText.includes("Baby Mole,"));
+    check("a pet obtained more than once shows an 'xN' dupe count in the header's list", headerText.includes("Pet Zilyana x3"));
+    check("!pets' header keeps the normal (non-red) color -- only !log's header is colored red", message._channel._sent[0].payload.embeds[0].data.color === bot.COLOR.main);
     bot.config.runeProfileFetcher = prevFetcher;
   }
 
@@ -357,9 +363,13 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiImageFetcher = async () => { throw new Error("!pets must not use the big-image (pageimages) fetcher at all"); };
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    const petEmbeds = message._channel._sent[1].payload.embeds;
-    check("a pet with a resolved wiki icon gets a thumbnail", petEmbeds[0].data.thumbnail?.url === "https://wiki.example/baby-mole.png");
-    check("a pet with no resolved image gracefully has no thumbnail (not a crash)", petEmbeds[1].data.thumbnail === undefined);
+    check("a header plus one gallery message are posted, since at least one pet has a resolvable icon", message._channel._sent.length === 2);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("both pets are still named in the header regardless of whether their icon resolved", headerText.includes("Baby Mole") && headerText.includes("Herbi"));
+    const galleryEmbeds = message._channel._sent[1].payload.embeds;
+    check("only the pet with a resolved wiki icon appears in the picture gallery (the other is simply omitted, not a broken tile)", galleryEmbeds.length === 1);
+    check("a pet with a resolved wiki icon is shown via the embed's full image (not a thumbnail)", galleryEmbeds[0].data.image?.url === "https://wiki.example/baby-mole.png");
+    check("gallery embeds set a shared url -- Discord's same-url trick for tiling multiple images into one compact grid", typeof galleryEmbeds[0].data.url === "string" && galleryEmbeds[0].data.url.length > 0);
     bot.config.runeProfileFetcher = prevFetcher;
     bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
     bot.config.wikiImageFetcher = prevWikiPageFetcher;
@@ -387,18 +397,206 @@ const REAL_WORLD_HISCORES = {
     bot.config.wikiFileImageFetcher = prevFileFetcher;
   }
 
+  // ================= fetchWikiFileImages: a transient whole-request failure is retried once instead of giving up immediately =================
+  // Reported live: some (not all) item icons in the same !log/!pets batch
+  // intermittently failed to load, pointing at a transient wiki/CDN hiccup
+  // under load rather than permanently-missing icons.
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+    global.fetch = async () => {
+      callCount++;
+      if (callCount === 1) throw new Error("simulated transient network failure");
+      return {
+        ok: true,
+        json: async () => ({
+          query: { pages: { "1": { title: "File:Huberte.png", imageinfo: [{ url: "https://oldschool.runescape.wiki/images/Huberte.png" }] } } },
+        }),
+      };
+    };
+    const result = await bot.fetchWikiFileImages(["Huberte"]);
+    global.fetch = originalFetch;
+    check("a failed first attempt is retried exactly once", callCount === 2);
+    check("the retry's success is still returned to the caller", result.get("Huberte") === "https://oldschool.runescape.wiki/images/Huberte.png");
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= fetchWikiFileImages: a genuinely missing icon (not a request failure) is NOT retried as if it were transient =================
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+    global.fetch = async () => {
+      callCount++;
+      return { ok: true, json: async () => ({ query: { pages: { "-1": { title: "File:NoSuchItem.png", missing: true } } } }) };
+    };
+    const result = await bot.fetchWikiFileImages(["NoSuchItem"]);
+    global.fetch = originalFetch;
+    check("a clean (successful) response reporting no icon for this title is treated as a legitimate miss, not retried", callCount === 1);
+    check("the miss still resolves to null rather than throwing", result.get("NoSuchItem") === null);
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= fetchWikiFileImages: two consecutive whole-request failures give up gracefully =================
+  {
+    const prevFileFetcher = bot.config.wikiFileImageFetcher;
+    delete bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+    global.fetch = async () => { callCount++; throw new Error("simulated persistent network failure"); };
+    const result = await bot.fetchWikiFileImages(["Huberte"]);
+    global.fetch = originalFetch;
+    check("exactly 2 attempts are made (1 initial + 1 retry), not an unbounded retry loop", callCount === 2);
+    check("after both attempts fail, the title resolves to null instead of the whole command crashing", result.get("Huberte") === null);
+    bot.config.wikiFileImageFetcher = prevFileFetcher;
+  }
+
+  // ================= formatGpAmount: formats GP the way OSRS players actually write it =================
+  {
+    check("sub-1000 stays a plain number", bot.formatGpAmount(999) === "999");
+    check("thousands get a 'k' suffix", bot.formatGpAmount(1500) === "1.5k");
+    check("a round thousand doesn't show a pointless '.0'", bot.formatGpAmount(2000) === "2k");
+    check("millions get an 'm' suffix", bot.formatGpAmount(4_300_000) === "4.3m");
+    check("billions get a 'b' suffix", bot.formatGpAmount(2_100_000_000) === "2.1b");
+    check("a non-numeric/missing amount resolves to null rather than 'NaN'", bot.formatGpAmount(undefined) === null && bot.formatGpAmount(null) === null);
+  }
+
+  // ================= fetchGePrices: resolves a GE value via the cached mapping + latest-price datasets =================
+  {
+    bot._resetGePriceCachesForTests();
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    const prevLatestFetcher = bot.config.geLatestPriceFetcher;
+    let mappingCalls = 0;
+    let latestCalls = 0;
+    bot.config.geMappingFetcher = async () => {
+      mappingCalls++;
+      return [
+        { id: 11832, name: "Bandos chestplate" },
+        { id: 4151, name: "Abyssal whip" },
+      ];
+    };
+    bot.config.geLatestPriceFetcher = async () => {
+      latestCalls++;
+      return {
+        "11832": { high: 22000000, low: 21500000 },
+        "4151": { high: null, low: 1200000 }, // only ever seen an instant-sell
+      };
+    };
+    const prices = await bot.fetchGePrices(["Bandos chestplate", "Abyssal whip", "Some Untradeable Thing"]);
+    check("a tradeable item's price resolves (preferring the instant-buy 'high' price)", prices.get("Bandos chestplate") === 22000000);
+    check("an item with only an instant-sell price on record falls back to 'low'", prices.get("Abyssal whip") === 1200000);
+    check("an item absent from the mapping entirely (never tradeable) is simply not in the result", !prices.has("Some Untradeable Thing"));
+
+    // A second lookup within the cache TTL must reuse the cached datasets,
+    // not re-fetch the (large) mapping/latest-price datasets per command.
+    await bot.fetchGePrices(["Bandos chestplate"]);
+    check("the mapping dataset is only fetched once while cached", mappingCalls === 1);
+    check("the latest-price dataset is only fetched once while cached", latestCalls === 1);
+
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot.config.geLatestPriceFetcher = prevLatestFetcher;
+    bot._resetGePriceCachesForTests();
+  }
+
+  // ================= fetchGePrices: a failed mapping/latest-price fetch degrades to "no prices" rather than crashing =================
+  {
+    bot._resetGePriceCachesForTests();
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    bot.config.geMappingFetcher = async () => { throw new Error("simulated GE API outage"); };
+    const prices = await bot.fetchGePrices(["Bandos chestplate"]);
+    check("a failed GE price lookup resolves to an empty Map instead of throwing", prices.size === 0);
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot._resetGePriceCachesForTests();
+  }
+
+  // ================= fetchWikiDropRates: resolves each item's rarity, optionally scoped to a specific source page =================
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    bot.config.dropRateFetcher = async (itemName, pageNameHint) => {
+      if (itemName === "Tanzanite fang" && pageNameHint === "Zulrah") return "1/512";
+      if (itemName === "Magic fang") return null; // never obtained / no drop-table entry on file
+      return null;
+    };
+    const rates = await bot.fetchWikiDropRates(["Tanzanite fang", "Magic fang"], "Zulrah");
+    check("an item with a known rate (scoped to the right source page) resolves", rates.get("Tanzanite fang") === "1/512");
+    check("an item with no drop-table entry at all is simply absent, not a crash", !rates.has("Magic fang"));
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+  }
+
+  // ================= fetchWikiDropRate: caches a hit indefinitely but retries a miss later =================
+  {
+    bot._wikiDropRateCacheForTests.clear();
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    let calls = 0;
+    bot.config.dropRateFetcher = async () => { calls++; return "1/5000"; };
+    await bot.fetchWikiDropRate("Baby Mole", "Giant Mole");
+    await bot.fetchWikiDropRate("Baby Mole", "Giant Mole");
+    check("a resolved drop rate is cached -- the fetcher isn't called again for the same item+source", calls === 1);
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+  }
+
+  // ================= buildItemExtraLabel: combines price + rate into one trailing label =================
+  {
+    check("both present: price first, then rate in parens", bot.buildItemExtraLabel("4.3m", "1/512") === "— 4.3m (1/512)");
+    check("price only", bot.buildItemExtraLabel("4.3m", null) === "— 4.3m");
+    check("rate only", bot.buildItemExtraLabel(null, "1/512") === "(1/512)");
+    check("neither present is an empty string", bot.buildItemExtraLabel(null, null) === "");
+  }
+
+  // ================= enrichItemsWithExtras: wires price + drop rate into the gallery's item labels =================
+  {
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    const prevLatestFetcher = bot.config.geLatestPriceFetcher;
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    bot.config.geMappingFetcher = async () => [{ id: 1, name: "Lightbearer" }];
+    bot.config.geLatestPriceFetcher = async () => ({ "1": { high: 4300000, low: 4200000 } });
+    bot.config.dropRateFetcher = async (itemName) => (itemName === "Lightbearer" ? "1/200" : null);
+
+    const items = [
+      { name: "Lightbearer", quantity: 2 },
+      { name: "Masori mask", quantity: 1 }, // untradeable-in-this-test (not in the mapping) and no drop rate on file
+    ];
+    const enrichedWithPrice = await bot.enrichItemsWithExtras(items, { includePrice: true, pageNameHint: "Tombs of Amascut" });
+    check("an item with both a price and a rate gets both in its extra label", enrichedWithPrice[0].extra === "— 4.3m (1/200)");
+    check("an item with neither gets no .extra field at all", enrichedWithPrice[1].extra === undefined);
+
+    const enrichedNoPrice = await bot.enrichItemsWithExtras(items, { includePrice: false, pageNameHint: "Tombs of Amascut" });
+    check("includePrice: false (used for !pets, since pets are untradeable) omits the price even for an otherwise-tradeable name", enrichedNoPrice[0].extra === "(1/200)");
+
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot.config.geLatestPriceFetcher = prevLatestFetcher;
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
+  }
+
   // ================= handleOsrsStatsCommand: !pets batches images across messages past Discord's 10-embed cap =================
   {
     const prevFetcher = bot.config.runeProfileFetcher;
+    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
     const manyPets = Array.from({ length: 13 }, (_, i) => ({ name: `Pet ${i + 1}`, quantity: 1 }));
     bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: manyPets });
+    bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/\s+/g, "-").toLowerCase()}.png`]));
     const message = makeFakeMessage({ content: "!pets Zezima" });
     await bot.handleOsrsStatsCommand(message);
-    // 1 header + 2 image batches (10 + 3) = 3 messages total
-    check("more than 10 pets are split across multiple messages, respecting Discord's embed cap", message._channel._sent.length === 3);
-    check("the first image batch has exactly 10 embeds", message._channel._sent[1].payload.embeds.length === 10);
-    check("the second image batch has the remaining 3 embeds", message._channel._sent[2].payload.embeds.length === 3);
+    // 1 header + 2 gallery batches (10 + 3) = 3 messages total
+    check("more than 10 pictured pets are split across multiple gallery messages, respecting Discord's embed cap", message._channel._sent.length === 3);
+    check("the first gallery batch has exactly 10 embeds", message._channel._sent[1].payload.embeds.length === 10);
+    check("the second gallery batch has the remaining 3 embeds", message._channel._sent[2].payload.embeds.length === 3);
+    const allUrls = new Set([...message._channel._sent[1].payload.embeds, ...message._channel._sent[2].payload.embeds].map((e) => e.data.url));
+    check("every gallery embed across both batches shares the identical url -- that's what makes Discord tile them into one gallery", allUrls.size === 1);
     bot.config.runeProfileFetcher = prevFetcher;
+    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !pets with zero pets owned =================
@@ -602,23 +800,143 @@ const REAL_WORLD_HISCORES = {
   // ================= handleOsrsStatsCommand: !log <category> end-to-end =================
   {
     const prevFetcher = bot.config.collectionLogFetcher;
+    const prevWikiFileFetcher = bot.config.wikiFileImageFetcher;
+    bot._wikiFileImageCacheForTests.clear();
     bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.wikiFileImageFetcher = async (titles) => new Map(titles.map((t) => [t, `https://wiki.example/${t.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`]));
 
     const message = makeFakeMessage({ content: "!log toa Zezima" });
     const handled = await bot.handleOsrsStatsCommand(message);
     check("!log is recognized as a handled command", handled === true);
     check("the command message is deleted", message._deleted === true);
-    check("a header message plus one image-batch message are posted", message._channel._sent.length === 2);
+    check("a header message plus one gallery message are posted", message._channel._sent.length === 2);
+    check("!log's header embed is colored red (COLOR.bad), distinct from the gallery underneath it", message._channel._sent[0].payload.embeds[0].data.color === bot.COLOR.bad);
     const headerText = message._channel._sent[0].payload.embeds[0].data.description;
     check("the header names the player and the resolved category", headerText.includes("Zezima") && headerText.includes("Tombs of Amascut"));
     check("the header shows the category's obtained/total progress", headerText.includes("4/10"));
     check("the header states how many items are shown (only the owned ones)", headerText.includes("2"));
+    check("an item obtained once is named in the header's list, without a dupe badge", headerText.includes("Masori mask,"));
+    check("an item obtained more than once shows its dupe count in the header's list", headerText.includes("Lightbearer x2"));
     const itemEmbeds = message._channel._sent[1].payload.embeds;
-    check("only owned items are listed (the unowned Osmumten's fang is excluded)", itemEmbeds.length === 2);
-    check("an item obtained once is shown by name alone", itemEmbeds.some((e) => e.data.description === "Masori mask"));
-    check("an item obtained more than once shows its dupe count", itemEmbeds.some((e) => e.data.description === "Lightbearer x2"));
+    check("only owned items appear in the picture gallery (the unowned Osmumten's fang is excluded)", itemEmbeds.length === 2);
+    check("gallery embeds use the item's wiki icon as the full embed image (not a per-item caption)", itemEmbeds.every((e) => typeof e.data.image?.url === "string"));
+    check("gallery embeds share one identical url so Discord tiles them into a compact grid", new Set(itemEmbeds.map((e) => e.data.url)).size === 1);
 
     bot.config.collectionLogFetcher = prevFetcher;
+    bot.config.wikiFileImageFetcher = prevWikiFileFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> shows GE value + drop rate in the item labels, !pets shows drop rate only =================
+  {
+    const prevCollectionFetcher = bot.config.collectionLogFetcher;
+    const prevRuneProfileFetcher = bot.config.runeProfileFetcher;
+    const prevMappingFetcher = bot.config.geMappingFetcher;
+    const prevLatestFetcher = bot.config.geLatestPriceFetcher;
+    const prevDropRateFetcher = bot.config.dropRateFetcher;
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
+
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.runeProfileFetcher = async () => ({ ok: true, notFound: false, pets: [{ name: "Baby Mole", quantity: 1 }] });
+    bot.config.geMappingFetcher = async () => [{ id: 1, name: "Masori mask" }, { id: 2, name: "Lightbearer" }];
+    bot.config.geLatestPriceFetcher = async () => ({ "1": { high: 8_500_000, low: 8_300_000 }, "2": { high: 4_300_000, low: 4_200_000 } });
+    bot.config.dropRateFetcher = async (itemName) => {
+      if (itemName === "Masori mask") return "1/3,000";
+      if (itemName === "Lightbearer") return "1/1,500";
+      if (itemName === "Baby Mole") return "1/3,000";
+      return null;
+    };
+
+    const logMessage = makeFakeMessage({ content: "!log toa Zezima" });
+    await bot.handleOsrsStatsCommand(logMessage);
+    const logHeaderText = logMessage._channel._sent[0].payload.embeds[0].data.description;
+    check("!log's name list includes a tradeable item's GE value", logHeaderText.includes("Masori mask — 8.5m (1/3,000)"));
+    check("!log's name list includes a dupe-count item's GE value alongside its count", logHeaderText.includes("Lightbearer x2 — 4.3m (1/1,500)"));
+
+    const petsMessage = makeFakeMessage({ content: "!pets Zezima" });
+    await bot.handleOsrsStatsCommand(petsMessage);
+    const petsHeaderText = petsMessage._channel._sent[0].payload.embeds[0].data.description;
+    check("!pets' name list shows the drop rate but NEVER a GE value, since pets are untradeable", petsHeaderText.includes("Baby Mole (1/3,000)") && !/—/.test(petsHeaderText));
+
+    bot.config.collectionLogFetcher = prevCollectionFetcher;
+    bot.config.runeProfileFetcher = prevRuneProfileFetcher;
+    bot.config.geMappingFetcher = prevMappingFetcher;
+    bot.config.geLatestPriceFetcher = prevLatestFetcher;
+    bot.config.dropRateFetcher = prevDropRateFetcher;
+    bot._resetGePriceCachesForTests();
+    bot._wikiDropRateCacheForTests.clear();
+  }
+
+  // ================= findHiscoreActivityForCollectionLogPage: cross-referencing a !log category against the official Hiscores =================
+  // RuneProfile's own collection log data never includes kill counts, so !log
+  // shows them (when available) by matching the resolved category name
+  // against the SAME official Hiscores activities !kc already reads from --
+  // letting someone spot a mega-spooned (very few kills, lots of items) or
+  // cursed (tons of kills, barely any items) account from the numbers alone.
+  {
+    const hiscoreData = {
+      activities: [
+        { name: "The Hueycoatl", rank: 1226, score: 1367 }, // "The "-prefix mismatch, same as !kc's own bug fix
+        { name: "Tombs of Amascut", rank: 500, score: 42 },
+        { name: "Tombs of Amascut: Expert Mode", rank: -1, score: 0 },
+        { name: "Zulrah", rank: -1, score: 0 }, // never killed -- must NOT be reported as "0 kills recorded"
+      ],
+    };
+    check(
+      "a page name resolves against the Hiscores even across a 'The '-prefix mismatch",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Hueycoatl")?.score === 1367
+    );
+    check(
+      "an exact-name match (no prefix quirk) also resolves",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Tombs of Amascut")?.score === 42
+    );
+    check(
+      "a raid's '...: Expert Mode' collection log page name falls back to the base raid's Hiscores entry when the CM-specific one is unranked",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Tombs of Amascut: Expert Mode")?.score === 42
+    );
+    check(
+      "a Hiscores entry with 0 recorded kills (never actually killed) is treated as no match, not a real 0-kill result",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Zulrah") === null
+    );
+    check(
+      "a category with no Hiscores equivalent at all (e.g. a non-tracked minigame) resolves to null rather than crashing",
+      bot.findHiscoreActivityForCollectionLogPage(hiscoreData, "Some Untracked Minigame") === null
+    );
+    check("a missing/null hiscoreData is handled gracefully", bot.findHiscoreActivityForCollectionLogPage(null, "Zulrah") === null);
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> shows Hiscores KC/completions alongside the item count =================
+  {
+    const prevCollectionFetcher = bot.config.collectionLogFetcher;
+    const prevHiscoreFetcher = bot.config.hiscoreFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.hiscoreFetcher = async () => ({ activities: [{ name: "The Hueycoatl", rank: 1226, score: 1367 }] });
+
+    const message = makeFakeMessage({ content: "!log huey Zezima" });
+    await bot.handleOsrsStatsCommand(message);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header includes the matched Hiscores kill count for a boss category", headerText.includes("1,367"));
+    check("the header phrases it as kills/completions recorded", /kills?\/completions? recorded/i.test(headerText));
+
+    bot.config.collectionLogFetcher = prevCollectionFetcher;
+    bot.config.hiscoreFetcher = prevHiscoreFetcher;
+  }
+
+  // ================= handleOsrsStatsCommand: !log <category> still works fine when there's no Hiscores match (or the lookup fails) =================
+  {
+    const prevCollectionFetcher = bot.config.collectionLogFetcher;
+    const prevHiscoreFetcher = bot.config.hiscoreFetcher;
+    bot.config.collectionLogFetcher = async () => ({ ok: true, notFound: false, data: SAMPLE_COLLECTION_LOG });
+    bot.config.hiscoreFetcher = async () => { throw new Error("simulated Hiscores outage"); };
+
+    const message = makeFakeMessage({ content: "!log toa Zezima" });
+    const handled = await bot.handleOsrsStatsCommand(message);
+    check("a failed/unmatched Hiscores lookup doesn't break the !log command itself", handled === true);
+    const headerText = message._channel._sent[0].payload.embeds[0].data.description;
+    check("the header simply omits the kills/completions clause rather than crashing or showing a bogus number", !/kills?\/completions?/i.test(headerText));
+
+    bot.config.collectionLogFetcher = prevCollectionFetcher;
+    bot.config.hiscoreFetcher = prevHiscoreFetcher;
   }
 
   // ================= handleOsrsStatsCommand: !log <category> with nothing obtained yet =================

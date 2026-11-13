@@ -174,6 +174,32 @@ async function main() {
     check("Once verified, the explicit block is removed and they fall back to the Clan Member role's allow", !clanChatCategory.permissionOverwrites.cache.get("pending-member-id"));
   }
 
+  // ---- The announcements channel is a standalone channel ID used AS the
+  //      "category" key (it has no real Discord category) -- confirms that
+  //      still works end-to-end: self-corrects stale permissions, denies
+  //      @everyone, and allows every clan member tier plus Clan Friends. ----
+  {
+    const channelsById = new Map();
+    channelsById.set(
+      bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID,
+      makeFakeChannel(bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID, "announcements", [
+        { id: EVERYONE_ROLE, type: OverwriteType.Role, allow: [PermissionFlagsBits.ViewChannel] }, // stale: wide open
+      ])
+      // Deliberately no `.children` set -- a plain text channel never has one,
+      // confirming applyServerPrivacyCategory tolerates that gracefully.
+    );
+    const guild = makeFakeGuild(channelsById);
+
+    await bot.applyServerPrivacyCategory(guild, bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID, bot.SERVER_PRIVACY_CATEGORIES[bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID]);
+
+    const ch = channelsById.get(bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID);
+    check("Announcements: the stale wide-open @everyone allow is corrected to a deny", ch.permissionOverwrites.cache.get(EVERYONE_ROLE).deny.has(PermissionFlagsBits.ViewChannel));
+    check("Announcements: Clan Member is allowed", ch.permissionOverwrites.cache.get(CLAN_MEMBER_ROLE).allow.has(PermissionFlagsBits.ViewChannel));
+    check("Announcements: Clan Friend is allowed", ch.permissionOverwrites.cache.get(CLAN_FRIEND_ROLE).allow.has(PermissionFlagsBits.ViewChannel));
+    check("Announcements: Leader (staff tier) is also allowed, not just base Clan Member", ch.permissionOverwrites.cache.get(LEADER_ROLE).allow.has(PermissionFlagsBits.ViewChannel));
+    check("Announcements: Owner is also allowed", ch.permissionOverwrites.cache.get(OWNER_ROLE).allow.has(PermissionFlagsBits.ViewChannel));
+  }
+
   console.log(`[server-privacy-channel-coverage.test.js] ${passed} checks passed.`);
 }
 
