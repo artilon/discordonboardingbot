@@ -41,10 +41,14 @@ copy("README.md");
 copy("panel/panel-640x200.png");
 copy("panel/panel-320x100.png");
 copy("panel/make-panel.py");
+copy("vendor/qrcode.min.js");
 
 /* ---- 2. single-file overlay: same page with the QR encoder inlined ---- */
 const indexHtml = read("index.html");
-const qrcodeJs = read("vendor/qrcode.js");
+// Prefer the minified encoder: the single-file overlay is small enough to copy
+// and paste into Notepad, which is the fallback when a download button is blocked.
+const hasMin = fs.existsSync(path.join(SRC, "vendor/qrcode.min.js"));
+const qrcodeJs = hasMin ? read("vendor/qrcode.min.js") : read("vendor/qrcode.js");
 const tag = '<script src="vendor/qrcode.js"></script>';
 if (!indexHtml.includes(tag)) throw new Error("overlay no longer references vendor/qrcode.js — update the inliner");
 
@@ -61,10 +65,15 @@ const singleNamed = single.replace(
   "See README.md in this folder",
   "See README.md in this pack"
 );
-if (!singleNamed.includes("var qrcode = function") || singleNamed.split("</script>").length < 3) {
+if (!/var qrcode\s*=\s*function/.test(singleNamed) || singleNamed.split("</script>").length < 3) {
   throw new Error("inlined overlay looks broken — check the replacement in build-twitch-pack.js");
 }
 fs.writeFileSync(path.join(OUT, "odinheim-overlay-single-file.html"), singleNamed);
+
+// Same file inside the repo, so cloning or "Download ZIP" on GitHub gets it too.
+const DIST = path.join(SRC, "dist");
+fs.mkdirSync(DIST, { recursive: true });
+fs.writeFileSync(path.join(DIST, "odinheim-overlay-single-file.html"), singleNamed);
 
 /* ---- 3. START-HERE.txt: the shortest possible path to "it's working" ---- */
 fs.writeFileSync(
@@ -72,14 +81,17 @@ fs.writeFileSync(
   `ODINHEIM TWITCH PACK — read this first
 ======================================
 
-What's in here
---------------
+What's in here  (all paths are relative to this unzipped folder)
+----------------------------------------------------------------
 odinheim-overlay-single-file.html   The pop-up overlay. ONE file. Use this one.
-odinheim-overlay.html               Same overlay, needs the vendor/ folder.
-twitch-overlay/                     The whole folder version, plus preview + source.
+index.html + vendor/                The same overlay as a two-file page. Identical
+                                    result; only useful if you'd rather edit
+                                    something smaller than the 76 KB single file.
+preview.html                        Mock stream + fake chat, to see it in context.
 panel/panel-640x200.png             The clickable panel image for your channel page.
-README.md                           Full setup notes, troubleshooting, the rules about
-                                    what Twitch does and doesn't allow.
+panel/make-panel.py                 Redraws that image with different wording.
+README.md                           Full setup notes, troubleshooting, and the rules
+                                    about what Twitch does and doesn't allow.
 
 DO THIS FIRST (2 minutes)
 -------------------------
@@ -134,3 +146,5 @@ execFileSync("zip", ["-r", "-q", path.basename(ZIP), path.basename(OUT)], {
 const kb = (p) => (fs.statSync(p).size / 1024).toFixed(0) + " KB";
 console.log("pack dir:", OUT);
 console.log("zip     :", ZIP, "(" + kb(ZIP) + ")");
+console.log("in-repo :", path.join(SRC, "dist/odinheim-overlay-single-file.html"),
+            "(" + kb(path.join(SRC, "dist/odinheim-overlay-single-file.html")) + ")");
