@@ -9532,10 +9532,24 @@ function startTwitchLiveLoop() {
   }
   if (twitchPollTimer) clearInterval(twitchPollTimer);
   console.log(`[TwitchAlert] Polling Twitch for ${TWITCH_USERNAME}'s live status every ${config.twitchPollIntervalMs / 1000}s.`);
+  // Run the first check right away instead of waiting a full poll interval
+  // after startup — otherwise a stream that's already live (and whose alert
+  // message primeTwitchLiveState() just recovered) would sit stale for up to
+  // twitchPollIntervalMs before getting its first refresh, and a brand new
+  // "went live" while the bot was offline would take just as long to post.
+  checkTwitchLiveStatus().catch((e) => console.error("[TwitchAlert] Initial poll error:", e.message));
   twitchPollTimer = setInterval(() => {
     checkTwitchLiveStatus().catch((e) => console.error("[TwitchAlert] Poll error:", e.message));
   }, config.twitchPollIntervalMs);
   if (typeof twitchPollTimer.unref === "function") twitchPollTimer.unref();
+}
+
+/** Stops the recurring poll (used by tests to avoid leaking timers across files; also handy for a clean shutdown). */
+function stopTwitchLiveLoop() {
+  if (twitchPollTimer) {
+    clearInterval(twitchPollTimer);
+    twitchPollTimer = null;
+  }
 }
 
 // ================= WIRING =================
@@ -9904,6 +9918,7 @@ module.exports = {
   checkTwitchLiveStatus,
   primeTwitchLiveState,
   startTwitchLiveLoop,
+  stopTwitchLiveLoop,
   isTwitchConfigured,
   // OSRS in-chat stat command exports (!lvl / !kc / !pets / !log)
   OSRS_STATS_CHANNEL_ID,
