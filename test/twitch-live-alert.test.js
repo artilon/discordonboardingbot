@@ -372,6 +372,32 @@ const OFFLINE_STATUS = { live: false };
     check("with no message to edit, the poll just does nothing for that ongoing session", unreadableChannel._sent.length === 0 && unreadableChannel._edited.length === 0);
   }
 
+  // ================= startTwitchLiveLoop: the first check runs immediately on startup =================
+  // Regression coverage for: "i want it to post NOW" — previously the loop
+  // only set up a setInterval, so the very first Twitch check (and thus the
+  // very first alert, or the very first refresh of a recovered alert) didn't
+  // happen until a full twitchPollIntervalMs (90s by default) after the bot
+  // finished starting up.
+  {
+    const loopChannel = makeFakeChannel(bot.WEEKLY_RECAP_CHANNEL_ID);
+    bot.client.channels.fetch = async (id) => (id === bot.WEEKLY_RECAP_CHANNEL_ID ? loopChannel : makeFakeChannel());
+
+    bot.config.twitchLiveState = { wasLive: false, lastAlertedStreamId: null };
+    bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, id: "stream-loop-start" });
+
+    bot.startTwitchLiveLoop();
+    // The immediate check is fired off (not awaited) by startTwitchLiveLoop
+    // itself; give its promise chain a tick to resolve before asserting,
+    // well before the real poll interval would ever have elapsed.
+    await new Promise((resolve) => setImmediate(resolve));
+    check(
+      "starting the poll loop posts the first alert right away, without waiting for the poll interval to elapse",
+      loopChannel._sent.length === 1
+    );
+
+    bot.stopTwitchLiveLoop();
+  }
+
   // ---- cleanup so this test doesn't leak state into other test files ----
   bot.config.twitchStreamFetcher = null;
   bot.config.twitchLiveState = { wasLive: false, lastAlertedStreamId: null };
