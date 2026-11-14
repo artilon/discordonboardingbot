@@ -1017,6 +1017,9 @@ const REAL_WORLD_HISCORES = {
           // resolves to ("The Hueycoatl") -- exercises the hiscoreMatchKey "The "-tolerant match.
           { name: "Hueycoatl", obtained: 1, total: 3, items: [{ id: 4, name: "Huasca", quantity: 1 }] },
           { name: "Zulrah", obtained: 0, total: 5, items: [{ id: 5, name: "Tanzanite fang", quantity: 0 }] },
+          // Deliberately named WITHOUT the leading "The " that resolveBossHiscoreName("cg")
+          // resolves to ("The Corrupted Gauntlet") -- same "The "-tolerant match as Hueycoatl.
+          { name: "Corrupted Gauntlet", obtained: 2, total: 6, items: [{ id: 8, name: "Corrupted hunllef head", quantity: 1 }] },
         ],
       },
       {
@@ -1040,6 +1043,13 @@ const REAL_WORLD_HISCORES = {
     check("a known !kc boss alias resolves against the real page name even across a 'The '-prefix mismatch ('huey' -> 'Hueycoatl' page)",
       bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "huey")?.name === "Hueycoatl");
     check("the full boss name also resolves the same way", bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "hueycoatl")?.name === "Hueycoatl");
+    check(
+      "the 'cg' shorthand for Corrupted Gauntlet resolves against the real page name across the 'The '-prefix mismatch (regression: '!log cg <rsn>' didn't work)",
+      bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "cg")?.name === "Corrupted Gauntlet"
+    );
+    check("the 'cg' alias resolves directly via resolveBossHiscoreName too (shared with !kc)", bot.resolveBossHiscoreName("cg") === "The Corrupted Gauntlet");
+    check("the longer 'cgaunt' alias still resolves the same way", bot.resolveBossHiscoreName("cgaunt") === "The Corrupted Gauntlet");
+    check("the uncorrupted 'gaunt' alias is unaffected and still resolves to The Gauntlet", bot.resolveBossHiscoreName("gaunt") === "The Gauntlet");
     check("a known raid alias resolves normally ('toa' -> Tombs of Amascut)",
       bot.resolveCollectionLogPage(SAMPLE_COLLECTION_LOG, "toa")?.name === "Tombs of Amascut");
     check("a category outside the !kc boss list resolves via an exact name match ('barbarianassault')",

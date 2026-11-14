@@ -2501,6 +2501,7 @@ const KC_ALIASES = {
   vork: "Vorkath",
   gaunt: "The Gauntlet",
   gauntlet: "The Gauntlet",
+  cg: "The Corrupted Gauntlet",
   cgaunt: "The Corrupted Gauntlet",
   corrupted: "The Corrupted Gauntlet",
   corruptedgauntlet: "The Corrupted Gauntlet",
