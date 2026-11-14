@@ -80,6 +80,16 @@ const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 const TWITCH_USERNAME = process.env.TWITCH_USERNAME;
 
+// Kick "went live" alert — same idea as the Twitch one above, posted
+// independently to the same channel (so being live on both at once posts/
+// updates two separate messages). KICK_CLIENT_ID / KICK_CLIENT_SECRET come
+// from a free app registered at kick.com/settings/developer (requires 2FA
+// enabled on the Kick account first). KICK_USERNAME is the channel slug from
+// kick.com/<slug>, not a display name or URL.
+const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID;
+const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
+const KICK_USERNAME = process.env.KICK_USERNAME;
+
 // Optional: a RuneProfile API key (https://runeprofile.com, join their Discord
 // to request one) raises the !pets lookup's rate limit from 30/min to
 // 120/min. Not required — !pets works fine without it at low clan-chat volume.
@@ -454,7 +464,49 @@ const config = {
     lastAlertMessage: null,
     lastTitle: null,
     lastGameName: null,
+    lastThumbnailUrl: null,
+    lastUserName: null,
     lastImageRefreshAt: 0,
+  },
+  // Same idea as the Twitch settings above, but for Kick — kept as a fully
+  // separate poll/state so being live on both platforms at once tracks and
+  // updates two independent alert messages.
+  kickPollIntervalMs: 90 * 1000,
+  kickStreamFetcher: null,            // Optional override for testing Kick API fetches
+  kickImageRefreshIntervalMs: 5 * 60 * 1000,
+  kickLiveState: {
+    wasLive: false,
+    lastAlertedStreamId: null,
+    lastAlertMessage: null,
+    lastTitle: null,
+    lastGameName: null,
+    lastThumbnailUrl: null,
+    lastUserName: null,
+    lastImageRefreshAt: 0,
+  },
+  // Combined Twitch+Kick alert state: when the clan is live on BOTH platforms
+  // at once, the two single-platform alerts are replaced by one merged embed
+  // (see reconcileLiveAlerts). `message` is the Discord Message object for
+  // that combined alert (null when no combined alert is active);
+  // `imagePlatform` records which platform went live first, since the
+  // combined embed shows only that platform's preview image. The
+  // `lastTwitch*`/`lastKick*` fields snapshot what the combined message
+  // currently shows, so reconcile only edits it when something actually
+  // changed (or the preview image is due a refresh). `dead` is set when the
+  // combined message can no longer be edited (e.g. it was deleted) so the
+  // bot stops trying for the rest of this combined session instead of
+  // reposting every poll. In-memory only, same as the per-platform state.
+  combinedLiveAlert: {
+    message: null,
+    imagePlatform: null,
+    dead: false,
+    lastEditAt: 0,
+    lastTwitchTitle: null,
+    lastTwitchGame: null,
+    lastTwitchStreamId: null,
+    lastKickTitle: null,
+    lastKickGame: null,
+    lastKickStreamId: null,
   },
 };
 
@@ -9378,10 +9430,15 @@ async function findExistingTwitchLiveMessage(username) {
  * to remember for the next poll. `shouldAlert` and `shouldUpdate` are never
  * both true at once: a brand new session always posts fresh rather than
  * editing whatever the previous session left behind.
+ *
+ * Platform-agnostic on purpose — Twitch and Kick statuses are normalized to
+ * the same `{ live, id, title, gameName, ... }` shape, so both
+ * decideTwitchAlert and decideKickAlert delegate to this same core with
+ * their own default `imageRefreshIntervalMs`.
  */
-function decideTwitchAlert(prevState, status, opts = {}) {
+function decideLiveAlert(prevState, status, opts = {}) {
   const now = opts.now ?? Date.now();
-  const imageRefreshIntervalMs = opts.imageRefreshIntervalMs ?? config.twitchImageRefreshIntervalMs;
+  const imageRefreshIntervalMs = opts.imageRefreshIntervalMs;
 
   if (!status || !status.live) {
     return {
@@ -9434,6 +9491,11 @@ function decideTwitchAlert(prevState, status, opts = {}) {
   };
 }
 
+/** Twitch-flavored entry point into decideLiveAlert — defaults the image refresh cadence to config.twitchImageRefreshIntervalMs, same as before this was pulled out into a shared platform-agnostic core. */
+function decideTwitchAlert(prevState, status, opts = {}) {
+  return decideLiveAlert(prevState, status, { imageRefreshIntervalMs: config.twitchImageRefreshIntervalMs, ...opts });
+}
+
 let twitchPollInFlight = false;
 
 // `config.twitchStreamFetcher` (test-only) is a complete stand-in for the
@@ -9452,6 +9514,28 @@ async function checkTwitchLiveStatus() {
     const status = await fetchTwitchLiveStatus(TWITCH_USERNAME);
     const { shouldAlert, shouldUpdate, nextState } = decideTwitchAlert(config.twitchLiveState, status);
 
+    // Combined Twitch+Kick mode: when a combined alert is already active
+    // (or was lost mid-session), or both platforms are live right now, the
+    // combined alert owns the announcements channel — keep this platform's
+    // state current from the fresh status and let reconcileLiveAlerts()
+    // handle the actual message (creating/updating/reverting the combined
+    // embed as needed) instead of posting or editing a single-platform
+    // alert. A genuinely new stream session clears `dead` first, so a fresh
+    // session always gets a fresh combined alert even if a previous one was
+    // deleted mid-stream.
+    if (config.combinedLiveAlert.message || config.combinedLiveAlert.dead || (nextState.wasLive && config.kickLiveState.wasLive)) {
+      if (shouldAlert) config.combinedLiveAlert.dead = false;
+      config.twitchLiveState = {
+        ...nextState,
+        lastTitle: status?.live ? status.title || "" : null,
+        lastGameName: status?.live ? status.gameName || "" : null,
+        lastThumbnailUrl: status?.live ? status.thumbnailUrl || "" : "",
+        lastUserName: status?.live ? status.userName || TWITCH_USERNAME : TWITCH_USERNAME,
+      };
+      await reconcileLiveAlerts();
+      return;
+    }
+
     if (shouldAlert) {
       const sent = await postTwitchLiveAlert(status, TWITCH_USERNAME);
       config.twitchLiveState = {
@@ -9459,6 +9543,8 @@ async function checkTwitchLiveStatus() {
         lastAlertMessage: sent || null,
         lastTitle: status.title || "",
         lastGameName: status.gameName || "",
+        lastThumbnailUrl: status.thumbnailUrl || "",
+        lastUserName: status.userName || TWITCH_USERNAME,
         lastImageRefreshAt: Date.now(),
       };
     } else if (shouldUpdate) {
@@ -9468,6 +9554,8 @@ async function checkTwitchLiveStatus() {
             ...nextState,
             lastTitle: status.title || "",
             lastGameName: status.gameName || "",
+            lastThumbnailUrl: status.thumbnailUrl || "",
+            lastUserName: status.userName || TWITCH_USERNAME,
             lastImageRefreshAt: Date.now(),
           }
         : // The message is gone (e.g. deleted) — stop trying to update it for
@@ -9503,12 +9591,20 @@ async function primeTwitchLiveState() {
     const status = await fetchTwitchLiveStatus(TWITCH_USERNAME);
     if (status?.live) {
       const existingMessage = await findExistingTwitchLiveMessage(TWITCH_USERNAME);
+      // If the recovered message is actually a combined Twitch+Kick alert
+      // (it carries both platforms' markers), adopt it as the combined
+      // alert instead of this platform's single one — see
+      // adoptCombinedAlertMessage.
+      const adoptedAsCombined = !!existingMessage && isCombinedAlertMessage(existingMessage);
+      if (adoptedAsCombined) adoptCombinedAlertMessage(existingMessage);
       config.twitchLiveState = {
         wasLive: true,
         lastAlertedStreamId: status.id,
-        lastAlertMessage: existingMessage,
+        lastAlertMessage: adoptedAsCombined ? null : existingMessage,
         lastTitle: null,
         lastGameName: null,
+        lastThumbnailUrl: status.thumbnailUrl || "",
+        lastUserName: status.userName || TWITCH_USERNAME,
         lastImageRefreshAt: 0,
       };
       console.log(
@@ -9550,6 +9646,567 @@ function stopTwitchLiveLoop() {
     clearInterval(twitchPollTimer);
     twitchPollTimer = null;
   }
+}
+
+// ================= KICK LIVE ALERT =================
+// Same idea as the Twitch alert above, posted independently to the same
+// channel: if the clan streams on both Twitch and Kick at once, each gets
+// its own tracked "now live" message that stays updated on its own.
+const KICK_COLOR = 0x53fc18; // Kick brand green
+
+let kickAppAccessToken = null;
+let kickAppAccessTokenExpiresAt = 0; // ms epoch
+
+/** Fetches (and caches) an app access token for Kick's public API. */
+async function getKickAppAccessToken() {
+  if (kickAppAccessToken && Date.now() < kickAppAccessTokenExpiresAt - 60_000) {
+    return kickAppAccessToken;
+  }
+  const res = await fetch("https://id.kick.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: KICK_CLIENT_ID,
+      client_secret: KICK_CLIENT_SECRET,
+      grant_type: "client_credentials",
+    }),
+  });
+  if (!res.ok) throw new Error(`Kick token request failed: ${res.status}`);
+  const data = await res.json();
+  kickAppAccessToken = data.access_token;
+  kickAppAccessTokenExpiresAt = Date.now() + (Number(data.expires_in) || 0) * 1000;
+  return kickAppAccessToken;
+}
+
+/**
+ * Returns `{ live: false }` or `{ live: true, id, title, gameName, userName,
+ * startedAt, thumbnailUrl }` for the given Kick channel slug, or `null` if
+ * the request couldn't be made at all (not configured, or an actual error).
+ * Kick's channel endpoint has no distinct "stream session id" field like
+ * Twitch does, so `id` is the stream's `start_time` instead — still unique
+ * per broadcast, which is all decideLiveAlert needs it for.
+ * `config.kickStreamFetcher`, when set, replaces this entirely — same
+ * test-injection pattern as `config.twitchStreamFetcher`.
+ */
+async function fetchKickLiveStatus(username) {
+  if (typeof config.kickStreamFetcher === "function") {
+    return config.kickStreamFetcher(username);
+  }
+  if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET || !username) return null;
+  const token = await getKickAppAccessToken();
+  const res = await fetch(`https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(username)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Kick channels request failed: ${res.status}`);
+  const data = await res.json();
+  const channel = data?.data?.[0];
+  if (!channel || !channel.stream?.is_live) return { live: false };
+  return {
+    live: true,
+    id: channel.stream.start_time || String(channel.broadcaster_user_id || username),
+    title: channel.stream_title || "",
+    gameName: channel.category?.name || "",
+    userName: channel.slug || username,
+    startedAt: channel.stream.start_time || null,
+    thumbnailUrl: channel.stream.thumbnail || "",
+  };
+}
+
+function buildKickLiveAlert(stream, username) {
+  const displayName = stream.userName || username;
+  const url = `https://kick.com/${username}`;
+  const embed = new EmbedBuilder()
+    .setColor(KICK_COLOR)
+    .setDescription(
+      `🟢 **${displayName}** is now live on Kick!\n` +
+      `**${stream.title || "No title set"}**\n` +
+      url
+    );
+  if (stream.gameName) {
+    embed.addFields({ name: "Playing", value: stream.gameName, inline: true });
+  }
+  if (stream.thumbnailUrl) {
+    // Unlike Twitch, Kick's thumbnail URL isn't a {width}/{height} template —
+    // it's already a concrete image URL. Still cache-bust it so Discord
+    // doesn't keep reusing a stale preview from earlier in the same stream.
+    embed.setImage(`${stream.thumbnailUrl}?t=${Date.now()}`);
+  }
+  return { embeds: [embed], allowedMentions: { parse: [] } };
+}
+
+/** Posts the initial "went live" alert. Returns the sent Message object (so it can be remembered and edited later), or null if it couldn't be posted. */
+async function postKickLiveAlert(stream, username) {
+  const channel = await getClanAnnouncementsChannel();
+  if (!channel) return null;
+  return channel
+    .send(buildKickLiveAlert(stream, username))
+    .catch((e) => {
+      console.warn("[KickAlert] Failed to post live alert:", e.message);
+      return null;
+    });
+}
+
+/** Same approach as updateTwitchLiveAlert: edits the held Message object directly, no re-fetch-by-id. See that function's comment for why. */
+async function updateKickLiveAlert(message, stream, username) {
+  if (!message || typeof message.edit !== "function") return false;
+  return message
+    .edit(buildKickLiveAlert(stream, username))
+    .then(() => true)
+    .catch((e) => {
+      console.warn("[KickAlert] Failed to update live alert:", e.message);
+      return false;
+    });
+}
+
+/** Same approach as findExistingTwitchLiveMessage, scanning for the bot's own "is now live on Kick" post instead. */
+async function findExistingKickLiveMessage(username) {
+  try {
+    const channel = await getClanAnnouncementsChannel();
+    if (!channel || typeof channel.messages?.fetch !== "function") return null;
+    const recent = await channel.messages.fetch({ limit: 50 });
+    const list = typeof recent?.values === "function" ? Array.from(recent.values()) : Array.from(recent || []);
+    const marker = `kick.com/${String(username || "").toLowerCase()}`;
+    const botId = client.user?.id;
+    for (const message of list) {
+      const authorId = message.author?.id;
+      if (botId && authorId && authorId !== botId) continue;
+      const embed = message.embeds?.[0];
+      const desc = embed?.description ?? embed?.data?.description ?? "";
+      if (desc.toLowerCase().includes(marker) && /is now live on kick/i.test(desc)) {
+        return message;
+      }
+    }
+  } catch (e) {
+    console.warn("[KickAlert] Could not search for an existing live alert message:", e.message);
+  }
+  return null;
+}
+
+/** Kick-flavored entry point into decideLiveAlert — defaults the image refresh cadence to config.kickImageRefreshIntervalMs. */
+function decideKickAlert(prevState, status, opts = {}) {
+  return decideLiveAlert(prevState, status, { imageRefreshIntervalMs: config.kickImageRefreshIntervalMs, ...opts });
+}
+
+let kickPollInFlight = false;
+
+// `config.kickStreamFetcher` (test-only) is a complete stand-in for the real
+// Kick calls, so it bypasses the "are real credentials set" guard below —
+// otherwise this function could never be exercised in a test environment
+// that (correctly) has no real Kick credentials configured.
+function isKickConfigured() {
+  return typeof config.kickStreamFetcher === "function" || !!(KICK_USERNAME && KICK_CLIENT_ID && KICK_CLIENT_SECRET);
+}
+
+async function checkKickLiveStatus() {
+  if (kickPollInFlight) return;
+  if (!isKickConfigured()) return;
+  kickPollInFlight = true;
+  try {
+    const status = await fetchKickLiveStatus(KICK_USERNAME);
+    const { shouldAlert, shouldUpdate, nextState } = decideKickAlert(config.kickLiveState, status);
+
+    // Combined Twitch+Kick mode — same handoff as checkTwitchLiveStatus:
+    // when a combined alert is active (or was lost mid-session), or both
+    // platforms are live right now, keep this platform's state current and
+    // let reconcileLiveAlerts() own the actual message.
+    if (config.combinedLiveAlert.message || config.combinedLiveAlert.dead || (nextState.wasLive && config.twitchLiveState.wasLive)) {
+      if (shouldAlert) config.combinedLiveAlert.dead = false;
+      config.kickLiveState = {
+        ...nextState,
+        lastTitle: status?.live ? status.title || "" : null,
+        lastGameName: status?.live ? status.gameName || "" : null,
+        lastThumbnailUrl: status?.live ? status.thumbnailUrl || "" : "",
+        lastUserName: status?.live ? status.userName || KICK_USERNAME : KICK_USERNAME,
+      };
+      await reconcileLiveAlerts();
+      return;
+    }
+
+    if (shouldAlert) {
+      const sent = await postKickLiveAlert(status, KICK_USERNAME);
+      config.kickLiveState = {
+        ...nextState,
+        lastAlertMessage: sent || null,
+        lastTitle: status.title || "",
+        lastGameName: status.gameName || "",
+        lastThumbnailUrl: status.thumbnailUrl || "",
+        lastUserName: status.userName || KICK_USERNAME,
+        lastImageRefreshAt: Date.now(),
+      };
+    } else if (shouldUpdate) {
+      const updated = await updateKickLiveAlert(nextState.lastAlertMessage, status, KICK_USERNAME);
+      config.kickLiveState = updated
+        ? {
+            ...nextState,
+            lastTitle: status.title || "",
+            lastGameName: status.gameName || "",
+            lastThumbnailUrl: status.thumbnailUrl || "",
+            lastUserName: status.userName || KICK_USERNAME,
+            lastImageRefreshAt: Date.now(),
+          }
+        : // The message is gone (e.g. deleted) — stop trying to update it for
+          // the rest of this session rather than retrying every poll forever.
+          { ...nextState, lastAlertMessage: null };
+    } else {
+      config.kickLiveState = nextState;
+    }
+  } catch (err) {
+    console.error("[KickAlert] Could not check live status:", err.message);
+  } finally {
+    kickPollInFlight = false;
+  }
+}
+
+/** Same approach as primeTwitchLiveState — see that function's comment for the full explanation. */
+async function primeKickLiveState() {
+  if (!isKickConfigured()) return;
+  try {
+    const status = await fetchKickLiveStatus(KICK_USERNAME);
+    if (status?.live) {
+      const existingMessage = await findExistingKickLiveMessage(KICK_USERNAME);
+      // Same combined-alert adoption as primeTwitchLiveState — if the
+      // recovered message is a combined Twitch+Kick alert, it belongs to
+      // the combined state, not this platform's single one.
+      const adoptedAsCombined = !!existingMessage && isCombinedAlertMessage(existingMessage);
+      if (adoptedAsCombined) adoptCombinedAlertMessage(existingMessage);
+      config.kickLiveState = {
+        wasLive: true,
+        lastAlertedStreamId: status.id,
+        lastAlertMessage: adoptedAsCombined ? null : existingMessage,
+        lastTitle: null,
+        lastGameName: null,
+        lastThumbnailUrl: status.thumbnailUrl || "",
+        lastUserName: status.userName || KICK_USERNAME,
+        lastImageRefreshAt: 0,
+      };
+      console.log(
+        `[KickAlert] ${KICK_USERNAME} is already live at startup — won't alert for this in-progress stream, only the next one.` +
+        (existingMessage
+          ? " Found its existing live alert message, so it'll keep being kept up to date."
+          : " Could not find an existing live alert message to keep updating — it'll stay as last posted until a new session starts.")
+      );
+    }
+  } catch (err) {
+    console.error("[KickAlert] Could not check initial live status:", err.message);
+  }
+}
+
+let kickPollTimer = null;
+
+function startKickLiveLoop() {
+  if (!isKickConfigured()) {
+    console.warn("[KickAlert] KICK_CLIENT_ID / KICK_CLIENT_SECRET / KICK_USERNAME not fully set — live alerts disabled until configured.");
+    return;
+  }
+  if (kickPollTimer) clearInterval(kickPollTimer);
+  console.log(`[KickAlert] Polling Kick for ${KICK_USERNAME}'s live status every ${config.kickPollIntervalMs / 1000}s.`);
+  // Same as Twitch: run the first check immediately rather than waiting a
+  // full poll interval after startup.
+  checkKickLiveStatus().catch((e) => console.error("[KickAlert] Initial poll error:", e.message));
+  kickPollTimer = setInterval(() => {
+    checkKickLiveStatus().catch((e) => console.error("[KickAlert] Poll error:", e.message));
+  }, config.kickPollIntervalMs);
+  if (typeof kickPollTimer.unref === "function") kickPollTimer.unref();
+}
+
+/** Stops the recurring poll (used by tests to avoid leaking timers across files; also handy for a clean shutdown). */
+function stopKickLiveLoop() {
+  if (kickPollTimer) {
+    clearInterval(kickPollTimer);
+    kickPollTimer = null;
+  }
+}
+
+// ================= COMBINED TWITCH + KICK LIVE ALERT =================
+// When the clan is live on BOTH Twitch and Kick at the same time, the two
+// single-platform alerts are replaced by ONE merged embed: it names both
+// channels, links to both, and shows a single preview image (from whichever
+// platform went live first). When one of the two streams ends, the combined
+// message is edited back down into a single-platform alert for whichever
+// platform is still live. reconcileLiveAlerts() is the single place that
+// enforces this, called from both platforms' poll checks whenever a combined
+// alert is active or both platforms are live.
+
+/**
+ * Builds the merged "live on both" embed. `firstPlatform` ("twitch" | "kick")
+ * is whichever platform went live first — it provides the embed's color and
+ * the single preview image. The description deliberately contains BOTH
+ * platforms' "is now live on ..." phrasing and channel URLs, so the existing
+ * per-platform startup recovery searches (findExistingTwitchLiveMessage /
+ * findExistingKickLiveMessage) can both find this message after a restart.
+ */
+function buildCombinedLiveAlert(firstPlatform) {
+  const twitchState = config.twitchLiveState;
+  const kickState = config.kickLiveState;
+  const twitchUser = twitchState.lastUserName || TWITCH_USERNAME;
+  const kickUser = kickState.lastUserName || KICK_USERNAME;
+  const firstIsTwitch = firstPlatform !== "kick";
+  const embed = new EmbedBuilder()
+    .setColor(firstIsTwitch ? TWITCH_COLOR : KICK_COLOR)
+    .setDescription(
+      `🔴 **${twitchUser}** is now live on Twitch and **${kickUser}** is now live on Kick!\n` +
+      `**Twitch:** ${twitchState.lastTitle || "No title set"}\n` +
+      `https://twitch.tv/${TWITCH_USERNAME}\n` +
+      `**Kick:** ${kickState.lastTitle || "No title set"}\n` +
+      `https://kick.com/${KICK_USERNAME}`
+    );
+  if (twitchState.lastGameName) {
+    embed.addFields({ name: "Twitch — Playing", value: twitchState.lastGameName, inline: true });
+  }
+  if (kickState.lastGameName) {
+    embed.addFields({ name: "Kick — Playing", value: kickState.lastGameName, inline: true });
+  }
+  // Only one preview image: the first platform's. Twitch's thumbnail URL is
+  // a {width}/{height} template; Kick's is already concrete — same handling
+  // as the single-platform builders.
+  const imageState = firstIsTwitch ? twitchState : kickState;
+  if (imageState.lastThumbnailUrl) {
+    const thumb = firstIsTwitch
+      ? imageState.lastThumbnailUrl.replace("{width}", "640").replace("{height}", "360")
+      : imageState.lastThumbnailUrl;
+    embed.setImage(`${thumb}?t=${Date.now()}`);
+  }
+  // The footer lists the platforms in go-live order — prime uses it to
+  // recover which platform went live first after a restart.
+  embed.setFooter({ text: firstIsTwitch ? "Streaming on Twitch and Kick" : "Streaming on Kick and Twitch" });
+  return { embeds: [embed], allowedMentions: { parse: [] } };
+}
+
+/** Posts the merged "live on both" alert. Returns the sent Message object, or null if it couldn't be posted. */
+async function postCombinedLiveAlert(firstPlatform) {
+  const channel = await getClanAnnouncementsChannel();
+  if (!channel) return null;
+  return channel
+    .send(buildCombinedLiveAlert(firstPlatform))
+    .catch((e) => {
+      console.warn("[CombinedAlert] Failed to post combined live alert:", e.message);
+      return null;
+    });
+}
+
+/** Edits the combined alert in place with the latest titles/games/image. Returns false (instead of throwing) if the message can no longer be edited. */
+async function updateCombinedLiveAlert() {
+  const combined = config.combinedLiveAlert;
+  if (!combined.message || typeof combined.message.edit !== "function") return false;
+  return combined.message
+    .edit(buildCombinedLiveAlert(combined.imagePlatform))
+    .then(() => true)
+    .catch((e) => {
+      console.warn("[CombinedAlert] Failed to update combined live alert:", e.message);
+      return false;
+    });
+}
+
+/** Deletes any single-platform alert messages currently on file (used when a combined alert takes over). Best-effort: never throws. */
+async function deleteSingleLiveAlertMessages() {
+  const seen = new Set();
+  for (const state of [config.twitchLiveState, config.kickLiveState]) {
+    const message = state.lastAlertMessage;
+    if (!message || seen.has(message) || typeof message.delete !== "function") continue;
+    seen.add(message);
+    await message.delete().catch((e) => {
+      console.warn("[CombinedAlert] Failed to delete single-platform live alert:", e.message);
+    });
+  }
+}
+
+/** Snapshots what the combined message currently shows, so the next reconcile only edits it when something actually changed. */
+function snapshotCombinedState() {
+  const combined = config.combinedLiveAlert;
+  combined.lastEditAt = Date.now();
+  combined.lastTwitchTitle = config.twitchLiveState.lastTitle || null;
+  combined.lastTwitchGame = config.twitchLiveState.lastGameName || null;
+  combined.lastTwitchStreamId = config.twitchLiveState.lastAlertedStreamId || null;
+  combined.lastKickTitle = config.kickLiveState.lastTitle || null;
+  combined.lastKickGame = config.kickLiveState.lastGameName || null;
+  combined.lastKickStreamId = config.kickLiveState.lastAlertedStreamId || null;
+}
+
+/** Clears all combined-alert tracking. Any combined message already posted stays in the channel as a historical record, same as single-platform alerts do when a stream ends. */
+function resetCombinedState() {
+  const combined = config.combinedLiveAlert;
+  combined.message = null;
+  combined.imagePlatform = null;
+  combined.dead = false;
+  combined.lastEditAt = 0;
+  combined.lastTwitchTitle = null;
+  combined.lastTwitchGame = null;
+  combined.lastTwitchStreamId = null;
+  combined.lastKickTitle = null;
+  combined.lastKickGame = null;
+  combined.lastKickStreamId = null;
+}
+
+/**
+ * Both platforms are live and no combined alert exists yet: post the merged
+ * alert, then remove the now-redundant single-platform alerts. The combined
+ * alert is posted FIRST and the singles only deleted once it's actually up,
+ * so there's never a moment with no live alert in the channel if the post
+ * fails.
+ */
+async function createCombinedLiveAlert() {
+  const combined = config.combinedLiveAlert;
+  // Whichever platform was already live (it has a single-platform alert on
+  // file) went live first, so its preview image is the one the combined
+  // embed shows. If neither has one yet (e.g. both went live while the bot
+  // was down), default to Twitch.
+  const firstPlatform = config.twitchLiveState.lastAlertMessage
+    ? "twitch"
+    : config.kickLiveState.lastAlertMessage
+      ? "kick"
+      : "twitch";
+  const sent = await postCombinedLiveAlert(firstPlatform);
+  if (!sent) return;
+  await deleteSingleLiveAlertMessages();
+  combined.message = sent;
+  combined.imagePlatform = firstPlatform;
+  combined.dead = false;
+  snapshotCombinedState();
+  config.twitchLiveState = { ...config.twitchLiveState, lastAlertMessage: null };
+  config.kickLiveState = { ...config.kickLiveState, lastAlertMessage: null };
+}
+
+/** Edits the combined alert only when a title/game/stream changed, or the preview image is due a refresh (same cadence as the single-platform alerts). */
+async function updateCombinedLiveAlertIfNeeded() {
+  const combined = config.combinedLiveAlert;
+  const twitchState = config.twitchLiveState;
+  const kickState = config.kickLiveState;
+  const contentChanged =
+    (twitchState.lastTitle || "") !== (combined.lastTwitchTitle || "") ||
+    (twitchState.lastGameName || "") !== (combined.lastTwitchGame || "") ||
+    (twitchState.lastAlertedStreamId || "") !== (combined.lastTwitchStreamId || "") ||
+    (kickState.lastTitle || "") !== (combined.lastKickTitle || "") ||
+    (kickState.lastGameName || "") !== (combined.lastKickGame || "") ||
+    (kickState.lastAlertedStreamId || "") !== (combined.lastKickStreamId || "");
+  const imageRefreshIntervalMs =
+    combined.imagePlatform === "kick" ? config.kickImageRefreshIntervalMs : config.twitchImageRefreshIntervalMs;
+  const imageDue = Date.now() - (combined.lastEditAt || 0) >= imageRefreshIntervalMs;
+  if (!contentChanged && !imageDue) return;
+  const updated = await updateCombinedLiveAlert();
+  if (updated) {
+    snapshotCombinedState();
+  } else {
+    // The combined message is gone (e.g. deleted) — stop tracking it and
+    // don't repost for the rest of this combined session, mirroring how the
+    // single-platform alerts stop updating a vanished message.
+    combined.dead = true;
+    combined.message = null;
+    combined.imagePlatform = null;
+  }
+}
+
+/**
+ * One of the two streams ended while a combined alert was up: edit that same
+ * message back down into a single-platform alert for whichever platform is
+ * still live (no new post), and hand the message over to that platform's
+ * state so its title/image updates resume on it.
+ */
+async function revertCombinedToSingleAlert(survivorPlatform) {
+  const combined = config.combinedLiveAlert;
+  const survivorState = survivorPlatform === "twitch" ? config.twitchLiveState : config.kickLiveState;
+  const endedState = survivorPlatform === "twitch" ? config.kickLiveState : config.twitchLiveState;
+  const username = survivorPlatform === "twitch" ? TWITCH_USERNAME : KICK_USERNAME;
+  const buildAlert = survivorPlatform === "twitch" ? buildTwitchLiveAlert : buildKickLiveAlert;
+  const stream = {
+    userName: survivorState.lastUserName || username,
+    title: survivorState.lastTitle || "",
+    gameName: survivorState.lastGameName || "",
+    thumbnailUrl: survivorState.lastThumbnailUrl || "",
+  };
+  const updated =
+    combined.message && typeof combined.message.edit === "function"
+      ? await combined.message
+          .edit(buildAlert(stream, username))
+          .then(() => true)
+          .catch((e) => {
+            console.warn("[CombinedAlert] Failed to revert combined live alert to a single-platform alert:", e.message);
+            return false;
+          })
+      : false;
+  // Either way, that message (or its absence) is now this platform's single
+  // alert — adopt it so updates resume on it.
+  survivorState.lastAlertMessage = updated ? combined.message : null;
+  survivorState.lastImageRefreshAt = Date.now();
+  endedState.lastAlertMessage = null;
+  resetCombinedState();
+}
+
+let combinedReconcileInFlight = false;
+
+/**
+ * Enforces the combined-alert invariant after either platform's poll:
+ * both live -> exactly one combined alert (created/updated as needed);
+ * exactly one live -> any combined alert is edited back down to that
+ * platform's single alert; neither live -> combined tracking is cleared
+ * (the posted message stays as a historical record).
+ */
+async function reconcileLiveAlerts() {
+  // Both platforms' polls can land at the same moment — never let two
+  // reconciles interleave (e.g. double-posting a combined alert). A skipped
+  // reconcile is harmless: the next poll (within one poll interval) runs it
+  // again and converges.
+  if (combinedReconcileInFlight) return;
+  combinedReconcileInFlight = true;
+  try {
+    const twitchLive = !!config.twitchLiveState.wasLive;
+    const kickLive = !!config.kickLiveState.wasLive;
+    const combined = config.combinedLiveAlert;
+
+    if (twitchLive && kickLive) {
+      if (combined.dead) return; // combined alert vanished mid-session — don't repost
+      if (!combined.message) {
+        await createCombinedLiveAlert();
+      } else {
+        await updateCombinedLiveAlertIfNeeded();
+      }
+      return;
+    }
+
+    if (combined.message && (twitchLive || kickLive)) {
+      await revertCombinedToSingleAlert(twitchLive ? "twitch" : "kick");
+      return;
+    }
+
+    resetCombinedState();
+  } finally {
+    combinedReconcileInFlight = false;
+  }
+}
+
+/** True if the given message is a combined Twitch+Kick alert (its embed carries both platforms' channel markers). */
+function isCombinedAlertMessage(message) {
+  if (!message || !TWITCH_USERNAME || !KICK_USERNAME) return false;
+  const embed = message.embeds?.[0];
+  const desc = (embed?.description ?? embed?.data?.description ?? "").toLowerCase();
+  return (
+    desc.includes(`twitch.tv/${String(TWITCH_USERNAME).toLowerCase()}`) &&
+    desc.includes(`kick.com/${String(KICK_USERNAME).toLowerCase()}`)
+  );
+}
+
+/**
+ * Adopts a recovered combined alert message at startup (called from the
+ * prime functions). No-op if one was already adopted by the other platform's
+ * prime — both primes find the same message.
+ */
+function adoptCombinedAlertMessage(message) {
+  const combined = config.combinedLiveAlert;
+  if (combined.message) return;
+  combined.message = message;
+  combined.dead = false;
+  // The footer lists the platforms in go-live order ("Streaming on Twitch
+  // and Kick" vs "Streaming on Kick and Twitch") — recover which platform
+  // went live first so the combined embed keeps showing its preview image.
+  const embed = message.embeds?.[0];
+  const footerText = embed?.footer?.text ?? embed?.data?.footer?.text ?? "";
+  combined.imagePlatform = /^streaming on kick/i.test(footerText) ? "kick" : "twitch";
+  combined.lastEditAt = 0;
+  combined.lastTwitchTitle = null;
+  combined.lastTwitchGame = null;
+  combined.lastTwitchStreamId = null;
+  combined.lastKickTitle = null;
+  combined.lastKickGame = null;
+  combined.lastKickStreamId = null;
 }
 
 // ================= WIRING =================
@@ -9632,6 +10289,12 @@ client.once(Events.ClientReady, async () => {
     startTwitchLiveLoop();
   } catch (err) {
     console.error("[TwitchAlert] Initial setup failed:", err.message);
+  }
+  try {
+    await primeKickLiveState();
+    startKickLiveLoop();
+  } catch (err) {
+    console.error("[KickAlert] Initial setup failed:", err.message);
   }
 });
 
@@ -9914,11 +10577,28 @@ module.exports = {
   postTwitchLiveAlert,
   updateTwitchLiveAlert,
   findExistingTwitchLiveMessage,
+  decideLiveAlert,
   decideTwitchAlert,
   checkTwitchLiveStatus,
   primeTwitchLiveState,
   startTwitchLiveLoop,
   stopTwitchLiveLoop,
+  fetchKickLiveStatus,
+  buildKickLiveAlert,
+  postKickLiveAlert,
+  updateKickLiveAlert,
+  findExistingKickLiveMessage,
+  decideKickAlert,
+  checkKickLiveStatus,
+  primeKickLiveState,
+  startKickLiveLoop,
+  stopKickLiveLoop,
+  // Combined Twitch + Kick Live Alert exports
+  buildCombinedLiveAlert,
+  postCombinedLiveAlert,
+  updateCombinedLiveAlert,
+  reconcileLiveAlerts,
+  isCombinedAlertMessage,
   isTwitchConfigured,
   // OSRS in-chat stat command exports (!lvl / !kc / !pets / !log)
   OSRS_STATS_CHANNEL_ID,
