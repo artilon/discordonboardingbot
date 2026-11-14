@@ -18,6 +18,20 @@ twitch-overlay/
 Open `preview.html` to see the card over a fake gameplay scene with a fake chat
 next to it — that's the closest thing to how a viewer experiences it.
 
+### Just want the files, not a repo?
+
+```bash
+node scripts/build-twitch-pack.js
+```
+
+From the repo root. Writes `odinheim-twitch-pack.zip` next to the repo (not
+inside it) containing everything here, plus:
+
+- **`odinheim-overlay-single-file.html`** — the overlay with the QR encoder
+  inlined into the page. One loose file, no `vendor/` folder needed, so you can
+  drop it anywhere and point OBS at it. Use this if in doubt.
+- **`START-HERE.txt`** — the four steps, plain text, for future you.
+
 ---
 
 ## First, the honest part: viewers can't click your overlay
