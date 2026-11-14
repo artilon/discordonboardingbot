@@ -80,6 +80,16 @@ const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID;
 const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET;
 const TWITCH_USERNAME = process.env.TWITCH_USERNAME;
 
+// Kick "went live" alert — same idea as the Twitch one above, posted
+// independently to the same channel (so being live on both at once posts/
+// updates two separate messages). KICK_CLIENT_ID / KICK_CLIENT_SECRET come
+// from a free app registered at kick.com/settings/developer (requires 2FA
+// enabled on the Kick account first). KICK_USERNAME is the channel slug from
+// kick.com/<slug>, not a display name or URL.
+const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID;
+const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET;
+const KICK_USERNAME = process.env.KICK_USERNAME;
+
 // Optional: a RuneProfile API key (https://runeprofile.com, join their Discord
 // to request one) raises the !pets lookup's rate limit from 30/min to
 // 120/min. Not required — !pets works fine without it at low clan-chat volume.
@@ -449,6 +459,20 @@ const config = {
   // search fails (e.g. it scrolled out of the recent-message window, or was
   // deleted) the stream is simply left untouched until the next new session.
   twitchLiveState: {
+    wasLive: false,
+    lastAlertedStreamId: null,
+    lastAlertMessage: null,
+    lastTitle: null,
+    lastGameName: null,
+    lastImageRefreshAt: 0,
+  },
+  // Same idea as the Twitch settings above, but for Kick — kept as a fully
+  // separate poll/state so being live on both platforms at once tracks and
+  // updates two independent alert messages.
+  kickPollIntervalMs: 90 * 1000,
+  kickStreamFetcher: null,            // Optional override for testing Kick API fetches
+  kickImageRefreshIntervalMs: 5 * 60 * 1000,
+  kickLiveState: {
     wasLive: false,
     lastAlertedStreamId: null,
     lastAlertMessage: null,
@@ -9378,10 +9402,15 @@ async function findExistingTwitchLiveMessage(username) {
  * to remember for the next poll. `shouldAlert` and `shouldUpdate` are never
  * both true at once: a brand new session always posts fresh rather than
  * editing whatever the previous session left behind.
+ *
+ * Platform-agnostic on purpose — Twitch and Kick statuses are normalized to
+ * the same `{ live, id, title, gameName, ... }` shape, so both
+ * decideTwitchAlert and decideKickAlert delegate to this same core with
+ * their own default `imageRefreshIntervalMs`.
  */
-function decideTwitchAlert(prevState, status, opts = {}) {
+function decideLiveAlert(prevState, status, opts = {}) {
   const now = opts.now ?? Date.now();
-  const imageRefreshIntervalMs = opts.imageRefreshIntervalMs ?? config.twitchImageRefreshIntervalMs;
+  const imageRefreshIntervalMs = opts.imageRefreshIntervalMs;
 
   if (!status || !status.live) {
     return {
@@ -9432,6 +9461,11 @@ function decideTwitchAlert(prevState, status, opts = {}) {
     // lastImageRefreshAt once an update actually succeeds.
     nextState: { ...prevState, wasLive: true },
   };
+}
+
+/** Twitch-flavored entry point into decideLiveAlert — defaults the image refresh cadence to config.twitchImageRefreshIntervalMs, same as before this was pulled out into a shared platform-agnostic core. */
+function decideTwitchAlert(prevState, status, opts = {}) {
+  return decideLiveAlert(prevState, status, { imageRefreshIntervalMs: config.twitchImageRefreshIntervalMs, ...opts });
 }
 
 let twitchPollInFlight = false;
@@ -9552,6 +9586,247 @@ function stopTwitchLiveLoop() {
   }
 }
 
+// ================= KICK LIVE ALERT =================
+// Same idea as the Twitch alert above, posted independently to the same
+// channel: if the clan streams on both Twitch and Kick at once, each gets
+// its own tracked "now live" message that stays updated on its own.
+const KICK_COLOR = 0x53fc18; // Kick brand green
+
+let kickAppAccessToken = null;
+let kickAppAccessTokenExpiresAt = 0; // ms epoch
+
+/** Fetches (and caches) an app access token for Kick's public API. */
+async function getKickAppAccessToken() {
+  if (kickAppAccessToken && Date.now() < kickAppAccessTokenExpiresAt - 60_000) {
+    return kickAppAccessToken;
+  }
+  const res = await fetch("https://id.kick.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: KICK_CLIENT_ID,
+      client_secret: KICK_CLIENT_SECRET,
+      grant_type: "client_credentials",
+    }),
+  });
+  if (!res.ok) throw new Error(`Kick token request failed: ${res.status}`);
+  const data = await res.json();
+  kickAppAccessToken = data.access_token;
+  kickAppAccessTokenExpiresAt = Date.now() + (Number(data.expires_in) || 0) * 1000;
+  return kickAppAccessToken;
+}
+
+/**
+ * Returns `{ live: false }` or `{ live: true, id, title, gameName, userName,
+ * startedAt, thumbnailUrl }` for the given Kick channel slug, or `null` if
+ * the request couldn't be made at all (not configured, or an actual error).
+ * Kick's channel endpoint has no distinct "stream session id" field like
+ * Twitch does, so `id` is the stream's `start_time` instead — still unique
+ * per broadcast, which is all decideLiveAlert needs it for.
+ * `config.kickStreamFetcher`, when set, replaces this entirely — same
+ * test-injection pattern as `config.twitchStreamFetcher`.
+ */
+async function fetchKickLiveStatus(username) {
+  if (typeof config.kickStreamFetcher === "function") {
+    return config.kickStreamFetcher(username);
+  }
+  if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET || !username) return null;
+  const token = await getKickAppAccessToken();
+  const res = await fetch(`https://api.kick.com/public/v1/channels?slug=${encodeURIComponent(username)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Kick channels request failed: ${res.status}`);
+  const data = await res.json();
+  const channel = data?.data?.[0];
+  if (!channel || !channel.stream?.is_live) return { live: false };
+  return {
+    live: true,
+    id: channel.stream.start_time || String(channel.broadcaster_user_id || username),
+    title: channel.stream_title || "",
+    gameName: channel.category?.name || "",
+    userName: channel.slug || username,
+    startedAt: channel.stream.start_time || null,
+    thumbnailUrl: channel.stream.thumbnail || "",
+  };
+}
+
+function buildKickLiveAlert(stream, username) {
+  const displayName = stream.userName || username;
+  const url = `https://kick.com/${username}`;
+  const embed = new EmbedBuilder()
+    .setColor(KICK_COLOR)
+    .setDescription(
+      `🟢 **${displayName}** is now live on Kick!\n` +
+      `**${stream.title || "No title set"}**\n` +
+      url
+    );
+  if (stream.gameName) {
+    embed.addFields({ name: "Playing", value: stream.gameName, inline: true });
+  }
+  if (stream.thumbnailUrl) {
+    // Unlike Twitch, Kick's thumbnail URL isn't a {width}/{height} template —
+    // it's already a concrete image URL. Still cache-bust it so Discord
+    // doesn't keep reusing a stale preview from earlier in the same stream.
+    embed.setImage(`${stream.thumbnailUrl}?t=${Date.now()}`);
+  }
+  return { embeds: [embed], allowedMentions: { parse: [] } };
+}
+
+/** Posts the initial "went live" alert. Returns the sent Message object (so it can be remembered and edited later), or null if it couldn't be posted. */
+async function postKickLiveAlert(stream, username) {
+  const channel = await getClanAnnouncementsChannel();
+  if (!channel) return null;
+  return channel
+    .send(buildKickLiveAlert(stream, username))
+    .catch((e) => {
+      console.warn("[KickAlert] Failed to post live alert:", e.message);
+      return null;
+    });
+}
+
+/** Same approach as updateTwitchLiveAlert: edits the held Message object directly, no re-fetch-by-id. See that function's comment for why. */
+async function updateKickLiveAlert(message, stream, username) {
+  if (!message || typeof message.edit !== "function") return false;
+  return message
+    .edit(buildKickLiveAlert(stream, username))
+    .then(() => true)
+    .catch((e) => {
+      console.warn("[KickAlert] Failed to update live alert:", e.message);
+      return false;
+    });
+}
+
+/** Same approach as findExistingTwitchLiveMessage, scanning for the bot's own "is now live on Kick" post instead. */
+async function findExistingKickLiveMessage(username) {
+  try {
+    const channel = await getClanAnnouncementsChannel();
+    if (!channel || typeof channel.messages?.fetch !== "function") return null;
+    const recent = await channel.messages.fetch({ limit: 50 });
+    const list = typeof recent?.values === "function" ? Array.from(recent.values()) : Array.from(recent || []);
+    const marker = `kick.com/${String(username || "").toLowerCase()}`;
+    const botId = client.user?.id;
+    for (const message of list) {
+      const authorId = message.author?.id;
+      if (botId && authorId && authorId !== botId) continue;
+      const embed = message.embeds?.[0];
+      const desc = embed?.description ?? embed?.data?.description ?? "";
+      if (desc.toLowerCase().includes(marker) && /is now live on kick/i.test(desc)) {
+        return message;
+      }
+    }
+  } catch (e) {
+    console.warn("[KickAlert] Could not search for an existing live alert message:", e.message);
+  }
+  return null;
+}
+
+/** Kick-flavored entry point into decideLiveAlert — defaults the image refresh cadence to config.kickImageRefreshIntervalMs. */
+function decideKickAlert(prevState, status, opts = {}) {
+  return decideLiveAlert(prevState, status, { imageRefreshIntervalMs: config.kickImageRefreshIntervalMs, ...opts });
+}
+
+let kickPollInFlight = false;
+
+// `config.kickStreamFetcher` (test-only) is a complete stand-in for the real
+// Kick calls, so it bypasses the "are real credentials set" guard below —
+// otherwise this function could never be exercised in a test environment
+// that (correctly) has no real Kick credentials configured.
+function isKickConfigured() {
+  return typeof config.kickStreamFetcher === "function" || !!(KICK_USERNAME && KICK_CLIENT_ID && KICK_CLIENT_SECRET);
+}
+
+async function checkKickLiveStatus() {
+  if (kickPollInFlight) return;
+  if (!isKickConfigured()) return;
+  kickPollInFlight = true;
+  try {
+    const status = await fetchKickLiveStatus(KICK_USERNAME);
+    const { shouldAlert, shouldUpdate, nextState } = decideKickAlert(config.kickLiveState, status);
+
+    if (shouldAlert) {
+      const sent = await postKickLiveAlert(status, KICK_USERNAME);
+      config.kickLiveState = {
+        ...nextState,
+        lastAlertMessage: sent || null,
+        lastTitle: status.title || "",
+        lastGameName: status.gameName || "",
+        lastImageRefreshAt: Date.now(),
+      };
+    } else if (shouldUpdate) {
+      const updated = await updateKickLiveAlert(nextState.lastAlertMessage, status, KICK_USERNAME);
+      config.kickLiveState = updated
+        ? {
+            ...nextState,
+            lastTitle: status.title || "",
+            lastGameName: status.gameName || "",
+            lastImageRefreshAt: Date.now(),
+          }
+        : // The message is gone (e.g. deleted) — stop trying to update it for
+          // the rest of this session rather than retrying every poll forever.
+          { ...nextState, lastAlertMessage: null };
+    } else {
+      config.kickLiveState = nextState;
+    }
+  } catch (err) {
+    console.error("[KickAlert] Could not check live status:", err.message);
+  } finally {
+    kickPollInFlight = false;
+  }
+}
+
+/** Same approach as primeTwitchLiveState — see that function's comment for the full explanation. */
+async function primeKickLiveState() {
+  if (!isKickConfigured()) return;
+  try {
+    const status = await fetchKickLiveStatus(KICK_USERNAME);
+    if (status?.live) {
+      const existingMessage = await findExistingKickLiveMessage(KICK_USERNAME);
+      config.kickLiveState = {
+        wasLive: true,
+        lastAlertedStreamId: status.id,
+        lastAlertMessage: existingMessage,
+        lastTitle: null,
+        lastGameName: null,
+        lastImageRefreshAt: 0,
+      };
+      console.log(
+        `[KickAlert] ${KICK_USERNAME} is already live at startup — won't alert for this in-progress stream, only the next one.` +
+        (existingMessage
+          ? " Found its existing live alert message, so it'll keep being kept up to date."
+          : " Could not find an existing live alert message to keep updating — it'll stay as last posted until a new session starts.")
+      );
+    }
+  } catch (err) {
+    console.error("[KickAlert] Could not check initial live status:", err.message);
+  }
+}
+
+let kickPollTimer = null;
+
+function startKickLiveLoop() {
+  if (!isKickConfigured()) {
+    console.warn("[KickAlert] KICK_CLIENT_ID / KICK_CLIENT_SECRET / KICK_USERNAME not fully set — live alerts disabled until configured.");
+    return;
+  }
+  if (kickPollTimer) clearInterval(kickPollTimer);
+  console.log(`[KickAlert] Polling Kick for ${KICK_USERNAME}'s live status every ${config.kickPollIntervalMs / 1000}s.`);
+  // Same as Twitch: run the first check immediately rather than waiting a
+  // full poll interval after startup.
+  checkKickLiveStatus().catch((e) => console.error("[KickAlert] Initial poll error:", e.message));
+  kickPollTimer = setInterval(() => {
+    checkKickLiveStatus().catch((e) => console.error("[KickAlert] Poll error:", e.message));
+  }, config.kickPollIntervalMs);
+  if (typeof kickPollTimer.unref === "function") kickPollTimer.unref();
+}
+
+/** Stops the recurring poll (used by tests to avoid leaking timers across files; also handy for a clean shutdown). */
+function stopKickLiveLoop() {
+  if (kickPollTimer) {
+    clearInterval(kickPollTimer);
+    kickPollTimer = null;
+  }
+}
+
 // ================= WIRING =================
 client.once(Events.ClientReady, async () => {
   console.log(`[Heimdall] Logged in as ${client.user.tag}`);
@@ -9632,6 +9907,12 @@ client.once(Events.ClientReady, async () => {
     startTwitchLiveLoop();
   } catch (err) {
     console.error("[TwitchAlert] Initial setup failed:", err.message);
+  }
+  try {
+    await primeKickLiveState();
+    startKickLiveLoop();
+  } catch (err) {
+    console.error("[KickAlert] Initial setup failed:", err.message);
   }
 });
 
@@ -9914,11 +10195,22 @@ module.exports = {
   postTwitchLiveAlert,
   updateTwitchLiveAlert,
   findExistingTwitchLiveMessage,
+  decideLiveAlert,
   decideTwitchAlert,
   checkTwitchLiveStatus,
   primeTwitchLiveState,
   startTwitchLiveLoop,
   stopTwitchLiveLoop,
+  fetchKickLiveStatus,
+  buildKickLiveAlert,
+  postKickLiveAlert,
+  updateKickLiveAlert,
+  findExistingKickLiveMessage,
+  decideKickAlert,
+  checkKickLiveStatus,
+  primeKickLiveState,
+  startKickLiveLoop,
+  stopKickLiveLoop,
   isTwitchConfigured,
   // OSRS in-chat stat command exports (!lvl / !kc / !pets / !log)
   OSRS_STATS_CHANNEL_ID,
