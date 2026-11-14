@@ -7,9 +7,12 @@ generated in the page).
 
 ```
 twitch-overlay/
-├── index.html        ← the overlay (edit the CONFIG block at the top)
-├── preview.html      ← mock stream + chat, just to see it in context
-└── vendor/qrcode.js  ← QR encoder, MIT, vendored so OBS can load it offline
+├── index.html          ← the overlay (edit the CONFIG block at the top)
+├── preview.html        ← mock stream + chat, just to see it in context
+├── panel/              ← the clickable panel graphic + the script that draws it
+│   ├── panel-640x200.png   ← upload this to Twitch
+│   └── make-panel.py       ← regenerate it with different text
+└── vendor/qrcode.js    ← QR encoder, MIT, vendored so OBS can load it offline
 ```
 
 Open `preview.html` to see the card over a fake gameplay scene with a fake chat
@@ -48,6 +51,49 @@ Do all three. They cover each other: overlay for attention, panel for people who
 scroll down, chat for people who just ask.
 
 ---
+
+## The panel (the clickable one)
+
+A **panel** is one of the boxes that sit under your video player on
+`twitch.tv/<you>`, in the *About* area — two narrow columns, each panel 320 px
+wide. They're ordinary web content, not video, which is why they're the one part
+of your channel a viewer can genuinely click. They persist forever, need no
+extension, no review, no developer account, and they also show up in the mobile
+app's About tab.
+
+`panel/panel-640x200.png` is a matching one — same gold, crest and wordmark as
+the overlay. Twitch renders panels at 320 px wide, so the 640-wide file is a 2×
+upload that stays crisp on retina screens.
+
+**Adding it:**
+
+1. Open `twitch.tv/<yourname>` while logged in, scroll to the **About** section
+   (just under the player) and click **Edit Panels** — or the **+** tile if the
+   edit toggle is already on.
+2. Choose **Image**.
+3. **Upload** `panel/panel-640x200.png`.
+4. Put your invite in the **link** field on that panel — that's what makes the
+   whole box clickable.
+5. Caption is optional and shows as alt text/below the image. Something like
+   `Clan Odinheim — OSRS · raids, PvM, skilling` works; anything longer wraps onto
+   a second line and pushes the layout down.
+6. **Save**, then reload your channel page to check it. Click it yourself before
+   you go live.
+
+Order matters a little: panels fill left column first, top to bottom. Put the
+Discord one first so it's the first thing under your stream.
+
+**Want different wording on it?** The text is baked into the PNG, so edit the
+strings in `make-panel.py` (`ODINHEIM`, `JOIN THE CLAN DISCORD`, `JOIN`) and
+rerun it — it only needs Pillow:
+
+```bash
+cd twitch-overlay/panel && pip install pillow && python3 make-panel.py
+```
+
+**Text panel instead?** Also completely fine and takes ten seconds: add a
+**Text** panel, paste the invite, and Twitch auto-links it. The image just looks
+better and matches the stream.
 
 ## Setup in OBS
 
