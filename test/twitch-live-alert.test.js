@@ -10,12 +10,15 @@ const assert = require("assert");
 const path = require("path");
 
 const bot = require(path.join(__dirname, "..", "onboarding.js"));
+bot.client.user = { id: "fake-bot-user", tag: "Heimdall#0001" };
 
 let passed = 0;
 function check(label, cond) {
   assert.ok(cond, label);
   passed++;
 }
+
+const BOT_USER_ID = "fake-bot-user";
 
 function makeFakeChannel(channelId = "fake-channel") {
   const sent = [];
@@ -29,9 +32,12 @@ function makeFakeChannel(channelId = "fake-channel") {
       const msg = {
         id,
         channelId,
+        author: { id: BOT_USER_ID },
+        embeds: (payload.embeds || []).map((e) => ({ description: e.data.description })),
         edit: async (p) => {
           edited.push({ id, payload: p });
           msg.lastPayload = p;
+          msg.embeds = (p.embeds || []).map((e) => ({ description: e.data.description }));
           return msg;
         },
         lastPayload: payload,
@@ -39,7 +45,16 @@ function makeFakeChannel(channelId = "fake-channel") {
       messagesById.set(id, msg);
       return msg;
     },
-    messages: { fetch: async (id) => messagesById.get(id) || null },
+    messages: {
+      // Mirrors discord.js: fetch(id) looks up a single message; fetch({ limit })
+      // returns a Map-like collection of recent messages, newest first.
+      fetch: async (arg) => {
+        if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+          return new Map([...messagesById.entries()].reverse());
+        }
+        return messagesById.get(arg) || null;
+      },
+    },
     _sent: sent,
     _edited: edited,
   };
@@ -120,8 +135,7 @@ const OFFLINE_STATUS = { live: false };
     const basePrevState = {
       wasLive: true,
       lastAlertedStreamId: "stream-abc-1",
-      lastAlertChannelId: "chan-1",
-      lastAlertMessageId: "msg-1",
+      lastAlertMessage: { id: "msg-1" },
       lastTitle: LIVE_STREAM.title,
       lastGameName: LIVE_STREAM.gameName,
       lastImageRefreshAt: Date.now(),
@@ -149,7 +163,7 @@ const OFFLINE_STATUS = { live: false };
     check("the image refresh doesn't fire early, before its own interval has elapsed", imageNotDueYet.shouldUpdate === false);
 
     const noMessageOnFile = bot.decideTwitchAlert(
-      { ...basePrevState, lastAlertChannelId: null, lastAlertMessageId: null },
+      { ...basePrevState, lastAlertMessage: null },
       { ...LIVE_STREAM, title: "New title!" },
       { now: Date.now() }
     );
@@ -233,14 +247,18 @@ const OFFLINE_STATUS = { live: false };
 
     await bot.checkTwitchLiveStatus();
     check("the initial go-live posts exactly one message", channel._sent.length === 1 && channel._edited.length === 0);
-    check("the posted message's id/channel are remembered for later edits", !!bot.config.twitchLiveState.lastAlertMessageId && bot.config.twitchLiveState.lastAlertChannelId === bot.WEEKLY_RECAP_CHANNEL_ID);
+    check(
+      "the posted message is remembered directly (not just an id) so later edits need no re-fetch/extra permission",
+      !!bot.config.twitchLiveState.lastAlertMessage && bot.config.twitchLiveState.lastAlertMessage.channelId === bot.WEEKLY_RECAP_CHANNEL_ID
+    );
+    const firstMessage = bot.config.twitchLiveState.lastAlertMessage;
 
     // The title changes mid-stream — must edit the SAME message, not post a new one.
     bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, title: "Now grinding bosses!" });
     await bot.checkTwitchLiveStatus();
     check("a title change mid-stream edits the existing alert instead of posting a new one", channel._sent.length === 1 && channel._edited.length === 1);
     check("the edit reflects the new title", channel._edited[0].payload.embeds[0].data.description.includes("Now grinding bosses!"));
-    check("the edit targets the original message id", channel._edited[0].id === bot.config.twitchLiveState.lastAlertMessageId);
+    check("the edit targets the original message id", channel._edited[0].id === firstMessage.id);
 
     // Polling again immediately with no change and the image not due yet -> no further edit.
     await bot.checkTwitchLiveStatus();
@@ -251,12 +269,13 @@ const OFFLINE_STATUS = { live: false };
     await bot.checkTwitchLiveStatus();
     check("once the image refresh interval elapses, the alert is edited again even with no title/game change", channel._edited.length === 2);
 
-    // The alert message gets deleted out from under the bot — further polls must not keep failing/retrying forever.
-    channel.messages.fetch = async () => null;
+    // The alert message gets deleted out from under the bot — editing it now rejects.
+    // Further polls must not keep failing/retrying forever against a dead reference.
+    firstMessage.edit = async () => { throw new Error("Unknown Message"); };
     bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, title: "Yet another title change" });
     await bot.checkTwitchLiveStatus();
     check("a vanished message is handled gracefully (no throw) instead of crashing the poll", channel._edited.length === 2);
-    check("after a failed edit, the bot stops tracking the vanished message for this session", !bot.config.twitchLiveState.lastAlertMessageId);
+    check("after a failed edit, the bot stops tracking the vanished message for this session", !bot.config.twitchLiveState.lastAlertMessage);
 
     // Going offline then live again starts a fresh session/message, not reusing the stale state.
     bot.config.twitchStreamFetcher = async () => OFFLINE_STATUS;
@@ -292,6 +311,66 @@ const OFFLINE_STATUS = { live: false };
   bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, id: "stream-truly-new" });
   await bot.checkTwitchLiveStatus();
   check("a fresh stream after the primed one ends does trigger a real alert", primeChannel._sent.length === 1);
+
+  // ================= primeTwitchLiveState: recovering an in-progress alert after a restart =================
+  // Regression coverage for: a real report that after merging the "update the
+  // alert" feature, a stream that had been live for ~3 hours never got its
+  // post updated. Root cause: if the bot process restarts while a stream is
+  // already live, the OLD code path recorded no message to edit at all, so
+  // that session's alert was permanently stuck until it ended — exactly
+  // matching the report. Fix: prime now searches the announcements channel
+  // for the bot's own still-live alert post and resumes editing it.
+  {
+    const recoveryChannel = makeFakeChannel(bot.WEEKLY_RECAP_CHANNEL_ID);
+    bot.client.channels.fetch = async (id) => (id === bot.WEEKLY_RECAP_CHANNEL_ID ? recoveryChannel : makeFakeChannel());
+
+    // Simulate the OLD process having posted the live alert before "restarting"
+    // (via the real postTwitchLiveAlert, so its embed text matches exactly
+    // what a genuine prior session would have produced).
+    const preRestartStream = { ...LIVE_STREAM, id: "stream-pre-restart", title: "Streaming before the restart" };
+    await bot.postTwitchLiveAlert(preRestartStream, undefined);
+    check("sanity: the pre-restart alert is sitting in the channel", recoveryChannel._sent.length === 1);
+
+    // The "new" process boots up with a blank in-memory state and primes.
+    bot.config.twitchLiveState = { wasLive: false, lastAlertedStreamId: null };
+    bot.config.twitchStreamFetcher = async () => preRestartStream;
+    await bot.primeTwitchLiveState();
+
+    check("priming after a restart still never posts a brand new alert", recoveryChannel._sent.length === 1);
+    check("priming recovers the existing alert message instead of losing track of it", !!bot.config.twitchLiveState.lastAlertMessage);
+    check("the recovered message is the one actually posted before the restart", bot.config.twitchLiveState.lastAlertMessage?.id === "fake-message-1" && recoveryChannel._edited.length === 0);
+
+    // The very next regular poll (title unchanged, but lastTitle was deliberately
+    // left blank) should refresh the recovered message rather than leave it stale.
+    await bot.checkTwitchLiveStatus();
+    check("the first poll after recovery refreshes the recovered message", recoveryChannel._edited.length === 1);
+    check("the refresh keeps showing the pre-restart stream's real title", recoveryChannel._edited[0].payload.embeds[0].data.description.includes("Streaming before the restart"));
+
+    // From here on, ordinary title changes keep editing that SAME recovered message.
+    bot.config.twitchStreamFetcher = async () => ({ ...preRestartStream, title: "Still going strong hours later" });
+    await bot.checkTwitchLiveStatus();
+    check("further title changes keep editing the recovered message, not a new one", recoveryChannel._sent.length === 1 && recoveryChannel._edited.length === 2);
+  }
+
+  // If the pre-restart message can't be found (e.g. it scrolled past the
+  // recent-message search window, or the channel can't be read), priming
+  // degrades gracefully: no crash, no alert, just nothing to update until a
+  // fresh session starts.
+  {
+    const unreadableChannel = makeFakeChannel(bot.WEEKLY_RECAP_CHANNEL_ID);
+    unreadableChannel.messages.fetch = async () => { throw new Error("Missing Access"); };
+    bot.client.channels.fetch = async (id) => (id === bot.WEEKLY_RECAP_CHANNEL_ID ? unreadableChannel : makeFakeChannel());
+
+    bot.config.twitchLiveState = { wasLive: false, lastAlertedStreamId: null };
+    bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, id: "stream-unreadable-history" });
+
+    await bot.primeTwitchLiveState();
+    check("a channel that can't be searched for history doesn't crash priming", unreadableChannel._sent.length === 0);
+    check("priming still records the live session even without a recovered message", bot.config.twitchLiveState.wasLive === true && !bot.config.twitchLiveState.lastAlertMessage);
+
+    await bot.checkTwitchLiveStatus();
+    check("with no message to edit, the poll just does nothing for that ongoing session", unreadableChannel._sent.length === 0 && unreadableChannel._edited.length === 0);
+  }
 
   // ---- cleanup so this test doesn't leak state into other test files ----
   bot.config.twitchStreamFetcher = null;
