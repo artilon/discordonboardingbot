@@ -412,6 +412,7 @@ const config = {
   settleMs: 3000,
   rankSyncIntervalMs: 30 * 60 * 1000, // Check Supabase + tenure milestones every 30 minutes
   serverPrivacySyncIntervalMs: 30 * 60 * 1000, // Recheck channel/category permissions every 30 minutes
+  rankUpAlertStaggerMs: 3000, // Space consecutive brand-new staff alerts apart instead of bursting a catch-up backlog
   weeklyEventPollIntervalMs: WEEKLY_EVENT_POLL_INTERVAL_MS,
   osrsVoiceEmptyTimeoutMs: OSRS_VOICE_EMPTY_TIMEOUT_MS,
   osrsVoiceInitialEmptyTimeoutMs: OSRS_VOICE_INITIAL_EMPTY_TIMEOUT_MS,
@@ -5852,7 +5853,7 @@ function parseRosterText(rawText) {
 
 async function importRosterRows(supabase, rows = []) {
   if (!supabase || !rows || rows.length === 0) {
-    return { ok: false, totalUploaded: 0, added: [], reactivated: [], markedLeft: [] };
+    return { ok: false, totalUploaded: 0, added: [], reactivated: [], renamed: [], markedLeft: [] };
   }
 
   const uploadedByKey = new Map();
@@ -5868,7 +5869,7 @@ async function importRosterRows(supabase, rows = []) {
   }
 
   if (uploadedByKey.size === 0) {
-    return { ok: false, totalUploaded: 0, added: [], reactivated: [], markedLeft: [] };
+    return { ok: false, totalUploaded: 0, added: [], reactivated: [], renamed: [], markedLeft: [] };
   }
 
   const { data: existingMembers, error: existingErr } = await supabase
@@ -5876,25 +5877,72 @@ async function importRosterRows(supabase, rows = []) {
     .select("*");
   if (existingErr) {
     console.error("[RankSync] Could not fetch clan_members for roster import:", existingErr.message);
-    return { ok: false, error: existingErr.message, totalUploaded: 0, added: [], reactivated: [], markedLeft: [] };
+    return {
+      ok: false,
+      error: existingErr.message,
+      totalUploaded: 0,
+      added: [],
+      reactivated: [],
+      renamed: [],
+      markedLeft: [],
+    };
   }
 
   const existingByKey = new Map();
+  const existingByUserId = new Map();
   for (const m of existingMembers || []) {
     existingByKey.set(String(m.rsn || "").trim().toLowerCase(), m);
+    if (m.user_id) existingByUserId.set(String(m.user_id), m);
+  }
+
+  // Only write `user_id` once the column actually exists on clan_members —
+  // writing an unrecognized column makes Postgrest reject the whole
+  // insert/update, which would otherwise silently break EVERY roster upload
+  // (not just renames) on a database that hasn't run the migration yet.
+  // `select("*")` only ever returns real columns, so a row that has the key
+  // at all (even set to null) proves the column is there. With zero existing
+  // members there's nothing to protect yet, so it's safe either way.
+  const supportsUserId =
+    (existingMembers || []).length === 0 ||
+    (existingMembers || []).some((m) => Object.prototype.hasOwnProperty.call(m, "user_id"));
+
+  // RSN -> linked Discord user_id, so a member who changes their in-game name
+  // is still recognized as the SAME clan member (same row, same tenure/bonus
+  // XP) instead of looking like one member who "left" and a brand-new one who
+  // just joined. Honour Marks' `/register` is what keeps this mapping current
+  // whenever a member re-registers under their new name — this is best-effort:
+  // a member who hasn't registered with Honour Marks at all just falls back to
+  // the plain RSN-text match below, same as before this existed.
+  const hmRsnToUserId = new Map();
+  try {
+    const { data: hmMembers, error: hmErr } = await supabase.from("hm_members").select("user_id, rsn");
+    if (!hmErr) {
+      for (const hm of hmMembers || []) {
+        if (hm?.rsn && hm?.user_id) hmRsnToUserId.set(String(hm.rsn).trim().toLowerCase(), String(hm.user_id));
+      }
+    }
+  } catch {
+    /* hm_members may not exist yet (Honour Marks not set up) — degrade to RSN-only matching */
   }
 
   const nowIso = new Date().toISOString();
   const added = [];
   const reactivated = [];
+  const renamed = [];
   const markedLeft = [];
+  const claimedIds = new Set();
 
-  // 1. Insert new members or update existing members present in the upload
+  // 1. Insert new members, or update existing members present in the upload —
+  // matched first by linked Discord account (survives an in-game rename),
+  // falling back to a plain RSN match for members with no Honour Marks link.
   for (const [key, uploaded] of uploadedByKey.entries()) {
-    const existing = existingByKey.get(key);
+    const linkedUserId = hmRsnToUserId.get(key) || null;
+    const existing = (linkedUserId && existingByUserId.get(linkedUserId)) || existingByKey.get(key);
+
     if (!existing) {
       await supabase.from("clan_members").insert({
         rsn: uploaded.rsn,
+        ...(supportsUserId ? { user_id: linkedUserId } : {}),
         joined_date: uploaded.joined_date,
         active: true,
         xp: 0,
@@ -5908,12 +5956,29 @@ async function importRosterRows(supabase, rows = []) {
         updated_at: nowIso,
       });
       added.push(uploaded.rsn);
-    } else if (!existing.active || existing.joined_date !== uploaded.joined_date || existing.rsn !== uploaded.rsn) {
+      continue;
+    }
+
+    claimedIds.add(existing.id);
+    const existingKey = String(existing.rsn || "").trim().toLowerCase();
+    const isRename = existingKey !== key;
+    // Backfill the link opportunistically even when nothing else changed, so
+    // a FUTURE rename for this same member can be recognized automatically.
+    const resolvedUserId = linkedUserId || existing.user_id || null;
+    const needsUpdate =
+      !existing.active ||
+      existing.joined_date !== uploaded.joined_date ||
+      isRename ||
+      (supportsUserId && resolvedUserId !== (existing.user_id || null));
+
+    if (needsUpdate) {
       if (!existing.active) reactivated.push(uploaded.rsn);
+      if (isRename) renamed.push(`${existing.rsn} \u2192 ${uploaded.rsn}`);
       await supabase
         .from("clan_members")
         .update({
           rsn: uploaded.rsn,
+          ...(supportsUserId ? { user_id: resolvedUserId } : {}),
           joined_date: uploaded.joined_date,
           active: true,
           left_at: null,
@@ -5925,9 +5990,13 @@ async function importRosterRows(supabase, rows = []) {
     }
   }
 
-  // 2. Mark previously active members missing from the upload as having left the clan
-  for (const [key, existing] of existingByKey.entries()) {
-    if (existing.active && !uploadedByKey.has(key)) {
+  // 2. Mark previously active members missing from the upload as having left
+  // the clan — skip anyone already claimed above. A renamed member is matched
+  // (and claimed) under their OLD rsn key, which is no longer present in
+  // `uploadedByKey`, so this must check claimedIds rather than key-presence or
+  // every rename would also get wrongly marked as having left.
+  for (const existing of existingMembers || []) {
+    if (existing.active && !claimedIds.has(existing.id)) {
       markedLeft.push(existing.rsn);
       await supabase
         .from("clan_members")
@@ -5949,6 +6018,7 @@ async function importRosterRows(supabase, rows = []) {
     totalUploaded: uploadedByKey.size,
     added,
     reactivated,
+    renamed,
     markedLeft,
   };
 }
@@ -6077,8 +6147,10 @@ async function consumePendingRankXp(supabase, members = []) {
   if (!Array.isArray(members) || members.length === 0) return summary;
 
   const byRsn = new Map();
+  const byUserId = new Map();
   for (const m of members) {
     if (m && m.rsn) byRsn.set(String(m.rsn).trim().toLowerCase(), m);
+    if (m && m.user_id) byUserId.set(String(m.user_id), m);
   }
   if (byRsn.size === 0) return summary;
 
@@ -6105,8 +6177,14 @@ async function consumePendingRankXp(supabase, members = []) {
 
   for (const row of pending) {
     summary.rows += 1;
-    const key = await resolvePendingRsn(supabase, row, byRsn);
-    const member = key ? byRsn.get(key) : null;
+    // A direct hit on clan_members.user_id is both faster (no hm_members
+    // round-trip) and immune to an in-game rename that hm_members hasn't
+    // caught up with yet — try it before falling back to RSN-text matching.
+    let member = row.user_id ? byUserId.get(String(row.user_id)) : null;
+    if (!member) {
+      const key = await resolvePendingRsn(supabase, row, byRsn);
+      member = key ? byRsn.get(key) : null;
+    }
     if (!member) {
       summary.deferred += 1;
       await deferPendingRow(supabase, row);
@@ -6206,6 +6284,29 @@ async function runOneRankSyncPass(supabase, asOfDate) {
   await consumePendingRankXp(supabase, members);
 
   for (const member of members) {
+    // One member's bad luck (a transient Discord API error sending their alert,
+    // a malformed field, whatever) must never be able to silently wedge the
+    // whole pass. Before this try/catch, an exception thrown partway through
+    // this loop aborted every member still left in the (XP-sorted) list, so
+    // they'd keep missing their automatic tenure recompute pass after pass
+    // until something unrelated — like the next manual roster upload —
+    // happened to clear the jam. That is exactly how tenure XP looked "stuck
+    // until a manual upload" and how a pile of overdue rank-ups ended up
+    // posting all at once the moment it finally unstuck.
+    try {
+      await processOneMemberRankSync(supabase, member, asOfDate);
+    } catch (err) {
+      console.error(
+        `[RankSync] Failed to process member ${member?.rsn || member?.id}: ${err.message} — continuing with the rest of the pass.`
+      );
+    }
+  }
+
+  await ensureRankListMessage(members);
+}
+
+/** One member's slice of runOneRankSyncPass() — pulled out so it can be wrapped in its own try/catch. */
+async function processOneMemberRankSync(supabase, member, asOfDate) {
     if (member.active !== false) {
       const parsedJoin = parseJoinedDate(member.joined_date);
       const effectiveJoinedDate =
@@ -6268,8 +6369,14 @@ async function runOneRankSyncPass(supabase, asOfDate) {
       const eligibleIdx = getRankIndex(member.eligible_rank);
       const confirmedIdx = getRankIndex(member.confirmed_rank || "Bronze");
       if (eligibleIdx > confirmedIdx) {
+        const isFreshAlert = !(member.pending_alert_type === "rank_up" && member.pending_alert_message_id);
         const payload = buildRankUpAlertStep1(member, member.eligible_rank);
         await ensureStaffAlertMessage(supabase, member, "rank_up", payload);
+        // Space consecutive brand-new rank-up alerts apart instead of dumping
+        // an entire catch-up backlog into the staff channel in one instant
+        // burst — only a freshly-sent alert pays this cost, never a pass that's
+        // just re-verifying/editing an alert staff haven't acted on yet.
+        if (isFreshAlert) await sleep(config.rankUpAlertStaggerMs || 0);
       }
     } else {
       // Member has left the clan
@@ -6283,13 +6390,12 @@ async function runOneRankSyncPass(supabase, asOfDate) {
       }
 
       if (!member.left_confirmed) {
+        const isFreshAlert = !(member.pending_alert_type === "member_left" && member.pending_alert_message_id);
         const payload = buildMemberLeftAlertStep1(member);
         await ensureStaffAlertMessage(supabase, member, "member_left", payload);
+        if (isFreshAlert) await sleep(config.rankUpAlertStaggerMs || 0);
       }
     }
-  }
-
-  await ensureRankListMessage(members);
 }
 
 let realtimeChannel = null;
@@ -7281,8 +7387,9 @@ function buildRosterUploadResultEmbed(result) {
     result.markedLeft.length > 0
       ? `${result.markedLeft.length} (${result.markedLeft.slice(0, 10).join(", ")}${result.markedLeft.length > 10 ? "…" : ""})`
       : "0";
+  const renamedList = Array.isArray(result.renamed) ? result.renamed : [];
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(COLOR.ok)
     .setTitle("Clan Roster Uploaded & Synced")
     .setDescription(
@@ -7293,6 +7400,16 @@ function buildRosterUploadResultEmbed(result) {
       { name: "New Members Added", value: addedPreview, inline: true },
       { name: "Members Marked Left", value: leftPreview, inline: true }
     );
+
+  if (renamedList.length > 0) {
+    // In-game name changes recognized via the member's linked Honour Marks
+    // `/register` account — their existing tenure/XP row was updated in place,
+    // not treated as one member leaving and a different one joining.
+    const renamedPreview = `${renamedList.length} (${renamedList.slice(0, 10).join(", ")}${renamedList.length > 10 ? "…" : ""})`;
+    embed.addFields({ name: "Renamed (same member, tenure kept)", value: renamedPreview, inline: false });
+  }
+
+  return embed;
 }
 
 async function onRosterUploadButton(interaction) {
