@@ -426,14 +426,29 @@ const config = {
   dropRateFetcher: null,              // Optional override for testing OSRS Wiki drop-rate (Bucket API) fetches
   twitchPollIntervalMs: 90 * 1000,    // Check Twitch for a live-status change every 90 seconds
   twitchStreamFetcher: null,          // Optional override for testing Twitch API fetches
-  // Remembers whether the last poll saw the channel live, and which stream's
-  // `id` we already alerted for — lets a continuous live session only ever
-  // trigger one alert, while a new session later the same day still gets
-  // its own. Deliberately in-memory only (not persisted to Supabase): if the
-  // bot restarts mid-stream, the next poll treats that same stream as new
-  // and may post one extra alert for it — an acceptable tradeoff for a
-  // single-channel feature that otherwise needs no new database table.
-  twitchLiveState: { wasLive: false, lastAlertedStreamId: null },
+  // Once the live alert is posted, the preview image is also refreshed on a
+  // slower cadence even when the title hasn't changed, so a multi-hour
+  // stream doesn't stay stuck showing its very first minute forever.
+  twitchImageRefreshIntervalMs: 5 * 60 * 1000,
+  // Remembers whether the last poll saw the channel live, which stream's
+  // `id` we already alerted for, the message we posted for it (so it can be
+  // kept up to date), and the title/game last shown on that message — lets a
+  // continuous live session only ever trigger one NEW alert post, while
+  // still editing that same post if the title/game changes or enough time
+  // has passed to refresh the preview image. Deliberately in-memory only
+  // (not persisted to Supabase): if the bot restarts mid-stream, the next
+  // poll treats that same stream as new and may post one extra alert for it
+  // — an acceptable tradeoff for a single-channel feature that otherwise
+  // needs no new database table.
+  twitchLiveState: {
+    wasLive: false,
+    lastAlertedStreamId: null,
+    lastAlertChannelId: null,
+    lastAlertMessageId: null,
+    lastTitle: null,
+    lastGameName: null,
+    lastImageRefreshAt: 0,
+  },
 };
 
 // Component custom IDs
@@ -9275,29 +9290,108 @@ function buildTwitchLiveAlert(stream, username) {
   return { embeds: [embed], allowedMentions: { parse: [] } };
 }
 
+/** Posts the initial "went live" alert. Returns the sent message (so its id/channel can be remembered for later edits), or null if it couldn't be posted. */
 async function postTwitchLiveAlert(stream, username) {
   const channel = await getClanAnnouncementsChannel();
-  if (!channel) return;
-  await channel
+  if (!channel) return null;
+  return channel
     .send(buildTwitchLiveAlert(stream, username))
-    .catch((e) => console.warn("[TwitchAlert] Failed to post live alert:", e.message));
+    .catch((e) => {
+      console.warn("[TwitchAlert] Failed to post live alert:", e.message);
+      return null;
+    });
+}
+
+/**
+ * Keeps an already-posted live alert current for the rest of the stream:
+ * re-renders the same embed with the latest title/game/preview image and
+ * edits the original message in place (no new post, no extra ping). Returns
+ * false (instead of throwing) if the message can no longer be found/edited
+ * — e.g. a staff member deleted it — so the caller can stop trying to update
+ * it for the rest of this stream session rather than retrying forever.
+ */
+async function updateTwitchLiveAlert(channelId, messageId, stream, username) {
+  if (!channelId || !messageId) return false;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel || !channel.isTextBased()) return false;
+  const message = await channel.messages.fetch(messageId).catch(() => null);
+  if (!message) return false;
+  return message
+    .edit(buildTwitchLiveAlert(stream, username))
+    .then(() => true)
+    .catch((e) => {
+      console.warn("[TwitchAlert] Failed to update live alert:", e.message);
+      return false;
+    });
 }
 
 /**
  * Pure decision logic, kept separate from the network/posting side effects
  * so it's directly unit-testable: given the previously remembered state and
  * a fresh status fetch, decides whether this is a genuinely new "went live"
- * event (as opposed to the same continuous session still being live) and
- * what state to remember for the next poll.
+ * event (as opposed to the same continuous session still being live), or —
+ * for a session already alerted on — whether the EXISTING alert message
+ * should instead be edited to keep its title/game/preview image current
+ * (either because one of those actually changed, or because enough time has
+ * passed that the preview image deserves a refresh anyway), and what state
+ * to remember for the next poll. `shouldAlert` and `shouldUpdate` are never
+ * both true at once: a brand new session always posts fresh rather than
+ * editing whatever the previous session left behind.
  */
-function decideTwitchAlert(prevState, status) {
+function decideTwitchAlert(prevState, status, opts = {}) {
+  const now = opts.now ?? Date.now();
+  const imageRefreshIntervalMs = opts.imageRefreshIntervalMs ?? config.twitchImageRefreshIntervalMs;
+
   if (!status || !status.live) {
-    return { shouldAlert: false, nextState: { wasLive: false, lastAlertedStreamId: prevState.lastAlertedStreamId } };
+    return {
+      shouldAlert: false,
+      shouldUpdate: false,
+      nextState: {
+        wasLive: false,
+        lastAlertedStreamId: prevState.lastAlertedStreamId,
+        lastAlertChannelId: null,
+        lastAlertMessageId: null,
+        lastTitle: null,
+        lastGameName: null,
+        lastImageRefreshAt: 0,
+      },
+    };
   }
+
   const isNewSession = !prevState.wasLive || status.id !== prevState.lastAlertedStreamId;
+  if (isNewSession) {
+    return {
+      shouldAlert: true,
+      shouldUpdate: false,
+      // The caller fills in lastAlertChannelId/lastAlertMessageId/lastTitle/
+      // lastGameName/lastImageRefreshAt once the new alert is actually
+      // posted — this function has no access to the resulting message.
+      nextState: {
+        wasLive: true,
+        lastAlertedStreamId: status.id,
+        lastAlertChannelId: null,
+        lastAlertMessageId: null,
+        lastTitle: null,
+        lastGameName: null,
+        lastImageRefreshAt: 0,
+      },
+    };
+  }
+
+  // Same ongoing session that was already alerted on — keep the posted
+  // message current rather than leaving it frozen on whatever it said the
+  // moment it was first sent.
+  const titleChanged = (status.title || "") !== (prevState.lastTitle || "");
+  const gameChanged = (status.gameName || "") !== (prevState.lastGameName || "");
+  const imageDue = now - (Number(prevState.lastImageRefreshAt) || 0) >= imageRefreshIntervalMs;
+  const shouldUpdate = !!prevState.lastAlertMessageId && (titleChanged || gameChanged || imageDue);
+
   return {
-    shouldAlert: isNewSession,
-    nextState: { wasLive: true, lastAlertedStreamId: status.id },
+    shouldAlert: false,
+    shouldUpdate,
+    // Preserved as-is; the caller overwrites lastTitle/lastGameName/
+    // lastImageRefreshAt once an update actually succeeds.
+    nextState: { ...prevState, wasLive: true },
   };
 }
 
@@ -9317,10 +9411,37 @@ async function checkTwitchLiveStatus() {
   twitchPollInFlight = true;
   try {
     const status = await fetchTwitchLiveStatus(TWITCH_USERNAME);
-    const { shouldAlert, nextState } = decideTwitchAlert(config.twitchLiveState, status);
-    config.twitchLiveState = nextState;
+    const { shouldAlert, shouldUpdate, nextState } = decideTwitchAlert(config.twitchLiveState, status);
+
     if (shouldAlert) {
-      await postTwitchLiveAlert(status, TWITCH_USERNAME);
+      const sent = await postTwitchLiveAlert(status, TWITCH_USERNAME);
+      config.twitchLiveState = {
+        ...nextState,
+        lastAlertChannelId: sent ? sent.channelId || sent.channel?.id || null : null,
+        lastAlertMessageId: sent ? sent.id : null,
+        lastTitle: status.title || "",
+        lastGameName: status.gameName || "",
+        lastImageRefreshAt: Date.now(),
+      };
+    } else if (shouldUpdate) {
+      const updated = await updateTwitchLiveAlert(
+        nextState.lastAlertChannelId,
+        nextState.lastAlertMessageId,
+        status,
+        TWITCH_USERNAME
+      );
+      config.twitchLiveState = updated
+        ? {
+            ...nextState,
+            lastTitle: status.title || "",
+            lastGameName: status.gameName || "",
+            lastImageRefreshAt: Date.now(),
+          }
+        : // The message is gone (e.g. deleted) — stop trying to update it for
+          // the rest of this session rather than retrying every poll forever.
+          { ...nextState, lastAlertChannelId: null, lastAlertMessageId: null };
+    } else {
+      config.twitchLiveState = nextState;
     }
   } catch (err) {
     console.error("[TwitchAlert] Could not check live status:", err.message);
@@ -9333,14 +9454,25 @@ async function checkTwitchLiveStatus() {
  * Runs once at startup to silently record whether the channel happens to
  * already be live (e.g. the bot just restarted mid-stream), WITHOUT posting
  * an alert for that in-progress stream — only a stream that goes live while
- * the bot is continuously running should ever trigger a post.
+ * the bot is continuously running should ever trigger a post. There's
+ * deliberately no message to keep updated here either (none was posted), so
+ * that stream's title/image changes just go unobserved until it ends and a
+ * fresh session starts.
  */
 async function primeTwitchLiveState() {
   if (!isTwitchConfigured()) return;
   try {
     const status = await fetchTwitchLiveStatus(TWITCH_USERNAME);
     if (status?.live) {
-      config.twitchLiveState = { wasLive: true, lastAlertedStreamId: status.id };
+      config.twitchLiveState = {
+        wasLive: true,
+        lastAlertedStreamId: status.id,
+        lastAlertChannelId: null,
+        lastAlertMessageId: null,
+        lastTitle: null,
+        lastGameName: null,
+        lastImageRefreshAt: 0,
+      };
       console.log(`[TwitchAlert] ${TWITCH_USERNAME} is already live at startup — won't alert for this in-progress stream, only the next one.`);
     }
   } catch (err) {
@@ -9723,6 +9855,7 @@ module.exports = {
   fetchTwitchLiveStatus,
   buildTwitchLiveAlert,
   postTwitchLiveAlert,
+  updateTwitchLiveAlert,
   decideTwitchAlert,
   checkTwitchLiveStatus,
   primeTwitchLiveState,

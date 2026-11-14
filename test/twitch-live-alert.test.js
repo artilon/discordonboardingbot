@@ -17,13 +17,31 @@ function check(label, cond) {
   passed++;
 }
 
-function makeFakeChannel() {
+function makeFakeChannel(channelId = "fake-channel") {
   const sent = [];
+  const edited = [];
+  const messagesById = new Map();
   return {
     isTextBased: () => true,
-    send: async (payload) => { sent.push(payload); return { id: "fake-message" }; },
-    messages: { fetch: async () => new Map() },
+    send: async (payload) => {
+      const id = `fake-message-${sent.length + 1}`;
+      sent.push(payload);
+      const msg = {
+        id,
+        channelId,
+        edit: async (p) => {
+          edited.push({ id, payload: p });
+          msg.lastPayload = p;
+          return msg;
+        },
+        lastPayload: payload,
+      };
+      messagesById.set(id, msg);
+      return msg;
+    },
+    messages: { fetch: async (id) => messagesById.get(id) || null },
     _sent: sent,
+    _edited: edited,
   };
 }
 
@@ -92,6 +110,58 @@ const OFFLINE_STATUS = { live: false };
     check("a failed/undefined fetch result is treated as offline going forward", nextState.wasLive === false);
   }
 
+  // ================= decideTwitchAlert: keeping the posted alert current =================
+  // Regression coverage for: "can you make the bot update the stream title
+  // and image of the stream when it pings it?" — the already-posted alert
+  // message should be edited in place as the stream's title/game change, and
+  // its preview image refreshed periodically even with no other change, as
+  // long as there's an actual message on file to edit.
+  {
+    const basePrevState = {
+      wasLive: true,
+      lastAlertedStreamId: "stream-abc-1",
+      lastAlertChannelId: "chan-1",
+      lastAlertMessageId: "msg-1",
+      lastTitle: LIVE_STREAM.title,
+      lastGameName: LIVE_STREAM.gameName,
+      lastImageRefreshAt: Date.now(),
+    };
+
+    const sameEverything = bot.decideTwitchAlert(basePrevState, LIVE_STREAM, { now: Date.now() });
+    check("no title/game change and the image isn't due for a refresh yet -> no update", sameEverything.shouldAlert === false && sameEverything.shouldUpdate === false);
+
+    const titleChanged = bot.decideTwitchAlert(basePrevState, { ...LIVE_STREAM, title: "New title!" }, { now: Date.now() });
+    check("a title change on the same ongoing session triggers an in-place update, not a new alert", titleChanged.shouldAlert === false && titleChanged.shouldUpdate === true);
+
+    const gameChanged = bot.decideTwitchAlert(basePrevState, { ...LIVE_STREAM, gameName: "A different game" }, { now: Date.now() });
+    check("a game change on the same ongoing session also triggers an in-place update", gameChanged.shouldUpdate === true);
+
+    const imageDue = bot.decideTwitchAlert(basePrevState, LIVE_STREAM, {
+      now: basePrevState.lastImageRefreshAt + 10 * 60 * 1000,
+      imageRefreshIntervalMs: 5 * 60 * 1000,
+    });
+    check("even with nothing else changed, the preview image is refreshed once the refresh interval has elapsed", imageDue.shouldUpdate === true);
+
+    const imageNotDueYet = bot.decideTwitchAlert(basePrevState, LIVE_STREAM, {
+      now: basePrevState.lastImageRefreshAt + 1000,
+      imageRefreshIntervalMs: 5 * 60 * 1000,
+    });
+    check("the image refresh doesn't fire early, before its own interval has elapsed", imageNotDueYet.shouldUpdate === false);
+
+    const noMessageOnFile = bot.decideTwitchAlert(
+      { ...basePrevState, lastAlertChannelId: null, lastAlertMessageId: null },
+      { ...LIVE_STREAM, title: "New title!" },
+      { now: Date.now() }
+    );
+    check(
+      "a title change is never treated as 'update' when there's no alert message on file to edit (e.g. a stream that was already live at startup)",
+      noMessageOnFile.shouldUpdate === false
+    );
+
+    const newSessionNeverUpdates = bot.decideTwitchAlert(basePrevState, { ...LIVE_STREAM, id: "stream-def-2", title: "Brand new session" }, { now: Date.now() });
+    check("a genuinely NEW session always posts fresh rather than editing the previous session's message", newSessionNeverUpdates.shouldAlert === true && newSessionNeverUpdates.shouldUpdate === false);
+  }
+
   // ================= buildTwitchLiveAlert (embed shape) =================
 
   const built = bot.buildTwitchLiveAlert(LIVE_STREAM, "somecoolstreamer");
@@ -125,7 +195,7 @@ const OFFLINE_STATUS = { live: false };
 
   // ================= checkTwitchLiveStatus (end-to-end wiring, fetcher mocked) =================
 
-  const announcementsChannel = makeFakeChannel();
+  const announcementsChannel = makeFakeChannel(bot.WEEKLY_RECAP_CHANNEL_ID);
   const otherChannel = makeFakeChannel();
   bot.client.channels.fetch = async (id) => (id === bot.WEEKLY_RECAP_CHANNEL_ID ? announcementsChannel : otherChannel);
 
@@ -152,9 +222,55 @@ const OFFLINE_STATUS = { live: false };
   check("a genuinely new stream session later alerts again", announcementsChannel._sent.length === 2);
   check("the second alert is for the new stream's content", announcementsChannel._sent[1].embeds[0].data.description.includes("Back again!"));
 
+  // ================= checkTwitchLiveStatus: keeping the alert current (end-to-end) =================
+  {
+    const channel = makeFakeChannel(bot.WEEKLY_RECAP_CHANNEL_ID);
+    bot.client.channels.fetch = async (id) => (id === bot.WEEKLY_RECAP_CHANNEL_ID ? channel : makeFakeChannel());
+
+    bot.config.twitchLiveState = { wasLive: false, lastAlertedStreamId: null };
+    bot.config.twitchImageRefreshIntervalMs = 5 * 60 * 1000;
+    bot.config.twitchStreamFetcher = async () => LIVE_STREAM;
+
+    await bot.checkTwitchLiveStatus();
+    check("the initial go-live posts exactly one message", channel._sent.length === 1 && channel._edited.length === 0);
+    check("the posted message's id/channel are remembered for later edits", !!bot.config.twitchLiveState.lastAlertMessageId && bot.config.twitchLiveState.lastAlertChannelId === bot.WEEKLY_RECAP_CHANNEL_ID);
+
+    // The title changes mid-stream — must edit the SAME message, not post a new one.
+    bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, title: "Now grinding bosses!" });
+    await bot.checkTwitchLiveStatus();
+    check("a title change mid-stream edits the existing alert instead of posting a new one", channel._sent.length === 1 && channel._edited.length === 1);
+    check("the edit reflects the new title", channel._edited[0].payload.embeds[0].data.description.includes("Now grinding bosses!"));
+    check("the edit targets the original message id", channel._edited[0].id === bot.config.twitchLiveState.lastAlertMessageId);
+
+    // Polling again immediately with no change and the image not due yet -> no further edit.
+    await bot.checkTwitchLiveStatus();
+    check("polling again with nothing changed and the image not due yet does not edit again", channel._edited.length === 1);
+
+    // Time passes well beyond the image refresh interval with still no title/game change -> refreshes anyway.
+    bot.config.twitchLiveState.lastImageRefreshAt = Date.now() - 10 * 60 * 1000;
+    await bot.checkTwitchLiveStatus();
+    check("once the image refresh interval elapses, the alert is edited again even with no title/game change", channel._edited.length === 2);
+
+    // The alert message gets deleted out from under the bot — further polls must not keep failing/retrying forever.
+    channel.messages.fetch = async () => null;
+    bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, title: "Yet another title change" });
+    await bot.checkTwitchLiveStatus();
+    check("a vanished message is handled gracefully (no throw) instead of crashing the poll", channel._edited.length === 2);
+    check("after a failed edit, the bot stops tracking the vanished message for this session", !bot.config.twitchLiveState.lastAlertMessageId);
+
+    // Going offline then live again starts a fresh session/message, not reusing the stale state.
+    bot.config.twitchStreamFetcher = async () => OFFLINE_STATUS;
+    await bot.checkTwitchLiveStatus();
+    bot.config.twitchStreamFetcher = async () => ({ ...LIVE_STREAM, id: "stream-fresh-after-deletion" });
+    await bot.checkTwitchLiveStatus();
+    check("a new session after the vanished-message session posts a brand new alert", channel._sent.length === 2);
+  }
+
+  bot.config.twitchImageRefreshIntervalMs = 5 * 60 * 1000;
+
   // ================= primeTwitchLiveState (startup, must never alert) =================
 
-  const primeChannel = makeFakeChannel();
+  const primeChannel = makeFakeChannel(bot.WEEKLY_RECAP_CHANNEL_ID);
   const primeOtherChannel = makeFakeChannel();
   bot.client.channels.fetch = async (id) => (id === bot.WEEKLY_RECAP_CHANNEL_ID ? primeChannel : primeOtherChannel);
 
