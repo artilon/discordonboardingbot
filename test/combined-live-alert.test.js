@@ -129,6 +129,8 @@ function resetAll() {
   check("the Kick link is preceded by the custom Kick emoji", twitchFirstDesc.includes("<:kick:1571618398532534382> https://kick.com/testkick"));
   check("the combined alert shows the Twitch title", twitchFirstDesc.includes("Twitch title one"));
   check("the combined alert shows the Kick title", twitchFirstDesc.includes("Kick title one"));
+  check("the Twitch title is marked with a purple circle", twitchFirstDesc.includes("🟣 **Twitch:** Twitch title one"));
+  check("the Kick title is marked with a green circle", twitchFirstDesc.includes("🟢 **Kick:** Kick title one"));
   check("the combined alert shows both games as fields", twitchFirst.embeds[0].data.fields?.some((f) => f.value === "Old School RuneScape") && twitchFirst.embeds[0].data.fields.length === 2);
   check("Twitch-first uses Twitch's brand color", twitchFirst.embeds[0].data.color === 0x9146ff);
   check("Twitch-first shows the Twitch preview image (placeholders resolved)", twitchFirst.embeds[0].data.image?.url.includes("previews-ttv") && !twitchFirst.embeds[0].data.image.url.includes("{width}"));
@@ -140,6 +142,13 @@ function resetAll() {
   check("Kick-first uses Kick's brand color", kickFirst.embeds[0].data.color === 0x53fc18);
   check("Kick-first shows the Kick preview image instead", kickFirst.embeds[0].data.image?.url.includes("images.kick.com"));
   check("Kick-first footer lists Kick first", kickFirst.embeds[0].data.footer?.text === "Streaming on Kick and Twitch");
+
+  // Same display name on both platforms -> the header says it once.
+  bot.config.kickLiveState = { ...bot.config.kickLiveState, lastUserName: "TestTwitch" };
+  const sameNameDesc = bot.buildCombinedLiveAlert("twitch").embeds[0].data.description;
+  check("when the name is the same on both platforms, the header says it once", sameNameDesc.includes("**TestTwitch** is now live on Twitch and Kick!") && !sameNameDesc.includes("is now live on Kick!"));
+  check("the single-name header still matches the Twitch recovery search", /is now live on twitch/i.test(sameNameDesc));
+  check("the single-name header still matches the Kick recovery search", /is now live on (kick|twitch and kick)/i.test(sameNameDesc));
 
   // ================= single -> combined transition (Twitch live first) =================
 
@@ -270,10 +279,18 @@ function resetAll() {
     bot.client.channels.fetch = async (id) => (id === bot.WEEKLY_RECAP_CHANNEL_ID ? ch : makeFakeChannel());
     resetAll();
     // Simulate the pre-restart process: both live, combined alert posted.
+    // Same display name on both platforms, like the real setup — so the
+    // posted combined alert uses the single-name header.
     bot.config.twitchLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: TWITCH_LIVE.id, lastTitle: TWITCH_LIVE.title, lastGameName: TWITCH_LIVE.gameName, lastThumbnailUrl: TWITCH_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
-    bot.config.kickLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: KICK_LIVE.id, lastTitle: KICK_LIVE.title, lastGameName: KICK_LIVE.gameName, lastThumbnailUrl: KICK_LIVE.thumbnailUrl, lastUserName: KICK_LIVE.userName };
+    bot.config.kickLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: KICK_LIVE.id, lastTitle: KICK_LIVE.title, lastGameName: KICK_LIVE.gameName, lastThumbnailUrl: KICK_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
     await bot.postCombinedLiveAlert("twitch");
     check("setup: the pre-restart combined alert is sitting in the channel", ch._sent.length === 1);
+    check("setup: the pre-restart combined alert uses the single-name header", ch._sent[0].embeds[0].data.description.includes("**TestTwitch** is now live on Twitch and Kick!"));
+    check(
+      "both platforms' recovery searches can find the combined alert",
+      (await bot.findExistingTwitchLiveMessage("testtwitch"))?.id === "fake-message-1" &&
+      (await bot.findExistingKickLiveMessage("testkick"))?.id === "fake-message-1"
+    );
 
     // "Restart": blank in-memory state, then prime both platforms.
     resetAll();

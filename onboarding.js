@@ -9774,7 +9774,10 @@ async function findExistingKickLiveMessage(username) {
       if (botId && authorId && authorId !== botId) continue;
       const embed = message.embeds?.[0];
       const desc = embed?.description ?? embed?.data?.description ?? "";
-      if (desc.toLowerCase().includes(marker) && /is now live on kick/i.test(desc)) {
+      // Also matches the combined Twitch+Kick alert's "is now live on
+      // Twitch and Kick" header, so a combined message can be recovered
+      // by either platform's startup search.
+      if (desc.toLowerCase().includes(marker) && /is now live on (kick|twitch and kick)/i.test(desc)) {
         return message;
       }
     }
@@ -9943,13 +9946,22 @@ function buildCombinedLiveAlert(firstPlatform) {
   const twitchUser = twitchState.lastUserName || TWITCH_USERNAME;
   const kickUser = kickState.lastUserName || KICK_USERNAME;
   const firstIsTwitch = firstPlatform !== "kick";
+  // Say the name once when it's the same on both platforms ("is now live
+  // on Twitch and Kick"); only fall back to naming both when they differ.
+  // NOTE: both header variants must keep matching the per-platform
+  // recovery searches (findExistingTwitchLiveMessage /
+  // findExistingKickLiveMessage) — see the regexes there.
+  const sameName = String(twitchUser).toLowerCase() === String(kickUser).toLowerCase();
+  const header = sameName
+    ? `🔴 **${twitchUser}** is now live on Twitch and Kick!`
+    : `🔴 **${twitchUser}** is now live on Twitch and **${kickUser}** is now live on Kick!`;
   const embed = new EmbedBuilder()
     .setColor(firstIsTwitch ? TWITCH_COLOR : KICK_COLOR)
     .setDescription(
-      `🔴 **${twitchUser}** is now live on Twitch and **${kickUser}** is now live on Kick!\n\n` +
-      `**Twitch:** ${twitchState.lastTitle || "No title set"}\n` +
+      `${header}\n\n` +
+      `🟣 **Twitch:** ${twitchState.lastTitle || "No title set"}\n` +
       `${TWITCH_EMOJI} https://twitch.tv/${TWITCH_USERNAME}\n\n` +
-      `**Kick:** ${kickState.lastTitle || "No title set"}\n` +
+      `🟢 **Kick:** ${kickState.lastTitle || "No title set"}\n` +
       `${KICK_EMOJI} https://kick.com/${KICK_USERNAME}`
     );
   if (twitchState.lastGameName) {
