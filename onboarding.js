@@ -3987,7 +3987,41 @@ async function saveRecapSnapshots(supabase, rows) {
 
 // Top 5 Honour Marks earned this week, read straight from the Honour Marks
 // ledger (`hm_transactions`) and resolved to a display name via `hm_members`.
-async function computeHonourMarksLeaderboard(supabase, window) {
+/**
+ * Builds a map of Discord user_id -> current server display name (the
+ * member's server nickname if set, else their global username) for every
+ * human guild member. The Weekly Recap uses this so leaderboard names show
+ * each member's actual server nickname — not a stored RSN or a Discord
+ * username. Returns an empty Map (never null) if the guild member list
+ * couldn't be fetched, so callers fall back to their stored names.
+ */
+async function getServerNicknameMap() {
+  const map = new Map();
+  if (!client.guilds?.cache || client.guilds.cache.size === 0) return map;
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const members = await guild.members.fetch({ time: 30000 });
+      for (const member of members.values()) {
+        if (member.user?.bot) continue;
+        const name = String(member.displayName || member.user?.username || "").trim();
+        if (name) map.set(member.id, name);
+      }
+    } catch (err) {
+      console.error("[WeeklyRecap] Could not fetch guild members for nickname resolution:", err.message);
+      // Fall back to whatever's already cached from the gateway.
+      if (guild.members.cache && guild.members.cache.size > 0) {
+        for (const member of guild.members.cache.values()) {
+          if (member.user?.bot) continue;
+          const name = String(member.displayName || member.user?.username || "").trim();
+          if (name) map.set(member.id, name);
+        }
+      }
+    }
+  }
+  return map;
+}
+
+async function computeHonourMarksLeaderboard(supabase, window, nicknameByUserId) {
   if (!supabase) return [];
   try {
     const { data: txRows, error: txErr } = await supabase
@@ -4013,7 +4047,9 @@ async function computeHonourMarksLeaderboard(supabase, window) {
 
     const entries = userIds.map((uid) => {
       const m = nameByUserId.get(uid);
-      const name = (m && (m.display_name || m.rsn)) || `User ${uid}`;
+      // Prefer the member's current server nickname; fall back to the stored
+      // display_name / RSN only when Discord couldn't resolve them.
+      const name = (nicknameByUserId && nicknameByUserId.get(uid)) || (m && (m.display_name || m.rsn)) || `User ${uid}`;
       return { name, amount: totals.get(uid) };
     });
 
@@ -4095,6 +4131,64 @@ function buildBaselineAnnouncementEmbed(window, memberCount) {
   return { embeds: [embed] };
 }
 
+/**
+ * Accumulates one member's week-over-week gains into the shared recap
+ * totals. Extracted so the live run (which fetches fresh hiscores and saves
+ * snapshots) and a repost (which recomputes from already-stored snapshots)
+ * share identical diff math. `acc` carries the xpGainers/pvmers/raiders/
+ * rankXpEarners arrays and the skill/boss/raid/minigame total maps.
+ */
+function accumulateRecapGains(acc, rsn, prev, curr) {
+  if (!prev) return; // no baseline yet for this member; starts counting next week
+  const prevSkills = prev.skills || {};
+  const prevActivities = prev.activities || {};
+
+  let memberXpGained = 0;
+  for (const s of OSRS_SKILLS) {
+    const gained = sumSkillGain(prevSkills, curr.skills, s.name);
+    memberXpGained += gained; // Hitpoints XP still counts toward total XP gained.
+    if (gained > 0 && s.name !== "Hitpoints") acc.skillTotals.set(s.name, (acc.skillTotals.get(s.name) || 0) + gained);
+  }
+  if (memberXpGained > 0) acc.xpGainers.push({ name: rsn, amount: memberXpGained });
+
+  let memberPvmGained = 0;
+  for (const b of PVM_BOSS_ENTRIES) {
+    const gained = sumActivityGain(prevActivities, curr.activities, b.hiscoreNames);
+    memberPvmGained += gained;
+    if (gained > 0) acc.bossTotals.set(b.name, (acc.bossTotals.get(b.name) || 0) + gained);
+  }
+  if (memberPvmGained > 0) acc.pvmers.push({ name: rsn, amount: memberPvmGained });
+
+  let memberRaidGained = 0;
+  for (const r of RAID_BOSS_ENTRIES) {
+    const gained = sumActivityGain(prevActivities, curr.activities, r.hiscoreNames);
+    memberRaidGained += gained;
+    if (gained > 0) acc.raidTotals.set(r.name, (acc.raidTotals.get(r.name) || 0) + gained);
+  }
+  if (memberRaidGained > 0) acc.raiders.push({ name: rsn, amount: memberRaidGained });
+
+  for (const mg of OSRS_MINIGAMES) {
+    const gained = sumActivityGain(prevActivities, curr.activities, mg.hiscoreNames);
+    if (gained > 0) acc.minigameTotals.set(mg.name, (acc.minigameTotals.get(mg.name) || 0) + gained);
+  }
+
+  const rankXpGained = Math.max(0, (Number(curr.rank_xp) || 0) - (Number(prev.rank_xp) || 0));
+  if (rankXpGained > 0) acc.rankXpEarners.push({ name: rsn, amount: rankXpGained });
+}
+
+function newRecapAccumulator() {
+  return {
+    xpGainers: [],
+    pvmers: [],
+    raiders: [],
+    rankXpEarners: [],
+    skillTotals: new Map(OSRS_SKILLS.filter((s) => s.name !== "Hitpoints").map((s) => [s.name, 0])),
+    bossTotals: new Map(PVM_BOSS_ENTRIES.map((b) => [b.name, 0])),
+    raidTotals: new Map(RAID_BOSS_ENTRIES.map((b) => [b.name, 0])),
+    minigameTotals: new Map(OSRS_MINIGAMES.map((m) => [m.name, 0])),
+  };
+}
+
 async function runWeeklyRecap(window, now = new Date()) {
   const supabase = getSupabase();
   if (!supabase) return null;
@@ -4132,18 +4226,11 @@ async function runWeeklyRecap(window, now = new Date()) {
   const nowIso = (now instanceof Date ? now : new Date(now)).toISOString();
   const snapshotRows = [];
 
-  const xpGainers = [];
-  const pvmers = [];
-  const raiders = [];
-  const rankXpEarners = [];
   // Hitpoints is excluded from "Most Trained Skill" only (not from the Top 5
-  // XP Gainers total below) — every combat style trains it passively, so it
-  // would win this almost every single week regardless of what anyone was
-  // actually training, making the highlight meaningless.
-  const skillTotals = new Map(OSRS_SKILLS.filter((s) => s.name !== "Hitpoints").map((s) => [s.name, 0]));
-  const bossTotals = new Map(PVM_BOSS_ENTRIES.map((b) => [b.name, 0]));
-  const raidTotals = new Map(RAID_BOSS_ENTRIES.map((b) => [b.name, 0]));
-  const minigameTotals = new Map(OSRS_MINIGAMES.map((m) => [m.name, 0]));
+  // XP Gainers total) — every combat style trains it passively, so it would
+  // win this almost every single week regardless of what anyone was actually
+  // training, making the highlight meaningless.
+  const acc = newRecapAccumulator();
 
   for (const member of members) {
     const rsn = String(member.rsn).trim();
@@ -4151,54 +4238,21 @@ async function runWeeklyRecap(window, now = new Date()) {
     const hiscoreData = await fetchPlayerHiscores(rsn);
     const snapshot = extractMemberHiscoreSnapshot(hiscoreData);
 
-    snapshotRows.push({
-      week_key: window.weekKey,
-      rsn,
+    const curr = {
       skills: snapshot.skills,
       activities: snapshot.activities,
       rank_xp: Number(member.xp) || 0,
+    };
+    snapshotRows.push({
+      week_key: window.weekKey,
+      rsn,
+      skills: curr.skills,
+      activities: curr.activities,
+      rank_xp: curr.rank_xp,
       captured_at: nowIso,
     });
 
-    const prev = prevByRsn.get(key);
-    if (!prev) continue; // no baseline yet for this member; it'll start counting next week
-
-    const prevSkills = prev.skills || {};
-    const prevActivities = prev.activities || {};
-
-    let memberXpGained = 0;
-    for (const s of OSRS_SKILLS) {
-      const gained = sumSkillGain(prevSkills, snapshot.skills, s.name);
-      memberXpGained += gained; // Hitpoints XP still counts toward total XP gained.
-      if (gained > 0 && s.name !== "Hitpoints") skillTotals.set(s.name, (skillTotals.get(s.name) || 0) + gained);
-    }
-    if (memberXpGained > 0) xpGainers.push({ name: rsn, amount: memberXpGained });
-
-    let memberPvmGained = 0;
-    for (const b of PVM_BOSS_ENTRIES) {
-      const gained = sumActivityGain(prevActivities, snapshot.activities, b.hiscoreNames);
-      memberPvmGained += gained;
-      if (gained > 0) bossTotals.set(b.name, (bossTotals.get(b.name) || 0) + gained);
-    }
-    if (memberPvmGained > 0) pvmers.push({ name: rsn, amount: memberPvmGained });
-
-    let memberRaidGained = 0;
-    for (const r of RAID_BOSS_ENTRIES) {
-      const gained = sumActivityGain(prevActivities, snapshot.activities, r.hiscoreNames);
-      memberRaidGained += gained;
-      if (gained > 0) raidTotals.set(r.name, (raidTotals.get(r.name) || 0) + gained);
-    }
-    if (memberRaidGained > 0) raiders.push({ name: rsn, amount: memberRaidGained });
-
-    for (const mg of OSRS_MINIGAMES) {
-      const gained = sumActivityGain(prevActivities, snapshot.activities, mg.hiscoreNames);
-      if (gained > 0) minigameTotals.set(mg.name, (minigameTotals.get(mg.name) || 0) + gained);
-    }
-
-    const prevRankXp = Number(prev.rank_xp) || 0;
-    const currRankXp = Number(member.xp) || 0;
-    const rankXpGained = Math.max(0, currRankXp - prevRankXp);
-    if (rankXpGained > 0) rankXpEarners.push({ name: rsn, amount: rankXpGained });
+    accumulateRecapGains(acc, rsn, prevByRsn.get(key), curr);
   }
 
   await saveRecapSnapshots(supabase, snapshotRows);
@@ -4214,21 +4268,33 @@ async function runWeeklyRecap(window, now = new Date()) {
     return null;
   }
 
-  const hmEarners = await computeHonourMarksLeaderboard(supabase, window);
+  // Resolve leaderboard names to each member's current server nickname
+  // (via their linked Discord user_id) rather than the stored RSN.
+  const nicknameByUserId = await getServerNicknameMap();
+  const userIdByRsn = new Map(
+    members.map((m) => [String(m.rsn).trim().toLowerCase(), m.user_id ? String(m.user_id) : null])
+  );
+  const resolveRsnName = (rsn) => {
+    const uid = userIdByRsn.get(String(rsn).trim().toLowerCase());
+    return (uid && nicknameByUserId.get(uid)) || rsn;
+  };
+  const withNicknames = (entries) => entries.map((e) => ({ ...e, name: resolveRsnName(e.name) }));
+
+  const hmEarners = await computeHonourMarksLeaderboard(supabase, window, nicknameByUserId);
 
   const toEntryList = (map) => [...map.entries()].map(([name, amount]) => ({ name, amount }));
   const pickTop1 = (map) => topN(toEntryList(map), 1)[0] || null;
 
   const data = {
-    xpGainers: topN(xpGainers, 5),
-    pvmers: topN(pvmers, 5),
-    raiders: topN(raiders, 5),
-    rankXpEarners: topN(rankXpEarners, 5),
+    xpGainers: withNicknames(topN(acc.xpGainers, 5)),
+    pvmers: withNicknames(topN(acc.pvmers, 5)),
+    raiders: withNicknames(topN(acc.raiders, 5)),
+    rankXpEarners: withNicknames(topN(acc.rankXpEarners, 5)),
     hmEarners,
-    mostTrainedSkill: pickTop1(skillTotals),
-    mostKilledBoss: pickTop1(bossTotals),
-    mostPopularRaid: pickTop1(raidTotals),
-    mostPopularMinigame: pickTop1(minigameTotals),
+    mostTrainedSkill: pickTop1(acc.skillTotals),
+    mostKilledBoss: pickTop1(acc.bossTotals),
+    mostPopularRaid: pickTop1(acc.raidTotals),
+    mostPopularMinigame: pickTop1(acc.minigameTotals),
   };
 
   const payload = buildWeeklyRecapEmbed(window, data);
@@ -4237,6 +4303,78 @@ async function runWeeklyRecap(window, now = new Date()) {
     await channel.send(payload).catch((e) => console.error("[WeeklyRecap] Failed to post recap:", e.message));
   }
 
+  return { window, data };
+}
+
+/**
+ * Regenerates and reposts the recap for an already-completed week from the
+ * snapshots stored in the database — without re-fetching hiscores or
+ * re-saving snapshots. Used to repost a corrected recap (e.g. after a
+ * display-name fix) for the current week. Returns the posted payload, or
+ * null if there isn't enough stored data to build a real recap.
+ */
+async function repostWeeklyRecap(window) {
+  const supabase = getSupabase();
+  if (!supabase || !window) return null;
+
+  const { data: memberRows } = await supabase
+    .from("clan_members")
+    .select("*")
+    .eq("active", true);
+  const members = (memberRows || []).filter((m) => m && String(m.rsn || "").trim());
+  if (members.length === 0) return null;
+
+  // This week's stored snapshots (the ones the original recap was built from).
+  const { data: currRows } = await supabase
+    .from("weekly_recap_snapshots")
+    .select("*")
+    .eq("week_key", window.weekKey);
+  if (!currRows || currRows.length === 0) return null;
+  const currByRsn = new Map(currRows.map((r) => [String(r.rsn).trim().toLowerCase(), r]));
+
+  const prevByRsn = await loadPreviousRecapSnapshots(supabase, window.weekKey);
+  if (prevByRsn.size === 0) return null; // baseline-only week; nothing to diff
+
+  const acc = newRecapAccumulator();
+  for (const member of members) {
+    const rsn = String(member.rsn).trim();
+    const key = rsn.toLowerCase();
+    const curr = currByRsn.get(key);
+    if (!curr) continue;
+    accumulateRecapGains(acc, rsn, prevByRsn.get(key), curr);
+  }
+
+  const nicknameByUserId = await getServerNicknameMap();
+  const userIdByRsn = new Map(
+    members.map((m) => [String(m.rsn).trim().toLowerCase(), m.user_id ? String(m.user_id) : null])
+  );
+  const resolveRsnName = (rsn) => {
+    const uid = userIdByRsn.get(String(rsn).trim().toLowerCase());
+    return (uid && nicknameByUserId.get(uid)) || rsn;
+  };
+  const withNicknames = (entries) => entries.map((e) => ({ ...e, name: resolveRsnName(e.name) }));
+
+  const hmEarners = await computeHonourMarksLeaderboard(supabase, window, nicknameByUserId);
+  const toEntryList = (map) => [...map.entries()].map(([name, amount]) => ({ name, amount }));
+  const pickTop1 = (map) => topN(toEntryList(map), 1)[0] || null;
+
+  const data = {
+    xpGainers: withNicknames(topN(acc.xpGainers, 5)),
+    pvmers: withNicknames(topN(acc.pvmers, 5)),
+    raiders: withNicknames(topN(acc.raiders, 5)),
+    rankXpEarners: withNicknames(topN(acc.rankXpEarners, 5)),
+    hmEarners,
+    mostTrainedSkill: pickTop1(acc.skillTotals),
+    mostKilledBoss: pickTop1(acc.bossTotals),
+    mostPopularRaid: pickTop1(acc.raidTotals),
+    mostPopularMinigame: pickTop1(acc.minigameTotals),
+  };
+
+  const payload = buildWeeklyRecapEmbed(window, data);
+  const channel = await getWeeklyRecapChannel();
+  if (channel) {
+    await channel.send(payload).catch((e) => console.error("[WeeklyRecap] Failed to repost recap:", e.message));
+  }
   return { window, data };
 }
 
@@ -9351,6 +9489,44 @@ async function onPollClose(interaction, messageId) {
   console.log(`[Poll] Closed poll ${messageId} by ${interaction.user.id}.`);
 }
 
+// ================= REPOST WEEKLY RECAP =================
+// Staff-only manual trigger to regenerate and repost the most recent
+// completed week's recap from stored snapshots (e.g. to replace a recap
+// that used the wrong display names). Does not touch the snapshots.
+async function registerRepostRecapCommand() {
+  if (!client.application) return;
+  const commandDef = {
+    name: "repost-recap",
+    description: "Regenerate and repost this week's Weekly Clan Recap from stored data (Staff, Leader & Owner roles only)",
+    defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
+    options: [],
+  };
+  for (const guild of client.guilds.cache.values()) {
+    await guild.commands.create(commandDef).catch((e) => {
+      console.warn(`[WeeklyRecap] Could not register /repost-recap in guild ${guild.id}:`, e.message);
+    });
+  }
+}
+
+async function onRepostRecapSlashCommand(interaction) {
+  if (!canCreatePoll(interaction.member)) {
+    return interaction.reply({
+      embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Not allowed").setDescription("Only Staff, Leader, and Owner roles can repost the recap.")],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+  const window = findMostRecentCompletedRecapWindow(new Date());
+  if (!window) {
+    return interaction.reply({ content: "No completed recap week found yet.", flags: MessageFlags.Ephemeral });
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = await repostWeeklyRecap(window);
+  if (!result) {
+    return interaction.editReply({ content: `No stored recap data for the week ending ${window.weekKey} — nothing to repost.` });
+  }
+  return interaction.editReply({ content: `Reposted the Weekly Clan Recap for the week ending ${window.weekKey} with server nicknames.` });
+}
+
 async function onRankUpConfirm1(interaction, encodedRsn, targetRank) {
   const rsn = decodeName(encodedRsn);
   const supabase = getSupabase();
@@ -9524,6 +9700,10 @@ async function handleInteraction(interaction) {
 
   if (interaction.isChatInputCommand?.() && interaction.commandName === "poll") {
     return onPollSlashCommand(interaction);
+  }
+
+  if (interaction.isChatInputCommand?.() && interaction.commandName === "repost-recap") {
+    return onRepostRecapSlashCommand(interaction);
   }
 
   if (interaction.isButton()) {
@@ -10585,6 +10765,11 @@ client.once(Events.ClientReady, async () => {
     console.error("[Poll] registerPollCommand failed:", err.message);
   }
   try {
+    await registerRepostRecapCommand();
+  } catch (err) {
+    console.error("[WeeklyRecap] registerRepostRecapCommand failed:", err.message);
+  }
+  try {
     await ensurePermanentMessage();
   } catch (err) {
     console.error("[Onboarding] ensurePermanentMessage failed:", err.message);
@@ -10876,6 +11061,12 @@ module.exports = {
   sumSkillGain,
   sumActivityGain,
   computeHonourMarksLeaderboard,
+  getServerNicknameMap,
+  accumulateRecapGains,
+  newRecapAccumulator,
+  repostWeeklyRecap,
+  registerRepostRecapCommand,
+  onRepostRecapSlashCommand,
   buildWeeklyRecapEmbed,
   buildBaselineAnnouncementEmbed,
   runWeeklyRecap,
