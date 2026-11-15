@@ -257,8 +257,9 @@ const OSRS_STATS_CHANNEL_ID = WEEKLY_RECAP_CHANNEL_ID;
 // Recruitment Drive Event — everything (announcement, leaderboard, per-member
 // evidence threads) lives in this single channel.
 const RECRUITMENT_DRIVE_CHANNEL_ID   = "1567981016642097324";
-const RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT  = "3 Bonds"; // awarded to 1st place
-const RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT = "1 Bond";  // awarded to 2nd place
+const BOND_EMOJI = "<:bond:1569038231876407427>"; // custom server emoji shown next to Recruitment Drive rewards
+const RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT  = `3 Bonds ${BOND_EMOJI}`; // awarded to 1st place
+const RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT = `2 Bonds ${BOND_EMOJI}`; // awarded to 2nd place
 const RECRUITMENT_UPLOAD_WINDOW_MS   = 10 * 60 * 1000; // 10 minutes to post a screenshot after clicking the button
 const RECRUITMENT_THREAD_AUTO_ARCHIVE_MINUTES = 10080; // 1 week — the max; new posts keep un-archiving it
 // Start/end instants (America/Chicago) are computed further down, right after
@@ -10881,6 +10882,7 @@ module.exports = {
   startWeeklyRecapLoop,
   // Recruitment Drive exports
   RECRUITMENT_DRIVE_CHANNEL_ID,
+  BOND_EMOJI,
   RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT,
   RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT,
   getRecruitmentDrivePlacements,

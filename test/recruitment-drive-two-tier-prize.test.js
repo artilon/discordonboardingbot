@@ -1,5 +1,6 @@
 // Regression coverage for: "i need to update the prize in the recruitment
-// drive event post to 3 bonds for 1st place and 1 bond for 2nd place."
+// drive event post to 3 bonds for 1st place and 2 bonds for 2nd place, with
+// the bond emoji next to both rewards."
 //
 // Covers the prize amounts themselves, the announcement embed's Prize field,
 // the final leaderboard's 1st/2nd place fields across every placement shape
@@ -17,15 +18,17 @@ function check(label, cond) {
   passed++;
 }
 
-check("1st place prize is 3 Bonds", bot.RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT === "3 Bonds");
-check("2nd place prize is 1 Bond", bot.RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT === "1 Bond");
+check("1st place prize is 3 Bonds with the bond emoji", bot.RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT === `3 Bonds ${bot.BOND_EMOJI}`);
+check("2nd place prize is 2 Bonds with the bond emoji", bot.RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT === `2 Bonds ${bot.BOND_EMOJI}`);
+check("the bond emoji is the server's bond emoji", bot.BOND_EMOJI === "<:bond:1569038231876407427>");
 
 // ---- Announcement embed's Prize field mentions both tiers ----
 const announcement = bot.buildRecruitmentDriveEmbed("active");
 const prizeField = announcement.embeds[0].data.fields.find((f) => f.name === "Prize");
 check("Prize field exists", !!prizeField);
 check("Prize field mentions 1st place and 3 Bonds", /1st place/i.test(prizeField.value) && prizeField.value.includes("3 Bonds"));
-check("Prize field mentions 2nd place and 1 Bond", /2nd place/i.test(prizeField.value) && prizeField.value.includes("1 Bond"));
+check("Prize field mentions 2nd place and 2 Bonds", /2nd place/i.test(prizeField.value) && prizeField.value.includes("2 Bonds"));
+check("Prize field shows the bond emoji next to both rewards", prizeField.value.split(bot.BOND_EMOJI).length - 1 === 2);
 
 // ---- getRecruitmentDrivePlacements: the shared placement logic ----
 {
@@ -83,8 +86,8 @@ check("Prize field mentions 2nd place and 1 Bond", /2nd place/i.test(prizeField.
     fields.some((f) => f.name === "1st Place" && f.value.includes("<@111>") && f.value.includes("3 Bonds"))
   );
   check(
-    "2nd Place field awards 1 Bond to the runner-up",
-    fields.some((f) => f.name === "2nd Place" && f.value.includes("<@222>") && f.value.includes("1 Bond"))
+    "2nd Place field awards 2 Bonds to the runner-up",
+    fields.some((f) => f.name === "2nd Place" && f.value.includes("<@222>") && f.value.includes("2 Bonds"))
   );
 }
 {
