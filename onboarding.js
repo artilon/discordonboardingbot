@@ -9267,6 +9267,7 @@ async function handleInteraction(interaction) {
 // goes live. Polling-based (no public webhook endpoint required) — checks
 // every `config.twitchPollIntervalMs` (default 90s) via Twitch's Helix API.
 const TWITCH_COLOR = 0x9146ff; // Twitch brand purple
+const TWITCH_EMOJI = "<:twitch:1571618429168001146>"; // custom server emoji shown next to Twitch links in live alerts
 
 let twitchAppAccessToken = null;
 let twitchAppAccessTokenExpiresAt = 0; // ms epoch
@@ -9334,7 +9335,7 @@ function buildTwitchLiveAlert(stream, username) {
     .setDescription(
       `🔴 **${displayName}** is now live on Twitch!\n` +
       `**${stream.title || "No title set"}**\n` +
-      url
+      `${TWITCH_EMOJI} ${url}`
     );
   if (stream.gameName) {
     embed.addFields({ name: "Playing", value: stream.gameName, inline: true });
@@ -9653,6 +9654,7 @@ function stopTwitchLiveLoop() {
 // channel: if the clan streams on both Twitch and Kick at once, each gets
 // its own tracked "now live" message that stays updated on its own.
 const KICK_COLOR = 0x53fc18; // Kick brand green
+const KICK_EMOJI = "<:kick:1571618398532534382>"; // custom server emoji shown next to Kick links in live alerts
 
 let kickAppAccessToken = null;
 let kickAppAccessTokenExpiresAt = 0; // ms epoch
@@ -9720,7 +9722,7 @@ function buildKickLiveAlert(stream, username) {
     .setDescription(
       `🟢 **${displayName}** is now live on Kick!\n` +
       `**${stream.title || "No title set"}**\n` +
-      url
+      `${KICK_EMOJI} ${url}`
     );
   if (stream.gameName) {
     embed.addFields({ name: "Playing", value: stream.gameName, inline: true });
@@ -9944,11 +9946,11 @@ function buildCombinedLiveAlert(firstPlatform) {
   const embed = new EmbedBuilder()
     .setColor(firstIsTwitch ? TWITCH_COLOR : KICK_COLOR)
     .setDescription(
-      `🔴 **${twitchUser}** is now live on Twitch and **${kickUser}** is now live on Kick!\n` +
+      `🔴 **${twitchUser}** is now live on Twitch and **${kickUser}** is now live on Kick!\n\n` +
       `**Twitch:** ${twitchState.lastTitle || "No title set"}\n` +
-      `https://twitch.tv/${TWITCH_USERNAME}\n` +
+      `${TWITCH_EMOJI} https://twitch.tv/${TWITCH_USERNAME}\n\n` +
       `**Kick:** ${kickState.lastTitle || "No title set"}\n` +
-      `https://kick.com/${KICK_USERNAME}`
+      `${KICK_EMOJI} https://kick.com/${KICK_USERNAME}`
     );
   if (twitchState.lastGameName) {
     embed.addFields({ name: "Twitch — Playing", value: twitchState.lastGameName, inline: true });

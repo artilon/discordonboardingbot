@@ -125,6 +125,8 @@ function resetAll() {
   check("the combined alert says the streamer is live on Kick", /is now live on kick/i.test(twitchFirstDesc));
   check("the combined alert links to the Twitch channel", twitchFirstDesc.includes("https://twitch.tv/testtwitch"));
   check("the combined alert links to the Kick channel", twitchFirstDesc.includes("https://kick.com/testkick"));
+  check("the Twitch link is preceded by the custom Twitch emoji", twitchFirstDesc.includes("<:twitch:1571618429168001146> https://twitch.tv/testtwitch"));
+  check("the Kick link is preceded by the custom Kick emoji", twitchFirstDesc.includes("<:kick:1571618398532534382> https://kick.com/testkick"));
   check("the combined alert shows the Twitch title", twitchFirstDesc.includes("Twitch title one"));
   check("the combined alert shows the Kick title", twitchFirstDesc.includes("Kick title one"));
   check("the combined alert shows both games as fields", twitchFirst.embeds[0].data.fields?.some((f) => f.value === "Old School RuneScape") && twitchFirst.embeds[0].data.fields.length === 2);
