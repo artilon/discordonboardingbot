@@ -257,8 +257,9 @@ const OSRS_STATS_CHANNEL_ID = WEEKLY_RECAP_CHANNEL_ID;
 // Recruitment Drive Event — everything (announcement, leaderboard, per-member
 // evidence threads) lives in this single channel.
 const RECRUITMENT_DRIVE_CHANNEL_ID   = "1567981016642097324";
-const RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT  = "3 Bonds"; // awarded to 1st place
-const RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT = "1 Bond";  // awarded to 2nd place
+const BOND_EMOJI = "<:bond:1569038231876407427>"; // custom server emoji shown next to Recruitment Drive rewards
+const RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT  = `3 Bonds ${BOND_EMOJI}`; // awarded to 1st place
+const RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT = `2 Bonds ${BOND_EMOJI}`; // awarded to 2nd place
 const RECRUITMENT_UPLOAD_WINDOW_MS   = 10 * 60 * 1000; // 10 minutes to post a screenshot after clicking the button
 const RECRUITMENT_THREAD_AUTO_ARCHIVE_MINUTES = 10080; // 1 week — the max; new posts keep un-archiving it
 // Start/end instants (America/Chicago) are computed further down, right after
@@ -573,6 +574,9 @@ const ID = {
   // Screenshot verification + Discord-join-bonus double confirm
   RECRUITMENT_VERIFY:            "recruitment_verify",
   RECRUITMENT_BONUS_C1:          "recruitment_bonus_c1",
+  // Bot poll custom IDs (payload = poll message ID, extra = option index)
+  POLL_VOTE:  "poll_vote",
+  POLL_CLOSE: "poll_close",
   RECRUITMENT_BONUS_C2:          "recruitment_bonus_c2",
   RECRUITMENT_BONUS_CANCEL:      "recruitment_bonus_cancel",
   // Staff Alert channel "new screenshot" review tracker
@@ -1046,9 +1050,11 @@ function buildPermanentMessage() {
     .setColor(COLOR.main)
     .setTitle("Welcome — Set Your Server Nickname")
     .setDescription(
-      "To get started, your server nickname must match your **exact in-game username**.\n\n" +
+      "To get started, your server nickname must match your **exact in-game username**. " +
+      "Setting it for the first time **unlocks access to the rest of the Discord** — until then, you can only see this channel and Contact Us.\n\n" +
       "Click the button below, type your in-game username, and confirm it. " +
-      "Double-check your spelling — no extra characters, no typos."
+      "Double-check your spelling — no extra characters, no typos.\n\n" +
+      "**Changed your in-game name?** Come back to this channel and update your nickname again so it stays in sync."
     );
 
   const row = new ActionRowBuilder().addComponents(
@@ -7003,6 +7009,31 @@ async function syncOrientationAccessForMember(member) {
   await setMemberChannelAllow(channel, member.id, isPendingOrientation(member), "Orientation channel stays visible until the role is accepted");
 }
 
+// The only two channels a member who has picked the Clan Member role but
+// hasn't set their nickname yet (isPendingNicknameVerification) may see:
+// the onboarding nickname channel and the Contact Us / ticket channel.
+// Everything else gets an explicit per-member View Channel DENY — this is
+// the only way to hide channels that the Clan Member role itself would
+// otherwise make visible. The two allowed channels get an explicit ALLOW
+// so they stay visible even if a parent category is denied. When the
+// member finishes nickname verification, every override is removed and
+// they inherit the normal role-based visibility again.
+const PENDING_ONBOARDING_VISIBLE_CHANNEL_IDS = new Set([ONBOARDING_CHANNEL_ID, TICKET_CONTACT_CHANNEL_ID]);
+
+async function syncPendingOnboardingAccessForMember(member) {
+  const isPending = isPendingNicknameVerification(member);
+  const reason = "Pending nickname setup — only the nickname and Contact Us channels are visible";
+  const channels = member.guild?.channels?.cache;
+  if (!channels) return;
+  for (const channel of channels.values()) {
+    if (PENDING_ONBOARDING_VISIBLE_CHANNEL_IDS.has(channel.id)) {
+      await setMemberChannelAllow(channel, member.id, isPending, reason);
+    } else {
+      await setMemberChannelBlock(channel, member.id, isPending, reason);
+    }
+  }
+}
+
 /** Corrects every current member's dynamic overrides — the drift-safety-net half of the heartbeat sync. */
 async function reconcileAllMembersChannelAccess(guild) {
   let members;
@@ -7017,6 +7048,7 @@ async function reconcileAllMembersChannelAccess(guild) {
     try {
       await syncClanChatAccessForMember(member);
       await syncOrientationAccessForMember(member);
+      await syncPendingOnboardingAccessForMember(member);
       await syncOsrsRoleForMember(member);
     } catch (err) {
       console.error(`[ServerPrivacy] Could not reconcile ${member.id}: ${err.message}`);
@@ -7100,6 +7132,13 @@ async function processOnboardingCompletion(guild, userId) {
     await syncClanChatAccessForMember(member).catch((e) =>
       console.error(`[ServerPrivacy] Could not sync Clan Chat access for ${userId}: ${e.message}`)
     );
+
+    // Same urgency for the pending-onboarding gate: a fresh Clan Member who
+    // hasn't set their nickname yet should only see the nickname channel and
+    // Contact Us, not the rest of the server.
+    await syncPendingOnboardingAccessForMember(member).catch((e) =>
+      console.error(`[ServerPrivacy] Could not sync pending-onboarding access for ${userId}: ${e.message}`)
+    );
   } finally {
     completionInFlight.delete(userId);
   }
@@ -7119,6 +7158,7 @@ async function handleMemberUpdate(oldMember, newMember) {
   try {
     if (relevantChanged([CLAN_MEMBER_ROLE_ID, UNVERIFIED_ROLE_ID])) {
       await syncClanChatAccessForMember(newMember);
+      await syncPendingOnboardingAccessForMember(newMember);
     }
     if (relevantChanged([STAFF_ROLE_ID, JR_STAFF_ROLE_ID, LEADER_ROLE_ID, VERIFIED_STAFF_ROLE_ID, VERIFIED_LEADER_ROLE_ID])) {
       await syncOrientationAccessForMember(newMember);
@@ -7277,6 +7317,11 @@ async function onConfirm2(interaction, encoded) {
     // Unlock Clan Chat immediately — don't make them wait for the next heartbeat.
     await syncClanChatAccessForMember(member).catch((e) =>
       console.error(`[ServerPrivacy] Could not unlock Clan Chat for ${interaction.user.id}: ${e.message}`)
+    );
+    // Nickname is set, so the pending-onboarding gate no longer applies —
+    // clear it immediately so the rest of the server becomes visible.
+    await syncPendingOnboardingAccessForMember(member).catch((e) =>
+      console.error(`[ServerPrivacy] Could not unlock server access for ${interaction.user.id}: ${e.message}`)
     );
   } catch (err) {
     console.error(`[Roles] Role update failed for ${interaction.user.id}: ${err.message}`);
@@ -9071,6 +9116,241 @@ async function registerUploadRosterCommand() {
   }
 }
 
+// ================= BOT POLLS =================
+// Discord's native poll composer does not work in Announcement Channels (nor
+// voice/stage/forum/media channels) — the Send Polls permission shows as
+// allowed there but has no effect. This bot-based /poll command works in any
+// channel type, including announcements. Staff-tier roles create the poll;
+// anyone who can see the channel can vote by clicking an option button.
+// Votes are tracked in memory (keyed by the poll message ID); a bot restart
+// resets the counts but leaves the poll message in place.
+const POLL_MAX_OPTIONS = 10;
+const POLL_MIN_OPTIONS = 2;
+const POLL_DEFAULT_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+const activePolls = new Map(); // messageId -> { question, options: [{label, voters:Set}], authorId, endsAt, closed }
+
+function canCreatePoll(member) {
+  return hasAnyRole(member, STAFF_AND_ABOVE_ROLE_IDS);
+}
+
+/** Parse a comma-separated options string into a clean list of labels. */
+function parsePollOptions(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, POLL_MAX_OPTIONS);
+}
+
+/** Parse a duration like "30m", "12h", "7d" into milliseconds. Null if invalid. */
+function parsePollDuration(raw) {
+  if (raw == null || String(raw).trim() === "") return POLL_DEFAULT_DURATION_MS;
+  const m = String(raw).trim().toLowerCase().match(/^(\d+)\s*(m|h|d)$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const mult = m[2] === "m" ? 60 * 1000 : m[2] === "h" ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  return n * mult;
+}
+
+function pollTotalVotes(poll) {
+  return poll.options.reduce((sum, o) => sum + o.voters.size, 0);
+}
+
+function buildPollEmbed(poll) {
+  const total = pollTotalVotes(poll);
+  const lines = poll.options.map((opt, i) => {
+    const count = opt.voters.size;
+    const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+    return `**${i + 1}.** ${opt.label} — ${count} vote${count === 1 ? "" : "s"} (${pct}%)`;
+  });
+  const embed = new EmbedBuilder()
+    .setColor(COLOR.main)
+    .setTitle(`📊 ${poll.question}`)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: poll.closed ? "This poll is closed." : `Click an option to vote · ${total} total vote${total === 1 ? "" : "s"}` });
+  if (!poll.closed && poll.endsAt) {
+    embed.setDescription(lines.join("\n") + `\n\nEnds <t:${Math.floor(poll.endsAt / 1000)}:R>`);
+  }
+  return embed;
+}
+
+function buildPollComponents(poll, messageId) {
+  const rows = [];
+  let current = new ActionRowBuilder();
+  poll.options.forEach((opt, i) => {
+    if (current.components.length === 5) {
+      rows.push(current);
+      current = new ActionRowBuilder();
+    }
+    const btn = new ButtonBuilder()
+      .setCustomId(`${ID.POLL_VOTE}:${messageId}:${i}`)
+      .setLabel(`${i + 1}. ${opt.label}`.slice(0, 80))
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!!poll.closed);
+    current.addComponents(btn);
+  });
+  if (current.components.length) rows.push(current);
+  // Close button on its own row (only while open).
+  if (!poll.closed) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${ID.POLL_CLOSE}:${messageId}`)
+          .setLabel("Close Poll")
+          .setStyle(ButtonStyle.Danger)
+      )
+    );
+  }
+  return rows;
+}
+
+function pollPayload(poll, messageId) {
+  return { embeds: [buildPollEmbed(poll)], components: buildPollComponents(poll, messageId) };
+}
+
+async function registerPollCommand() {
+  if (!client.application) return;
+  const commandDef = {
+    name: "poll",
+    description: "Create a poll anyone can vote on (Staff, Leader & Owner roles only)",
+    // Hidden from everyone by default; the in-handler role check is the real gate.
+    defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
+    options: [
+      {
+        name: "question",
+        description: "The poll question",
+        type: ApplicationCommandOptionType.String,
+        required: true,
+      },
+      {
+        name: "options",
+        description: "Comma-separated choices (2-10), e.g. \"Yes, No, Maybe\"",
+        type: ApplicationCommandOptionType.String,
+        required: true,
+      },
+      {
+        name: "duration",
+        description: "How long to run, e.g. 30m, 12h, 7d (default 24h)",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+      },
+    ],
+  };
+
+  for (const guild of client.guilds.cache.values()) {
+    await guild.commands.create(commandDef).catch((e) => {
+      console.warn(`[Poll] Could not register /poll in guild ${guild.id}:`, e.message);
+    });
+  }
+}
+
+async function onPollSlashCommand(interaction) {
+  if (!canCreatePoll(interaction.member)) {
+    return interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(COLOR.bad)
+          .setTitle("Not allowed")
+          .setDescription("Only Staff, Leader, and Owner roles can create polls."),
+      ],
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  const question = (interaction.options.getString("question", true) || "").trim();
+  const options = parsePollOptions(interaction.options.getString("options", true));
+  const durationMs = parsePollDuration(interaction.options.getString("duration", false));
+
+  if (!question) {
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Missing question").setDescription("Please provide a poll question.")], flags: MessageFlags.Ephemeral });
+  }
+  if (options.length < POLL_MIN_OPTIONS) {
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Not enough options").setDescription(`Please provide at least ${POLL_MIN_OPTIONS} comma-separated options.`)], flags: MessageFlags.Ephemeral });
+  }
+  if (durationMs === null) {
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Invalid duration").setDescription("Use a duration like `30m`, `12h`, or `7d`.")], flags: MessageFlags.Ephemeral });
+  }
+
+  const poll = {
+    question,
+    options: options.map((label) => ({ label, voters: new Set() })),
+    authorId: interaction.user.id,
+    channelId: interaction.channelId,
+    endsAt: durationMs ? Date.now() + durationMs : null,
+    closed: false,
+  };
+
+  // Post the poll as a normal (non-ephemeral) message so everyone can vote.
+  const message = await interaction.reply({ ...pollPayload(poll, "pending"), fetchReply: true });
+  activePolls.set(message.id, poll);
+  // Re-render with the real message ID baked into the button custom IDs.
+  await message.edit(pollPayload(poll, message.id)).catch(() => {});
+
+  if (poll.endsAt) {
+    const delay = Math.max(0, poll.endsAt - Date.now());
+    setTimeout(() => closePoll(message.id, "expired").catch(() => {}), delay).unref?.();
+  }
+  return message;
+}
+
+async function closePoll(messageId, reason) {
+  const poll = activePolls.get(messageId);
+  if (!poll || poll.closed) return;
+  poll.closed = true;
+  let message = null;
+  if (poll.channelId) {
+    const ch = await client.channels.fetch(poll.channelId).catch(() => null);
+    message = await ch?.messages?.fetch(messageId).catch(() => null);
+  }
+  if (message) {
+    await message.edit(pollPayload(poll, messageId)).catch(() => {});
+  }
+  console.log(`[Poll] Closed poll ${messageId} (${reason}).`);
+}
+
+async function onPollVote(interaction, messageId, optionIndex) {
+  const poll = activePolls.get(messageId);
+  if (!poll) {
+    return interaction.reply({ content: "This poll is no longer active.", flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+  if (poll.closed) {
+    return interaction.reply({ content: "This poll is closed.", flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+  const idx = parseInt(optionIndex, 10);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= poll.options.length) {
+    return interaction.deferUpdate().catch(() => {});
+  }
+
+  const userId = interaction.user.id;
+  const target = poll.options[idx];
+  // Toggle: clicking the option you already voted for removes your vote;
+  // clicking a different one moves your vote.
+  if (target.voters.has(userId)) {
+    target.voters.delete(userId);
+  } else {
+    for (const opt of poll.options) opt.voters.delete(userId);
+    target.voters.add(userId);
+  }
+
+  await interaction.update(pollPayload(poll, messageId)).catch(() => {});
+}
+
+async function onPollClose(interaction, messageId) {
+  const poll = activePolls.get(messageId);
+  if (!poll) {
+    return interaction.reply({ content: "This poll is no longer active.", flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+  const isAuthor = interaction.user.id === poll.authorId;
+  if (!isAuthor && !canCreatePoll(interaction.member)) {
+    return interaction.reply({ content: "Only the poll creator or staff can close this poll.", flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+  poll.closed = true;
+  await interaction.update(pollPayload(poll, messageId)).catch(() => {});
+  console.log(`[Poll] Closed poll ${messageId} by ${interaction.user.id}.`);
+}
+
 async function onRankUpConfirm1(interaction, encodedRsn, targetRank) {
   const rsn = decodeName(encodedRsn);
   const supabase = getSupabase();
@@ -9242,10 +9522,16 @@ async function handleInteraction(interaction) {
     return onRemoveRecruiterSlashCommand(interaction);
   }
 
+  if (interaction.isChatInputCommand?.() && interaction.commandName === "poll") {
+    return onPollSlashCommand(interaction);
+  }
+
   if (interaction.isButton()) {
     const [base, payload, extra] = interaction.customId.split(":");
     switch (base) {
       case ID.START:                return onStartButton(interaction);
+      case ID.POLL_VOTE:            return onPollVote(interaction, payload, extra);
+      case ID.POLL_CLOSE:           return onPollClose(interaction, payload);
       case ID.CONFIRM1:             return onConfirm1(interaction, payload);
       case ID.CONFIRM2:             return onConfirm2(interaction, payload);
       case ID.CANCEL:               return onCancel(interaction);
@@ -10294,6 +10580,11 @@ client.once(Events.ClientReady, async () => {
     console.error("[RecruitmentDrive] registerRemoveRecruiterCommand failed:", err.message);
   }
   try {
+    await registerPollCommand();
+  } catch (err) {
+    console.error("[Poll] registerPollCommand failed:", err.message);
+  }
+  try {
     await ensurePermanentMessage();
   } catch (err) {
     console.error("[Onboarding] ensurePermanentMessage failed:", err.message);
@@ -10591,6 +10882,7 @@ module.exports = {
   startWeeklyRecapLoop,
   // Recruitment Drive exports
   RECRUITMENT_DRIVE_CHANNEL_ID,
+  BOND_EMOJI,
   RECRUITMENT_DRIVE_FIRST_PRIZE_TEXT,
   RECRUITMENT_DRIVE_SECOND_PRIZE_TEXT,
   getRecruitmentDrivePlacements,
@@ -10628,6 +10920,17 @@ module.exports = {
   onRecruitmentRemoveConfirm2,
   onRecruitmentRemoveCancel,
   registerRemoveRecruiterCommand,
+  registerPollCommand,
+  onPollSlashCommand,
+  onPollVote,
+  onPollClose,
+  parsePollOptions,
+  parsePollDuration,
+  buildPollEmbed,
+  buildPollComponents,
+  pollTotalVotes,
+  canCreatePoll,
+  activePolls,
   markRecruitmentSubmissionVerified,
   setRecruitmentSubmissionAlertMessageId,
   buildRecruitmentSubmissionComponents,
@@ -10758,6 +11061,8 @@ module.exports = {
   setMemberChannelBlock,
   syncClanChatAccessForMember,
   syncOrientationAccessForMember,
+  syncPendingOnboardingAccessForMember,
+  PENDING_ONBOARDING_VISIBLE_CHANNEL_IDS,
   reconcileAllMembersChannelAccess,
   processOnboardingCompletion,
 };
