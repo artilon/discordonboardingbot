@@ -87,6 +87,7 @@ const CLAN_MEMBER_ROLE = "clan-member-role"; // deliberately NOT in the grant se
 async function main() {
   // ---- The grant configuration itself ----
   check("the Send Polls grant targets the announcements channel", !!bot.SEND_POLLS_GRANTS[bot.WEEKLY_RECAP_CHANNEL_ID]);
+  check("the Send Polls grant also targets the dedicated Announcements channel", !!bot.SEND_POLLS_GRANTS[bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID]);
   check(
     "the grant set covers every staff-tier role (Jr Staff through Owner)",
     bot.STAFF_AND_ABOVE_ROLE_IDS.length === 7 && bot.STAFF_AND_ABOVE_ROLE_IDS.includes("1546401420453085204") // OWNER_ROLE_ID
@@ -108,6 +109,27 @@ async function main() {
     }
     check("exactly one edit per staff-tier role", channel.permissionOverwrites._editCalls.length === bot.STAFF_AND_ABOVE_ROLE_IDS.length);
     check("no overwrite was created for roles outside the grant set", !channel.permissionOverwrites.cache.get(CLAN_MEMBER_ROLE));
+  }
+
+  // ---- The dedicated Announcements channel gets the same grants ----
+  {
+    const channelsById = new Map();
+    // This channel is privacy-managed, so it already carries the static
+    // ViewChannel rows the sync maintains — the grant must layer on top.
+    const channel = makeFakeChannel(bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID, "announcements", [
+      { id: "1546402959049359360", type: OverwriteType.Role, allow: [PermissionFlagsBits.ViewChannel] }, // STAFF_ROLE_ID
+    ]);
+    channelsById.set(bot.CLAN_ANNOUNCEMENTS_CHANNEL_ID, channel);
+    const guild = makeFakeGuild(channelsById);
+
+    await bot.ensureSendPollsGrants(guild);
+
+    for (const roleId of bot.STAFF_AND_ABOVE_ROLE_IDS) {
+      const ow = channel.permissionOverwrites.cache.get(roleId);
+      check(`Announcements: role ${roleId} now allows Send Polls`, !!ow && ow.allow.has(PermissionFlagsBits.SendPolls));
+    }
+    const staffOw = channel.permissionOverwrites.cache.get("1546402959049359360");
+    check("Announcements: the static ViewChannel allow survives the grant", staffOw.allow.has(PermissionFlagsBits.ViewChannel));
   }
 
   // ---- Existing overwrites are preserved (visibility untouched) ----

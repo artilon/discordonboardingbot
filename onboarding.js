@@ -6838,6 +6838,8 @@ const SEND_POLLS_GRANTS = {
   // The OSRS discussion / announcements channel: staff and above can
   // create polls there.
   [WEEKLY_RECAP_CHANNEL_ID]: STAFF_AND_ABOVE_ROLE_IDS,
+  // The dedicated Announcements channel: same deal.
+  [CLAN_ANNOUNCEMENTS_CHANNEL_ID]: STAFF_AND_ABOVE_ROLE_IDS,
 };
 
 /**
