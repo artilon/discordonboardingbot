@@ -6648,6 +6648,18 @@ const CLAN_MEMBER_AND_ABOVE_ROLE_IDS = [
 const VERIFIED_STAFF_AND_ABOVE_ROLE_IDS = [VERIFIED_STAFF_ROLE_ID, VERIFIED_LEADER_ROLE_ID, CO_OWNER_ROLE_ID, OWNER_ROLE_ID];
 const VERIFIED_LEADER_AND_ABOVE_ROLE_IDS = [VERIFIED_LEADER_ROLE_ID, CO_OWNER_ROLE_ID, OWNER_ROLE_ID];
 const OWNER_AND_CO_OWNER_ROLE_IDS = [CO_OWNER_ROLE_ID, OWNER_ROLE_ID];
+// Every staff-tier role and above (Jr Staff through Owner) — used for
+// grants where the whole staff team should be able to act, not just the
+// verified subset (e.g. creating Discord polls).
+const STAFF_AND_ABOVE_ROLE_IDS = [
+  JR_STAFF_ROLE_ID,
+  STAFF_ROLE_ID,
+  LEADER_ROLE_ID,
+  VERIFIED_STAFF_ROLE_ID,
+  VERIFIED_LEADER_ROLE_ID,
+  CO_OWNER_ROLE_ID,
+  OWNER_ROLE_ID,
+];
 
 /**
  * One entry per category this bot manages. `default` applies to every channel
@@ -6814,6 +6826,46 @@ async function applyServerPrivacyCategory(guild, categoryId, rule) {
 async function applyServerPrivacyConfig(guild) {
   for (const [categoryId, rule] of Object.entries(SERVER_PRIVACY_CATEGORIES)) {
     await applyServerPrivacyCategory(guild, categoryId, rule);
+  }
+}
+
+// Channels where specific roles are granted Discord's Send Polls
+// permission (creating native polls), keyed by channel ID. Kept separate
+// from SERVER_PRIVACY_CATEGORIES on purpose: those rules decide who can
+// SEE a channel (ViewChannel), while this only ever adds the SendPolls
+// bit — visibility is never affected either way.
+const SEND_POLLS_GRANTS = {
+  // The OSRS discussion / announcements channel: staff and above can
+  // create polls there.
+  [WEEKLY_RECAP_CHANNEL_ID]: STAFF_AND_ABOVE_ROLE_IDS,
+};
+
+/**
+ * Ensures the configured roles hold the Send Polls permission on the
+ * configured channels. Deliberately additive: each role's existing
+ * overwrite is edited to allow SendPolls (edit() merges, preserving every
+ * other bit, including ViewChannel), so channel visibility is untouched.
+ * Runs AFTER applyServerPrivacyConfig in the same sync cycle, because
+ * that sync's wholesale set() would otherwise wipe these grants within a
+ * minute on any managed channel — which is exactly why a manual
+ * channel-settings grant never seemed to stick. Skips the API call when
+ * the grant is already in place.
+ */
+async function ensureSendPollsGrants(guild) {
+  for (const [channelId, roleIds] of Object.entries(SEND_POLLS_GRANTS)) {
+    const channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      console.warn(`[ServerPrivacy] Send Polls grant channel ${channelId} not found — skipping.`);
+      continue;
+    }
+    for (const roleId of roleIds) {
+      if (!roleId) continue;
+      const current = channel.permissionOverwrites.cache.get(roleId);
+      if (current && current.allow.has(PermissionFlagsBits.SendPolls) && !current.deny.has(PermissionFlagsBits.SendPolls)) continue;
+      await channel.permissionOverwrites
+        .edit(roleId, { SendPolls: true }, { reason: "Staff and above can create polls in the announcements channel" })
+        .catch((e) => console.error(`[ServerPrivacy] Could not grant Send Polls to ${roleId} on #${channel.name || channel.id}: ${e.message}`));
+    }
   }
 }
 
@@ -6988,6 +7040,9 @@ async function runServerPrivacySync() {
   try {
     for (const guild of client.guilds.cache.values()) {
       await applyServerPrivacyConfig(guild);
+      // After the static sync (whose wholesale set() would wipe them), so
+      // the Send Polls grants are re-applied in the same cycle.
+      await ensureSendPollsGrants(guild);
       await reconcileAllMembersChannelAccess(guild);
     }
   } catch (err) {
@@ -10692,6 +10747,9 @@ module.exports = {
   syncOsrsRoleForMember,
   isServerPrivacySyncDue,
   applyServerPrivacyConfig,
+  STAFF_AND_ABOVE_ROLE_IDS,
+  SEND_POLLS_GRANTS,
+  ensureSendPollsGrants,
   runServerPrivacySync,
   startServerPrivacyLoop,
   setMemberChannelAllow,
