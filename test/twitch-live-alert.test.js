@@ -184,6 +184,7 @@ const OFFLINE_STATUS = { live: false };
   check("the alert names the streamer", builtDescription.includes("SomeCoolStreamer"));
   check("the alert includes the stream title", builtDescription.includes("Grinding Slayer for the clan!"));
   check("the alert links to the Twitch channel", builtDescription.includes("https://twitch.tv/somecoolstreamer"));
+  check("the Twitch link is preceded by the custom Twitch emoji", builtDescription.includes("<:twitch:1571618429168001146> https://twitch.tv/somecoolstreamer"));
   check("the alert says it's live", /live/i.test(builtDescription));
   check(
     "the alert does not contain a Discord @mention (no way to ping anyone)",

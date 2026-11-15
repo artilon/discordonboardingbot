@@ -170,6 +170,7 @@ const OFFLINE_STATUS = { live: false };
   check("the alert names the streamer", builtDescription.includes("SomeCoolStreamer"));
   check("the alert includes the stream title", builtDescription.includes("Grinding Slayer for the clan!"));
   check("the alert links to the Kick channel", builtDescription.includes("https://kick.com/somecoolstreamer"));
+  check("the Kick link is preceded by the custom Kick emoji", builtDescription.includes("<:kick:1571618398532534382> https://kick.com/somecoolstreamer"));
   check("the alert says it's live on Kick", /live on kick/i.test(builtDescription));
   check(
     "the alert does not contain a Discord @mention (no way to ping anyone)",
