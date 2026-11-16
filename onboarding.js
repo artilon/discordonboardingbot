@@ -5492,14 +5492,15 @@ function buildRankListPayload(members = [], asOfDate = new Date(), options = {})
     // rank replaces it.
     const progress = formatRankProgress(xp);
 
-    // Only show the tenure/quest split when quest XP actually exists, so the
-    // line stays short for members who have never turned in a quest.
+    // Label the XP source explicitly so there's no confusion: members with
+    // quest XP show the tenure/quest split; members whose XP is entirely
+    // tenure are labeled "Tenure only".
     const bonusXp = Number(m.bonus_xp) || 0;
     const tenureXp = Math.max(0, xp - bonusXp);
     const split =
       bonusXp > 0
         ? `Tenure \`${tenureXp.toLocaleString()}\` + Quests \`${bonusXp.toLocaleString()}\` • `
-        : "";
+        : `Tenure only • `;
 
     // Flags clan members who don't currently have a matching Discord server
     // member (by nickname/display name) with a trailing `\*` — escaped so it
@@ -5723,7 +5724,7 @@ function buildRankUpAlertStep1(member, targetRankName) {
       {
         name: "Total Rank XP",
         value: `\`${xp.toLocaleString()} XP\`` +
-          (bonusXp > 0 ? `\nTenure \`${tenureXp.toLocaleString()}\` + Quests \`${bonusXp.toLocaleString()}\`` : ""),
+          (bonusXp > 0 ? `\nTenure \`${tenureXp.toLocaleString()}\` + Quests \`${bonusXp.toLocaleString()}\`` : `\nTenure only`),
         inline: true,
       },
       { name: "Tenure Multiplier", value: `${formatRankName(tenureTier.name)} → ${formatMultiplier(tenureTier.multiplier)}`, inline: true },
