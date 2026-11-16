@@ -9353,8 +9353,8 @@ async function registerPollCommand() {
   const commandDef = {
     name: "poll",
     description: "Create a poll anyone can vote on (Staff, Leader & Owner roles only)",
-    // Hidden from everyone by default; the in-handler role check is the real gate.
-    defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
+    // No defaultMemberPermissions: it hides the command from the picker. The
+    // in-handler role check (onPollSlashCommand) is the real access gate.
     options: [
       {
         name: "question",
@@ -9378,9 +9378,12 @@ async function registerPollCommand() {
   };
 
   for (const guild of client.guilds.cache.values()) {
-    await guild.commands.create(commandDef).catch((e) => {
-      console.warn(`[Poll] Could not register /poll in guild ${guild.id}:`, e.message);
-    });
+    await guild.commands
+      .create(commandDef)
+      .then(() => console.log(`[Poll] /poll registered in guild ${guild.id}.`))
+      .catch((e) => {
+        console.warn(`[Poll] Could not register /poll in guild ${guild.id}:`, e.message);
+      });
   }
 }
 
@@ -9495,16 +9498,21 @@ async function onPollClose(interaction, messageId) {
 // that used the wrong display names). Does not touch the snapshots.
 async function registerRepostRecapCommand() {
   if (!client.application) return;
+  // NOTE: no `options` field and no `defaultMemberPermissions`. An empty
+  // `options: []` array can make Discord silently reject the command, and
+  // `defaultMemberPermissions` hides it from the picker. The in-handler
+  // staff-role check (onRepostRecapSlashCommand) is the real access gate.
   const commandDef = {
     name: "repost-recap",
     description: "Regenerate and repost this week's Weekly Clan Recap from stored data (Staff, Leader & Owner roles only)",
-    defaultMemberPermissions: PermissionFlagsBits.ManageGuild,
-    options: [],
   };
   for (const guild of client.guilds.cache.values()) {
-    await guild.commands.create(commandDef).catch((e) => {
-      console.warn(`[WeeklyRecap] Could not register /repost-recap in guild ${guild.id}:`, e.message);
-    });
+    await guild.commands
+      .create(commandDef)
+      .then(() => console.log(`[WeeklyRecap] /repost-recap registered in guild ${guild.id}.`))
+      .catch((e) => {
+        console.warn(`[WeeklyRecap] Could not register /repost-recap in guild ${guild.id}:`, e.message);
+      });
   }
 }
 
