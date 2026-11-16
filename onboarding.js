@@ -9504,7 +9504,9 @@ async function registerRepostRecapCommand() {
   // staff-role check (onRepostRecapSlashCommand) is the real access gate.
   const commandDef = {
     name: "repost-recap",
-    description: "Regenerate and repost this week's Weekly Clan Recap from stored data (Staff, Leader & Owner roles only)",
+    // Must be 100 characters or fewer — Discord rejects longer descriptions
+    // with "description[BASE_TYPE_MAX_LENGTH]".
+    description: "Repost this week's Weekly Clan Recap with server nicknames",
   };
   for (const guild of client.guilds.cache.values()) {
     await guild.commands
