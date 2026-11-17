@@ -2,8 +2,12 @@
 /**
  * Bounty Quests — an OSRS-themed bounty board for Honour Marks.
  *
- * 12 active bounties at a time (3 per party size: solo/duo/trio/quad),
- * posted as requests from NPCs. The NPC type determines the contract:
+ * 5 active bounties at a time, posted as requests from NPCs. The board's
+ * category mix is capped so it never floods with one kind: at most 2
+ * skilling (Artisan), 1 slayer (Mercenary), 1 boss and 1 raid — which
+ * sums to exactly the 5 slots. Each bounty rolls a random size (solo, or
+ * a team of 2/3/4) and is clearly labeled with it. The NPC type
+ * determines the contract:
  *   - Artisan:       paired gathering + artisan skills (blacksmith, alchemist…)
  *   - Mercenary:     "creatures" — always Slayer + Prayer + Hitpoints + one
  *                    random combat style (pure slayer training)
@@ -21,7 +25,10 @@
  */
 
 const BOUNTY_SIZES = ["solo", "duo", "trio", "quad"];
-const BOUNTIES_PER_SIZE = 3;
+const BOUNTY_TOTAL = 5;
+// Board category caps — they sum to exactly BOUNTY_TOTAL, so a full board
+// is always 2 skilling + 1 slayer + 1 boss + 1 raid, never more.
+const CATEGORY_CAPS = { artisan: 2, mercenary: 1, boss: 1, raid: 1 };
 const BOUNTY_CYCLE_MS = 3 * 60 * 60 * 1000; // 3 hours
 const BOUNTY_MAX_ACTIVE_MS = 96 * 60 * 60 * 1000; // 96 hours from last accept
 const REWARD_MULTIPLIER = 2.5;
@@ -229,6 +236,18 @@ function genRaid(size, recentNpcs) {
 const GENERATORS = { artisan: genArtisan, mercenary: genMercenary, boss: genBoss, raid: genRaid };
 const CATEGORIES = Object.keys(GENERATORS);
 
+// Roll a random bounty size: solo, or a team of 2/3/4.
+function randomSize() {
+  return pick(BOUNTY_SIZES);
+}
+
+// Pick a category that still has room under its board cap, given the
+// current per-category counts on the board.
+function pickCategory(counts) {
+  const available = CATEGORIES.filter((c) => (counts[c] || 0) < CATEGORY_CAPS[c]);
+  return pick(available);
+}
+
 // Build one bounty spec for a size, avoiding recently-used NPCs.
 function generateBounty(size, recentNpcs = new Set()) {
   const category = pick(CATEGORIES);
@@ -237,17 +256,28 @@ function generateBounty(size, recentNpcs = new Set()) {
   return { ...spec, size, hm_reward: rewards.hm, rank_xp_reward: rewards.rankXp };
 }
 
-// Generate the full board (3 per size = 12), tracking recent NPCs so the
-// same ones don't repeat within a single board.
+// Build one bounty for the board: category respects the caps, size is
+// rolled at random. `counts` is the running per-category tally.
+function generateBountyForBoard(counts, recentNpcs = new Set()) {
+  const category = pickCategory(counts);
+  const size = randomSize();
+  const spec = GENERATORS[category](size, recentNpcs);
+  const rewards = bountyRewards(size);
+  return { ...spec, size, hm_reward: rewards.hm, rank_xp_reward: rewards.rankXp };
+}
+
+// Generate the full board (5 bounties: 2 skilling + 1 slayer + 1 boss +
+// 1 raid, each with a random size), tracking recent NPCs so the same
+// ones don't repeat within a single board.
 function generateBoard(recentNpcs = new Set()) {
   const used = new Set(recentNpcs);
+  const counts = {};
   const board = [];
-  for (const size of BOUNTY_SIZES) {
-    for (let i = 0; i < BOUNTIES_PER_SIZE; i++) {
-      const b = generateBounty(size, used);
-      used.add(b.npc_name);
-      board.push(b);
-    }
+  for (let i = 0; i < BOUNTY_TOTAL; i++) {
+    const b = generateBountyForBoard(counts, used);
+    counts[b.category] = (counts[b.category] || 0) + 1;
+    used.add(b.npc_name);
+    board.push(b);
   }
   return board;
 }
@@ -257,6 +287,14 @@ function generateBoard(recentNpcs = new Set()) {
 const CATEGORY_EMOJI = { artisan: "🔨", mercenary: "⚔️", boss: "💀", raid: "🗿" };
 const CATEGORY_LABEL = { artisan: "Artisan", mercenary: "Mercenary", boss: "Boss Contract", raid: "Raid Delver" };
 const SIZE_LABEL = { solo: "Solo", duo: "Duo", trio: "Trio", quad: "Quad" };
+// Explicit team-size label so it's obvious at a glance whether a bounty
+// is solo or a team, and how many players the team is.
+const SIZE_TEAM_LABEL = {
+  solo: "Solo — just you",
+  duo: "Team of 2 (Duo)",
+  trio: "Team of 3 (Trio)",
+  quad: "Team of 4 (Quad)",
+};
 
 function formatRequirement(req) {
   if (req.kind === "skill") return `**${req.amount.toLocaleString()}** ${req.skill} XP`;
@@ -272,11 +310,13 @@ function formatRequirements(requirements) {
 // Render one bounty as an embed payload (pure — no Discord calls).
 function renderBountyEmbed(bounty, acceptances = []) {
   const emoji = CATEGORY_EMOJI[bounty.category] || "📜";
+  const teamLabel = SIZE_TEAM_LABEL[bounty.size] || SIZE_LABEL[bounty.size] || bounty.size;
   const lines = [
     `**From:** *${bounty.npc_name} ${bounty.npc_title}*`,
     `*"${bounty.flavor}"*`,
     "",
-    `**Contract:** ${bounty.title} · ${SIZE_LABEL[bounty.size] || bounty.size}`,
+    `**Contract:** ${bounty.title}`,
+    `**Team:** ${teamLabel}`,
     formatRequirements(bounty.requirements),
     "",
     `**Reward:** ${bounty.hm_reward} HM · ${bounty.rank_xp_reward} Rank XP`,
@@ -346,7 +386,8 @@ function progressFraction(requirements, baseline = {}, current = {}) {
 
 module.exports = {
   BOUNTY_SIZES,
-  BOUNTIES_PER_SIZE,
+  BOUNTY_TOTAL,
+  CATEGORY_CAPS,
   BOUNTY_CYCLE_MS,
   BOUNTY_MAX_ACTIVE_MS,
   REWARD_MULTIPLIER,
@@ -361,7 +402,11 @@ module.exports = {
   COMBAT_STYLES,
   CATEGORY_EMOJI,
   CATEGORY_LABEL,
+  SIZE_TEAM_LABEL,
+  randomSize,
+  pickCategory,
   generateBounty,
+  generateBountyForBoard,
   generateBoard,
   formatRequirement,
   formatRequirements,
