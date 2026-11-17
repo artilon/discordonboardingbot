@@ -236,6 +236,17 @@ function genRaid(size, recentNpcs) {
 const GENERATORS = { artisan: genArtisan, mercenary: genMercenary, boss: genBoss, raid: genRaid };
 const CATEGORIES = Object.keys(GENERATORS);
 
+// Board display order: artisan first, then slayer, boss, raid.
+const CATEGORY_ORDER = ["artisan", "mercenary", "boss", "raid"];
+
+// Sort a list of bounties into board display order (stable within a
+// category, so same-category bounties keep their existing order).
+function sortBoard(list) {
+  return [...list].sort(
+    (a, b) => CATEGORY_ORDER.indexOf(a.category) - CATEGORY_ORDER.indexOf(b.category)
+  );
+}
+
 // Roll a random bounty size: solo, or a team of 2/3/4.
 function randomSize() {
   return pick(BOUNTY_SIZES);
@@ -402,9 +413,11 @@ module.exports = {
   COMBAT_STYLES,
   CATEGORY_EMOJI,
   CATEGORY_LABEL,
+  CATEGORY_ORDER,
   SIZE_TEAM_LABEL,
   randomSize,
   pickCategory,
+  sortBoard,
   generateBounty,
   generateBountyForBoard,
   generateBoard,
