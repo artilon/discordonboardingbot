@@ -70,6 +70,12 @@ const CHANNEL_SPECS = [
     audience: "honourMarks",
   },
   {
+    key: "bounty",
+    name: "hm-bounty-quests",
+    topic: "Bounty board — NPC contracts, read only",
+    audience: "honourMarks",
+  },
+  {
     key: "staff",
     name: "hm-staff",
     topic: "Staff only — manual Honour Marks adjustments",

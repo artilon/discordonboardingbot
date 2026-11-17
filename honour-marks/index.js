@@ -58,6 +58,7 @@ const {
   readSetup, bindGuild, createStructure, verifyBindings, seedDefaults,
   applyPermissions, checkRoleGranting,
 } = require("./src/setup");
+const bounties = require("./src/bounties");
 
 assertConfig();
 
@@ -453,6 +454,272 @@ async function refreshPanels(guildId) {
   if (dbCh) {
     await syncPanel(guildId, dbCh, "database", await renderDatabase(guildId));
   }
+  // Bounty board — its own channel, synced alongside the other panels.
+  await syncBountyBoard(guildId).catch(() => {});
+}
+
+// ── Bounty Quests: the bounty board ────────────────────────────────────────
+// 12 active bounties (3 per size) posted as NPC requests. Members accept a
+// bounty to start tracking; progress is computed from a hiscores snapshot at
+// accept time. Bounties cycle every 3 hours, but one with an active hunter
+// endures up to 96 hours from the last accept.
+
+const BOUNTY_ACCEPT_PREFIX = "hm_bounty_accept:";
+
+async function getBountyChannel(guildId) {
+  const setup = await readSetup(guildId);
+  const channelId = setup?.channels?.bounty || config.channels.bounty;
+  if (!channelId) return null;
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  return guild ? guild.channels.fetch(channelId).catch(() => null) : null;
+}
+
+async function loadActiveBounties(guildId) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const { data } = await supabase
+    .from("hm_bounties")
+    .select("*")
+    .eq("guild_id", guildId)
+    .eq("status", "active")
+    .order("created_at", { ascending: true });
+  return data || [];
+}
+
+async function loadBountyAcceptances(bountyId) {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const { data } = await supabase
+    .from("hm_bounty_acceptances")
+    .select("*")
+    .eq("bounty_id", bountyId)
+    .order("accepted_at", { ascending: true });
+  return data || [];
+}
+
+function bountyAcceptRow(bountyId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${BOUNTY_ACCEPT_PREFIX}${bountyId}`)
+      .setLabel("Accept Bounty")
+      .setEmoji("📜")
+      .setStyle(ButtonStyle.Success)
+  );
+}
+
+async function bountyPayload(bounty) {
+  const acceptances = await loadBountyAcceptances(bounty.id);
+  const enriched = [];
+  for (const acc of acceptances) {
+    const member = await getMember(acc.user_id).catch(() => null);
+    enriched.push({
+      ...acc,
+      displayName: member?.display_name || member?.rsn || null,
+      rsn: member?.rsn || null,
+      progressText: bountyProgressText(bounty, acc),
+    });
+  }
+  const embed = bounties.renderBountyEmbed(bounty, enriched);
+  return { embeds: [new EmbedBuilder(embed)], components: [bountyAcceptRow(bounty.id)] };
+}
+
+function bountyProgressText(bounty, acc) {
+  const progress = acc.progress || {};
+  const parts = (bounty.requirements || []).map((req) => {
+    const gained = progress[bounties.reqKey(req)] ?? 0;
+    return `${Number(gained).toLocaleString()} / ${req.amount.toLocaleString()}`;
+  });
+  return parts.join(" · ");
+}
+
+// Post new bounties / refresh existing ones / retire expired ones so the
+// board always shows the current 12.
+async function syncBountyBoard(guildId) {
+  const supabase = getSupabase();
+  if (!supabase) return;
+  const channel = await getBountyChannel(guildId);
+  if (!channel) return;
+
+  const now = Date.now();
+  let active = await loadActiveBounties(guildId);
+
+  // Retire bounties past their window: 3h cycle, or 96h from last accept if
+  // someone is actively hunting.
+  for (const b of active) {
+    const createdMs = new Date(b.created_at).getTime();
+    const lastAcceptMs = b.last_accepted_at ? new Date(b.last_accepted_at).getTime() : 0;
+    const hasHunters = lastAcceptMs > 0;
+    const deadline = hasHunters
+      ? Math.min(createdMs + bounties.BOUNTY_MAX_ACTIVE_MS, lastAcceptMs + bounties.BOUNTY_MAX_ACTIVE_MS)
+      : createdMs + bounties.BOUNTY_CYCLE_MS;
+    if (now > deadline) {
+      await supabase.from("hm_bounties").update({ status: "expired" }).eq("id", b.id);
+      if (b.message_id) {
+        const msg = await channel.messages.fetch(b.message_id).catch(() => null);
+        await msg?.delete().catch(() => {});
+      }
+    }
+  }
+  active = active.filter((b) => b.status === "active" && now <= new Date(b.expires_at).getTime());
+
+  // Top up to 12 (3 per size).
+  const bySize = {};
+  for (const b of active) bySize[b.size] = (bySize[b.size] || 0) + 1;
+  const recentNpcs = new Set(active.map((b) => b.npc_name));
+  for (const size of bounties.BOUNTY_SIZES) {
+    let need = bounties.BOUNTIES_PER_SIZE - (bySize[size] || 0);
+    while (need > 0) {
+      const spec = bounties.generateBounty(size, recentNpcs);
+      recentNpcs.add(spec.npc_name);
+      const expiresAt = new Date(now + bounties.BOUNTY_CYCLE_MS).toISOString();
+      const { data: inserted, error } = await supabase
+        .from("hm_bounties")
+        .insert({
+          guild_id: guildId,
+          category: spec.category,
+          size: spec.size,
+          npc_name: spec.npc_name,
+          npc_title: spec.npc_title,
+          title: spec.title,
+          flavor: spec.flavor,
+          requirements: spec.requirements,
+          hm_reward: spec.hm_reward,
+          rank_xp_reward: spec.rank_xp_reward,
+          expires_at: expiresAt,
+          status: "active",
+        })
+        .select("*")
+        .single();
+      if (!error && inserted) {
+        active.push(inserted);
+        bySize[size] = (bySize[size] || 0) + 1;
+      }
+      need--;
+    }
+  }
+
+  // Post / edit each bounty message.
+  for (const bounty of active) {
+    const payload = await bountyPayload(bounty);
+    if (bounty.message_id) {
+      const msg = await channel.messages.fetch(bounty.message_id).catch(() => null);
+      if (msg) {
+        await msg.edit(payload).catch(() => {});
+        continue;
+      }
+    }
+    const sent = await channel.send(payload).catch(() => null);
+    if (sent) {
+      await supabase.from("hm_bounties").update({ message_id: sent.id }).eq("id", bounty.id);
+      bounty.message_id = sent.id;
+    }
+  }
+}
+
+async function handleBountyAccept(interaction) {
+  const bountyId = Number(interaction.customId.slice(BOUNTY_ACCEPT_PREFIX.length));
+  const supabase = getSupabase();
+  if (!supabase) return interaction.reply({ content: "Database unavailable.", flags: MessageFlags.Ephemeral });
+
+  const { data: bounty } = await supabase.from("hm_bounties").select("*").eq("id", bountyId).single();
+  if (!bounty || bounty.status !== "active") {
+    return interaction.reply({ content: "That bounty is no longer active.", flags: MessageFlags.Ephemeral });
+  }
+
+  const userId = interaction.user.id;
+  const member = await getMember(userId);
+  if (!member?.rsn) {
+    return interaction.reply({ content: "Register your RuneScape name first (button on the role panel).", flags: MessageFlags.Ephemeral });
+  }
+
+  const { data: existing } = await supabase
+    .from("hm_bounty_acceptances")
+    .select("id")
+    .eq("bounty_id", bountyId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (existing) {
+    return interaction.reply({ content: "You're already hunting this bounty.", flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const snap = await fetchHiscores(member.rsn);
+  const baseline = snap ? { skills: snap.skills || {}, activities: snap.activities || {} } : { skills: {}, activities: {} };
+
+  await supabase.from("hm_bounty_acceptances").insert({
+    bounty_id: bountyId,
+    guild_id: interaction.guildId,
+    user_id: userId,
+    baseline,
+    progress: {},
+    completed: false,
+    rewarded: false,
+  });
+  await supabase.from("hm_bounties").update({ last_accepted_at: new Date().toISOString() }).eq("id", bountyId);
+
+  await syncBountyBoard(interaction.guildId);
+  return interaction.editReply({ content: `📜 Accepted **${bounty.title}** — your progress is now being tracked. Good hunting!` });
+}
+
+// Periodic progress + completion sweep.
+async function bountyProgressTick() {
+  const supabase = getSupabase();
+  if (!supabase) return;
+  const guildIds = [...client.guilds.cache.keys()];
+  for (const guildId of guildIds) {
+    const active = await loadActiveBounties(guildId);
+    for (const bounty of active) {
+      const acceptances = await loadBountyAcceptances(bounty.id);
+      for (const acc of acceptances) {
+        if (acc.completed) continue;
+        const member = await getMember(acc.user_id).catch(() => null);
+        if (!member?.rsn) continue;
+        const snap = await fetchHiscores(member.rsn);
+        if (!snap) continue;
+        const current = { skills: snap.skills || {}, activities: snap.activities || {} };
+        const { perReq, complete } = bounties.computeProgress(bounty.requirements, acc.baseline, current);
+        const progress = {};
+        for (const p of perReq) progress[bounties.reqKey(p.req)] = p.gained;
+        await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
+        if (complete) {
+          await completeBountyAcceptance(bounty, acc, 1);
+        }
+      }
+    }
+    await syncBountyBoard(guildId).catch(() => {});
+  }
+}
+
+async function completeBountyAcceptance(bounty, acc, fraction) {
+  const supabase = getSupabase();
+  if (!supabase || acc.rewarded) return;
+  const hm = Math.round(bounty.hm_reward * fraction);
+  const rankXp = Math.round(bounty.rank_xp_reward * fraction);
+  await supabase.from("hm_bounty_acceptances").update({ completed: true, rewarded: true }).eq("id", acc.id);
+  if (hm > 0) {
+    await creditHm({
+      guildId: bounty.guild_id,
+      userId: acc.user_id,
+      amount: hm,
+      kind: "bounty",
+      reason: `Bounty: ${bounty.title}`,
+      idempotencyKey: `bounty:${bounty.id}:${acc.user_id}`,
+    }).catch(() => {});
+  }
+  if (rankXp > 0) {
+    const member = await getMember(acc.user_id).catch(() => null);
+    await supabase.from("pending_rank_xp").insert({
+      guild_id: bounty.guild_id,
+      user_id: acc.user_id,
+      rsn: member?.rsn || null,
+      amount: rankXp,
+      reason: `Bounty: ${bounty.title}`,
+      event_key: "bounty",
+      idempotency_key: `bounty_xp:${bounty.id}:${acc.user_id}`,
+    }).catch(() => {});
+  }
+  // Completed bounties count toward active clan quests (they are
+  // hiscores-backed, so matching clan quests advance on their next sync).
 }
 
 // ── Interaction: slash commands ──────────────────────────────────────────────
@@ -2612,6 +2879,9 @@ async function routeInteraction(interaction) {
 
     if (interaction.isButton()) {
       const btnId = interaction.customId;
+      if (btnId.startsWith(BOUNTY_ACCEPT_PREFIX)) {
+        return await handleBountyAccept(interaction);
+      }
       if (btnId.startsWith("hm_pick_skill_difficulty:")) {
         const [, questType, tree, difficulty] = btnId.split(":");
         return await handleSkillDifficultyChosen(interaction, questType, tree, difficulty);
@@ -2897,6 +3167,18 @@ client.once(Events.ClientReady, async () => {
   };
   await clanPoolTick();
   setInterval(clanPoolTick, config.expirySweepMs).unref?.();
+
+  // Bounty progress sweep — recomputes hunter progress from hiscores and
+  // completes finished bounties. Runs on the same cadence as the expiry sweep.
+  const bountyTick = async () => {
+    try {
+      await bountyProgressTick();
+    } catch (e) {
+      console.error("[Honour Marks] Bounty progress tick failed:", e.message);
+    }
+  };
+  await bountyTick();
+  setInterval(bountyTick, config.expirySweepMs).unref?.();
 
   for (const guild of client.guilds.cache.values()) {
     await refreshPanels(guild.id).catch(() => {});
