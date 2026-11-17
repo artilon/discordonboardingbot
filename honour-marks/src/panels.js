@@ -905,10 +905,12 @@ function buildGuideSections(setup = {}) {
         `**Step 2 — Read the request.** Every bounty tells you exactly what it needs, right on the post. ` +
         `Nothing is hidden. If it says "gain 50,000 Mining XP and 50,000 Smithing XP", that's the whole ` +
         `job — no surprises.\\n\\n` +
-        `**Step 3 — Press Accept Bounty.** That's it. You don't need a team, you don't need permission, and ` +
-        `you don't need to tell anyone. Lots of people can accept the same bounty at the same time — ` +
-        `everyone who accepts gets paid when they finish. You can also accept as many bounties as you ` +
-        `want, all at once.\\n\\n` +
+        `**Step 3 — Press Accept Bounty.** That's it. You don't need a team, and you don't need to tell ` +
+        `anyone. Lots of people can accept the same bounty at the same time — everyone who accepts gets ` +
+        `paid when they finish. You can also accept as many bounties as you want, all at once. The only ` +
+        `thing you need is a **server nickname** (the name Heimdall sets to match your RuneScape name) — ` +
+        `it's how you show up on the board. No popup, no confirmation message: the board just updates to ` +
+        `show you're hunting.\\n\\n` +
         `**Step 4 — Play the game normally.** The bot watches your hiscores and tracks your progress ` +
         `automatically. You don't have to press anything, check anything, or report anything. Just play.\\n\\n` +
         `**Step 5 — Get paid.** When you finish, the HM and Rank XP land in your account on their own. ` +

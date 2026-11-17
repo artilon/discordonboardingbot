@@ -93,6 +93,13 @@ function main() {
         if (r.boss) check("named boss is from the pool", bounties.BOSS_POOL.includes(r.boss));
       }
     }
+    // Boss KC is scaled 2.5x the normal quest (effort matches the 2.5x pay):
+    // generic = full amount, named = half, triple = quarter each.
+    if (m.category === "boss") {
+      const base = { solo: 100, duo: 375, trio: 625, quad: 875 }[m.size];
+      const total = m.requirements.reduce((s, r) => s + r.amount, 0);
+      check("boss KC is at the 2.5x scale", total >= base / 4 && total <= base);
+    }
     if (m.category === "raid") {
       check("raid is a real raid", bounties.RAIDS.includes(m.requirements[0].raid));
     }

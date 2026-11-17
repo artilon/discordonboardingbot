@@ -138,7 +138,10 @@ function pickMany(arr, n, exclude = new Set()) {
 
 // Skill XP target scaled by party size (bigger party, bigger grind).
 const SKILL_XP_BY_SIZE = { solo: 15000, duo: 25000, trio: 40000, quad: 60000 };
-const KC_BY_SIZE = { solo: 10, duo: 15, trio: 25, quad: 40 };
+// Boss KC target scaled by party size. Bounties pay 2.5x a normal quest,
+// so the KC is 2.5x the normal quest's requirement (solo weekly 40, duo
+// 150, trio 250, quad 350) — the effort matches the reward.
+const KC_BY_SIZE = { solo: 100, duo: 375, trio: 625, quad: 875 };
 const RAID_BY_SIZE = { solo: 2, duo: 3, trio: 4, quad: 5 };
 
 function skillReq(skill, size) {
@@ -183,16 +186,16 @@ function genMercenary(size, recentNpcs) {
 function genBoss(size, recentNpcs) {
   const npc = pick(BOSS_NPCS, recentNpcs);
   const roll = Math.random();
-  const kc = KC_BY_SIZE[size] || 10;
+  const kc = KC_BY_SIZE[size] || 100;
   if (roll < 0.4) {
-    // Generic KC — no specific boss.
+    // Generic KC — no specific boss (full amount).
     return {
       category: "boss",
       npc_name: npc.name,
       npc_title: npc.title,
       title: "The Ledger Hungers",
       flavor: npc.flavor,
-      requirements: [{ kind: "boss_kc", boss: null, amount: kc * 2 }],
+      requirements: [{ kind: "boss_kc", boss: null, amount: kc }],
     };
   }
   if (roll < 0.75) {

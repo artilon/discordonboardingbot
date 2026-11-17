@@ -468,6 +468,16 @@ async function refreshPanels(guildId) {
 
 const BOUNTY_ACCEPT_PREFIX = "hm_bounty_accept:";
 
+// A member's server nickname (which Heimdall keeps matching their RSN), or
+// null if they don't have one. Honour Marks requires a server nickname to
+// register and participate, and shows it instead of the Discord username.
+async function getServerNickname(guildId, userId) {
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) return null;
+  const member = await guild.members.fetch(userId).catch(() => null);
+  return member?.nickname || null;
+}
+
 async function getBountyChannel(guildId) {
   const setup = await readSetup(guildId);
   const channelId = setup?.channels?.bounty || config.channels.bounty;
@@ -514,9 +524,12 @@ async function bountyPayload(bounty) {
   const enriched = [];
   for (const acc of acceptances) {
     const member = await getMember(acc.user_id).catch(() => null);
+    // Show the server nickname (resolved live so it stays correct), falling
+    // back to the stored display name, then the RSN.
+    const nickname = await getServerNickname(bounty.guild_id, acc.user_id).catch(() => null);
     enriched.push({
       ...acc,
-      displayName: member?.display_name || member?.rsn || null,
+      displayName: nickname || member?.display_name || member?.rsn || null,
       rsn: member?.rsn || null,
       progressText: bountyProgressText(bounty, acc),
     });
@@ -677,6 +690,16 @@ async function handleBountyAccept(interaction) {
     return interaction.reply({ content: "Register your RuneScape name first (button on the role panel).", flags: MessageFlags.Ephemeral });
   }
 
+  const nickname = await getServerNickname(interaction.guildId, userId);
+  if (!nickname) {
+    return interaction.reply({
+      content:
+        "You need a **server nickname** to accept bounties. Your nickname should match your RuneScape name — " +
+        "ask staff or wait for Heimdall to set it.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   const { data: existing } = await supabase
     .from("hm_bounty_acceptances")
     .select("id")
@@ -687,7 +710,9 @@ async function handleBountyAccept(interaction) {
     return interaction.reply({ content: "You're already hunting this bounty.", flags: MessageFlags.Ephemeral });
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  // Silent accept: acknowledge the click with no popup. The board re-sync
+  // below updates the post to show the new hunter — that's the confirmation.
+  await interaction.deferUpdate();
   const snap = await fetchHiscores(member.rsn);
   const baseline = snap ? { skills: snap.skills || {}, activities: snap.activities || {} } : { skills: {}, activities: {} };
 
@@ -703,7 +728,6 @@ async function handleBountyAccept(interaction) {
   await supabase.from("hm_bounties").update({ last_accepted_at: new Date().toISOString() }).eq("id", bountyId);
 
   await syncBountyBoard(interaction.guildId);
-  return interaction.editReply({ content: `📜 Accepted **${bounty.title}** — your progress is now being tracked. Good hunting!` });
 }
 
 // Periodic progress + completion sweep.
@@ -951,6 +975,17 @@ async function performRegistration(interaction, target, rsn) {
     return interaction.editReply({ content: `**${rsn}** is already registered to <@${existingName.user_id}>.` });
   }
 
+  // A server nickname (matching the RSN, set by Heimdall) is required to
+  // register and participate — it's how the member is shown everywhere.
+  const nickname = await getServerNickname(interaction.guildId, target.id);
+  if (!nickname) {
+    return interaction.editReply({
+      content:
+        `You need a **server nickname** before registering. Your nickname should match your RuneScape name — ` +
+        `ask staff or wait for Heimdall to set it, then try again.`,
+    });
+  }
+
   // Verify the name resolves before accepting it, so nobody ends up with a
   // dead registration they can't quest with.
   await interaction.editReply({ content: `Checking **${rsn}** on the hiscores…` });
@@ -971,7 +1006,7 @@ async function performRegistration(interaction, target, rsn) {
       user_id: target.id,
       guild_id: interaction.guildId,
       rsn,
-      display_name: target.username,
+      display_name: nickname,
       active: true,
       updated_at: new Date().toISOString(),
     },
@@ -1461,6 +1496,17 @@ function renderSoloTargetConfirm(interaction, payload) {
 async function handleCreateSolo(interaction, questType, tree, picks = null, tokenConsumed = false, difficulty = "easy") {
   if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
   const member = await getMember(interaction.user.id);
+
+  // A server nickname is required to do quests (same rule as registering
+  // and accepting bounties).
+  const nickname = await getServerNickname(interaction.guildId, interaction.user.id);
+  if (!nickname) {
+    return interaction.editReply({
+      embeds: [emptyPage("Server nickname required", "You need a **server nickname** to do quests. Your nickname should match your RuneScape name — ask staff or wait for Heimdall to set it.").embed],
+      components: [],
+    });
+  }
+
   const kind = treeKind(tree);
 
   // Boss PvM and Raids never write the quest straight away — the exact
