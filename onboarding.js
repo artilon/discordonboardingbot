@@ -519,13 +519,6 @@ const ID = {
   CONFIRM1: "nick_c1",
   CONFIRM2: "nick_c2",
   CANCEL:   "nick_cancel",
-  // Change Tracked Account flow (shift HM + rank tracking to a new account)
-  ACCOUNT_START:  "acct_start",
-  ACCOUNT_MODAL:  "acct_modal",
-  ACCOUNT_INPUT:  "acct_input",
-  ACCOUNT_CONFIRM1: "acct_c1",
-  ACCOUNT_CONFIRM2: "acct_c2",
-  ACCOUNT_CANCEL:   "acct_cancel",
   ORIENT_LEADER: "orient_leader",
   ORIENT_STAFF:  "orient_staff",
   // Ranking system custom IDs
@@ -1061,19 +1054,14 @@ function buildPermanentMessage() {
       "Setting it for the first time **unlocks access to the rest of the Discord** — until then, you can only see this channel and Contact Us.\n\n" +
       "Click the button below, type your in-game username, and confirm it. " +
       "Double-check your spelling — no extra characters, no typos.\n\n" +
-      "**Changed your in-game name?** Come back to this channel and update your nickname again so it stays in sync.\n\n" +
-      "**Switched to a new account entirely?** Use **Change Tracked Account** to move your Honour Marks and rank tracking to your new account name — your old account is saved as a backup in case you ever swap back."
+      "**Changed your in-game name?** Come back to this channel and update your nickname again so it stays in sync."
     );
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(ID.START)
       .setLabel("Update Server Nickname")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(ID.ACCOUNT_START)
-      .setLabel("Change Tracked Account")
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(ButtonStyle.Primary)
   );
 
   return { embeds: [embed], components: [row] };
@@ -7622,174 +7610,6 @@ async function onCancel(interaction) {
   });
 }
 
-// ---- Change Tracked Account (shift HM + rank tracking to a new account) ----
-// For a member who switched to a brand-new in-game account. HM currency is
-// keyed by Discord user_id, so it already follows the person; what must move
-// is the tracked RSN (hm_members.rsn + clan_members.rsn) that drives hiscore
-// and rank tracking. The old RSN is saved to hm_members.previous_rsn as a
-// backup so the member can swap back later.
-async function onAccountStartButton(interaction) {
-  if (!memberHasRole(interaction.member, CLAN_MEMBER_ROLE_ID)) {
-    return interaction.reply({ embeds: [notAllowedEmbed()], flags: MessageFlags.Ephemeral });
-  }
-
-  const modal = new ModalBuilder().setCustomId(ID.ACCOUNT_MODAL).setTitle("Change Tracked Account");
-  const input = new TextInputBuilder()
-    .setCustomId(ID.ACCOUNT_INPUT)
-    .setLabel("Your NEW in-game username")
-    .setStyle(TextInputStyle.Short)
-    .setMinLength(1)
-    .setMaxLength(RSN_MAX_LENGTH)
-    .setRequired(true)
-    .setPlaceholder("Type your new account name exactly as in game");
-  modal.addComponents(new ActionRowBuilder().addComponents(input));
-  await interaction.showModal(modal);
-}
-
-async function onAccountModalSubmit(interaction) {
-  const result = validateRsn(interaction.fields.getTextInputValue(ID.ACCOUNT_INPUT));
-  if (!result.ok) {
-    const embed = new EmbedBuilder()
-      .setColor(COLOR.bad)
-      .setTitle("That username isn't valid")
-      .setDescription(`${result.error}\n\nClick **Change Tracked Account** to try again.`);
-    return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.warn)
-    .setTitle("Confirmation 1 of 2")
-    .setDescription(
-      `Your new tracked account will be:\n# \`${result.name}\`\n\n` +
-      "This moves your Honour Marks and rank tracking to this account. " +
-      "Your current account is saved as a backup in case you swap back.\n\n" +
-      "Is this your **exact** new in-game username?"
-    );
-  return interaction.reply({
-    embeds: [embed],
-    components: [confirmRow(ID.ACCOUNT_CONFIRM1, "Yes, switch to this account", "No, start over", result.name, ID.ACCOUNT_CANCEL)],
-    flags: MessageFlags.Ephemeral,
-  });
-}
-
-async function onAccountConfirm1(interaction, encoded) {
-  const result = validateRsn(decodeName(encoded));
-  if (!result.ok) {
-    return interaction.update({
-      embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Something went wrong").setDescription("Please click **Change Tracked Account** and try again.")],
-      components: [],
-    });
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor(COLOR.bad)
-    .setTitle("Confirmation 2 of 2 — Final check")
-    .setDescription(
-      `Your tracked account will change to:\n# \`${result.name}\`\n\n` +
-      "Are you **absolutely sure**? Your Honour Marks balance carries over, " +
-      "and your old account is kept as a backup."
-    );
-  return interaction.update({
-    embeds: [embed],
-    components: [confirmRow(ID.ACCOUNT_CONFIRM2, "Yes, change my account", "No, cancel", result.name, ID.ACCOUNT_CANCEL)],
-  });
-}
-
-async function onAccountConfirm2(interaction, encoded) {
-  const result = validateRsn(decodeName(encoded));
-  if (!result.ok) {
-    return interaction.update({
-      embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Something went wrong").setDescription("Please click **Change Tracked Account** and try again.")],
-      components: [],
-    });
-  }
-
-  await interaction.deferUpdate();
-
-  const supabase = getSupabase();
-  if (!supabase) {
-    return interaction.editReply({
-      embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("Database not configured").setDescription("Supabase is not set up, so I can't change your tracked account right now. Please ask a staff member.")],
-      components: [],
-    });
-  }
-
-  const userId = interaction.user.id;
-  const newRsn = result.name;
-
-  // Read the current tracked RSN so we can save it as the backup.
-  let oldRsn = null;
-  const { data: hmRow } = await supabase.from("hm_members").select("rsn").eq("user_id", userId).maybeSingle();
-  if (hmRow?.rsn) oldRsn = hmRow.rsn;
-  if (!oldRsn) {
-    const { data: clanRow } = await supabase.from("clan_members").select("rsn").eq("user_id", userId).maybeSingle();
-    if (clanRow?.rsn) oldRsn = clanRow.rsn;
-  }
-
-  if (oldRsn && oldRsn.trim().toLowerCase() === newRsn.trim().toLowerCase()) {
-    return interaction.editReply({
-      embeds: [new EmbedBuilder().setColor(COLOR.warn).setTitle("Already tracking that account").setDescription(`You're already tracking **${newRsn}**. No change needed.`)],
-      components: [],
-    });
-  }
-
-  // Shift tracking to the new account. HM balance is keyed by user_id, so it
-  // carries over automatically — only the RSN pointers move. Save the old
-  // RSN as the backup (previous_rsn) for future swapping.
-  const updates = [];
-  if (oldRsn) {
-    updates.push(
-      supabase.from("hm_members").update({ rsn: newRsn, previous_rsn: oldRsn, updated_at: new Date().toISOString() }).eq("user_id", userId)
-    );
-  } else {
-    updates.push(
-      supabase.from("hm_members").update({ rsn: newRsn, updated_at: new Date().toISOString() }).eq("user_id", userId)
-    );
-  }
-  updates.push(supabase.from("clan_members").update({ rsn: newRsn }).eq("user_id", userId));
-
-  const results = await Promise.allSettled(updates);
-  const failed = results.filter((r) => r.status === "rejected" || r.value?.error);
-  if (failed.length > 0) {
-    console.error(`[AccountChange] Failed for ${userId}:`, failed.map((f) => f.reason?.message || f.value?.error?.message).join("; "));
-    return interaction.editReply({
-      embeds: [new EmbedBuilder().setColor(COLOR.bad).setTitle("I couldn't change your tracked account").setDescription("Something went wrong updating the database. Please ask a staff member for help.")],
-      components: [],
-    });
-  }
-
-  // Keep the server nickname in sync with the new account name.
-  try {
-    const member = await interaction.guild.members.fetch(userId);
-    await member.setNickname(newRsn, "Change Tracked Account — member switched accounts");
-  } catch (err) {
-    console.warn(`[AccountChange] Could not update nickname for ${userId}:`, err.message);
-  }
-
-  const backupNote = oldRsn ? `\n\nYour previous account **${oldRsn}** is saved as a backup — ask staff if you ever want to swap back.` : "";
-  return interaction.editReply({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(COLOR.ok)
-        .setTitle("Tracked account changed")
-        .setDescription(`Your Honour Marks and rank tracking now follow **${newRsn}**. Your balance carried over.${backupNote}`),
-    ],
-    components: [],
-  });
-}
-
-async function onAccountCancel(interaction) {
-  return interaction.update({
-    embeds: [
-      new EmbedBuilder()
-        .setColor(COLOR.warn)
-        .setTitle("Cancelled")
-        .setDescription("No changes were made. Click **Change Tracked Account** whenever you're ready to try again."),
-    ],
-    components: [],
-  });
-}
-
 // ---- Ranking System Alert & List Button Handlers ----
 async function findMemberByRsn(supabase, rsn) {
   if (!supabase || !rsn) return null;
@@ -9919,10 +9739,6 @@ async function handleInteraction(interaction) {
     const [base, payload, extra] = interaction.customId.split(":");
     switch (base) {
       case ID.START:                return onStartButton(interaction);
-      case ID.ACCOUNT_START:        return onAccountStartButton(interaction);
-      case ID.ACCOUNT_CONFIRM1:     return onAccountConfirm1(interaction, payload);
-      case ID.ACCOUNT_CONFIRM2:     return onAccountConfirm2(interaction, payload);
-      case ID.ACCOUNT_CANCEL:       return onAccountCancel(interaction);
       case ID.POLL_VOTE:            return onPollVote(interaction, payload, extra);
       case ID.POLL_CLOSE:           return onPollClose(interaction, payload);
       case ID.CONFIRM1:             return onConfirm1(interaction, payload);
@@ -9989,7 +9805,6 @@ async function handleInteraction(interaction) {
   if (interaction.isModalSubmit()) {
     const [modalBase, modalPayload] = interaction.customId.split(":");
     if (interaction.customId === ID.MODAL) return onModalSubmit(interaction);
-    if (interaction.customId === ID.ACCOUNT_MODAL) return onAccountModalSubmit(interaction);
     if (interaction.customId === ID.ROSTER_MODAL) return onRosterModalSubmit(interaction);
     if (interaction.customId === ID.TICKET_DENY_MODAL) return onTicketDenyModalSubmit(interaction);
     if (interaction.customId === ID.RECRUITMENT_INFO_MODAL) return onRecruitmentInfoModalSubmit(interaction);
@@ -11277,12 +11092,6 @@ module.exports = {
   sumActivityGain,
   computeHonourMarksLeaderboard,
   getServerNicknameMap,
-  buildPermanentMessage,
-  onAccountStartButton,
-  onAccountModalSubmit,
-  onAccountConfirm1,
-  onAccountConfirm2,
-  onAccountCancel,
   accumulateRecapGains,
   newRecapAccumulator,
   repostWeeklyRecap,

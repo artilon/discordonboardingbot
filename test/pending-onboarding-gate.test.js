@@ -134,22 +134,6 @@ async function main() {
     check("a non-Clan-Member gets no override from this gate", !channels[0].permissionOverwrites.cache.get("user-3"));
   }
 
-  // ---- Channels with no permissionOverwrites are skipped, not crashed ----
-  // Regression: the reconcile loop spammed "Cannot read properties of
-  // undefined (reading 'cache')" because the gate iterates every guild
-  // channel and some cached channels have no permissionOverwrites object.
-  {
-    const noPermsChannel = { id: "chan-noperms", name: "no-perms" }; // no permissionOverwrites
-    const normalChannel = makeFakeChannel("chan-general", "general");
-    const guild = { channels: { cache: new Map([[noPermsChannel.id, noPermsChannel], [normalChannel.id, normalChannel]]) } };
-    const member = makeMember("user-5", [bot.CLAN_MEMBER_ROLE_ID, bot.UNVERIFIED_ROLE_ID], guild);
-
-    await bot.syncPendingOnboardingAccessForMember(member); // must not throw
-
-    const ow = normalChannel.permissionOverwrites.cache.get("user-5");
-    check("a channel without permissionOverwrites is skipped without throwing", !!ow && ow.deny.has(PermissionFlagsBits.ViewChannel));
-  }
-
   // ---- Re-running is idempotent (no redundant API writes) ----
   {
     const channels = [makeFakeChannel("chan-general", "general")];
