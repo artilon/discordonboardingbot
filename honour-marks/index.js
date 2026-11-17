@@ -1172,6 +1172,31 @@ async function handleHm(interaction) {
     await refreshPanels(interaction.guildId);
     return interaction.editReply({ content: "Panels refreshed." });
   }
+
+  if (sub === "bounty-reset") {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const supabase = getSupabase();
+    const channel = await getBountyChannel(interaction.guildId);
+    const active = await loadActiveBounties(interaction.guildId);
+    let deleted = 0;
+    for (const b of active) {
+      await supabase.from("hm_bounties").update({ status: "expired" }).eq("id", b.id);
+      if (b.message_id && channel) {
+        const msg = await channel.messages.fetch(b.message_id).catch(() => null);
+        if (msg) {
+          await msg.delete().catch(() => {});
+          deleted++;
+        }
+      }
+    }
+    // Post a fresh board in the current format.
+    await syncBountyBoard(interaction.guildId);
+    return interaction.editReply({
+      content:
+        `✅ **Bounty board reset.** Removed ${active.length} active bounties ` +
+        `(${deleted} messages deleted) and posted a fresh board.`,
+    });
+  }
 }
 
 // ── Interaction: buttons and menus ───────────────────────────────────────────

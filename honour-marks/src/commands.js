@@ -80,6 +80,11 @@ const raw = [
     )
     .addSubcommand((s) =>
       s
+        .setName("bounty-reset")
+        .setDescription("Clear all active bounties and post a fresh board (staff)")
+    )
+    .addSubcommand((s) =>
+      s
         .setName("force-complete")
         .setDescription("Force-complete one of your own active quests and pay the full reward (restricted)")
     ),
