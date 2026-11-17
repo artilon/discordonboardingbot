@@ -460,10 +460,11 @@ async function refreshPanels(guildId) {
 }
 
 // ── Bounty Quests: the bounty board ────────────────────────────────────────
-// 12 active bounties (3 per size) posted as NPC requests. Members accept a
-// bounty to start tracking; progress is computed from a hiscores snapshot at
-// accept time. Bounties cycle every 3 hours, but one with an active hunter
-// endures up to 96 hours from the last accept.
+// 5 active bounties (2 skilling + 1 slayer + 1 boss + 1 raid, random sizes)
+// posted as NPC requests. Members accept a bounty to start tracking;
+// progress is computed from a hiscores snapshot at accept time. Bounties
+// cycle every 3 hours, but one with an active hunter endures up to 96 hours
+// from the last accept.
 
 const BOUNTY_ACCEPT_PREFIX = "hm_bounty_accept:";
 
@@ -548,7 +549,7 @@ async function ensureBountyChannelPermissions(guild, channel) {
 }
 
 // Post new bounties / refresh existing ones / retire expired ones so the
-// board always shows the current 12.
+// board always shows the current 5.
 async function syncBountyBoard(guildId) {
   const supabase = getSupabase();
   if (!supabase) return;
@@ -579,40 +580,39 @@ async function syncBountyBoard(guildId) {
   }
   active = active.filter((b) => b.status === "active" && now <= new Date(b.expires_at).getTime());
 
-  // Top up to 12 (3 per size).
-  const bySize = {};
-  for (const b of active) bySize[b.size] = (bySize[b.size] || 0) + 1;
+  // Top up to 5 total, respecting the category caps (2 skilling + 1
+  // slayer + 1 boss + 1 raid) with a random size per bounty.
+  const counts = {};
+  for (const b of active) counts[b.category] = (counts[b.category] || 0) + 1;
   const recentNpcs = new Set(active.map((b) => b.npc_name));
-  for (const size of bounties.BOUNTY_SIZES) {
-    let need = bounties.BOUNTIES_PER_SIZE - (bySize[size] || 0);
-    while (need > 0) {
-      const spec = bounties.generateBounty(size, recentNpcs);
-      recentNpcs.add(spec.npc_name);
-      const expiresAt = new Date(now + bounties.BOUNTY_CYCLE_MS).toISOString();
-      const { data: inserted, error } = await supabase
-        .from("hm_bounties")
-        .insert({
-          guild_id: guildId,
-          category: spec.category,
-          size: spec.size,
-          npc_name: spec.npc_name,
-          npc_title: spec.npc_title,
-          title: spec.title,
-          flavor: spec.flavor,
-          requirements: spec.requirements,
-          hm_reward: spec.hm_reward,
-          rank_xp_reward: spec.rank_xp_reward,
-          expires_at: expiresAt,
-          status: "active",
-        })
-        .select("*")
-        .single();
-      if (!error && inserted) {
-        active.push(inserted);
-        bySize[size] = (bySize[size] || 0) + 1;
-      }
-      need--;
+  let need = bounties.BOUNTY_TOTAL - active.length;
+  while (need > 0) {
+    const spec = bounties.generateBountyForBoard(counts, recentNpcs);
+    recentNpcs.add(spec.npc_name);
+    const expiresAt = new Date(now + bounties.BOUNTY_CYCLE_MS).toISOString();
+    const { data: inserted, error } = await supabase
+      .from("hm_bounties")
+      .insert({
+        guild_id: guildId,
+        category: spec.category,
+        size: spec.size,
+        npc_name: spec.npc_name,
+        npc_title: spec.npc_title,
+        title: spec.title,
+        flavor: spec.flavor,
+        requirements: spec.requirements,
+        hm_reward: spec.hm_reward,
+        rank_xp_reward: spec.rank_xp_reward,
+        expires_at: expiresAt,
+        status: "active",
+      })
+      .select("*")
+      .single();
+    if (!error && inserted) {
+      active.push(inserted);
+      counts[spec.category] = (counts[spec.category] || 0) + 1;
     }
+    need--;
   }
 
   // Post / edit each bounty message.

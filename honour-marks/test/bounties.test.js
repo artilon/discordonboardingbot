@@ -1,5 +1,6 @@
-// Coverage for the Bounty Quests generator: board shape (12 bounties, 3 per
-// size), category validity, reward scaling (2.5x), and NPC variety.
+// Coverage for the Bounty Quests generator: board shape (5 bounties with
+// category caps + random sizes), category validity, reward scaling (2.5x),
+// NPC variety, and team-size labeling.
 const assert = require("assert");
 const path = require("path");
 
@@ -12,12 +13,30 @@ function check(label, cond) {
 }
 
 function main() {
-  // ---- Board shape ----
+  // ---- Board shape: 5 total, category caps, random sizes ----
   const board = bounties.generateBoard();
-  check("board has 12 bounties", board.length === 12);
-  for (const size of ["solo", "duo", "trio", "quad"]) {
-    check(`board has 3 ${size} bounties`, board.filter((b) => b.size === size).length === 3);
+  check("board has 5 bounties", board.length === 5);
+  check("board has 2 skilling (artisan) bounties", board.filter((b) => b.category === "artisan").length === 2);
+  check("board has 1 slayer (mercenary) bounty", board.filter((b) => b.category === "mercenary").length === 1);
+  check("board has 1 boss bounty", board.filter((b) => b.category === "boss").length === 1);
+  check("board has 1 raid bounty", board.filter((b) => b.category === "raid").length === 1);
+  for (const b of board) {
+    check("bounty size is a valid size", ["solo", "duo", "trio", "quad"].includes(b.size));
   }
+  // Caps hold across many boards, and sizes vary (random, not fixed per slot).
+  const seenSizes = new Set();
+  for (let i = 0; i < 60; i++) {
+    const b = bounties.generateBoard();
+    check("board is always 5", b.length === 5);
+    const byCat = {};
+    for (const x of b) byCat[x.category] = (byCat[x.category] || 0) + 1;
+    check("raid never exceeds 1", (byCat.raid || 0) <= 1);
+    check("boss never exceeds 1", (byCat.boss || 0) <= 1);
+    check("slayer never exceeds 1", (byCat.mercenary || 0) <= 1);
+    check("skilling never exceeds 2", (byCat.artisan || 0) <= 2);
+    for (const x of b) seenSizes.add(x.size);
+  }
+  check("sizes are random across boards (more than one size seen)", seenSizes.size > 1);
 
   // ---- Rewards are 2.5x the normal quest of the same size ----
   check("solo bounty HM is 2.5x weekly (150)", bounties.bountyRewards("solo").hm === 375);
@@ -77,6 +96,14 @@ function main() {
     check("embed shows the reward", embed.description.includes(`${b.hm_reward} HM`));
     check("embed shows requirements", b.requirements.every((r) => embed.description.includes(String(r.amount))));
     check("empty board says no hunters yet", /No hunters yet/.test(embed.description));
+    check("embed clearly labels the team size", embed.description.includes("**Team:** Team of 2 (Duo)"));
+
+    const solo = bounties.generateBounty("solo");
+    const soloEmbed = bounties.renderBountyEmbed(solo, []);
+    check("solo embed clearly labels solo", soloEmbed.description.includes("**Team:** Solo — just you"));
+    const quad = bounties.generateBounty("quad");
+    const quadEmbed = bounties.renderBountyEmbed(quad, []);
+    check("quad embed clearly labels team of 4", quadEmbed.description.includes("**Team:** Team of 4 (Quad)"));
 
     const withAcc = bounties.renderBountyEmbed(b, [
       { user_id: "u1", displayName: "Torlokt", progressText: "5,000 / 15,000", completed: false },
