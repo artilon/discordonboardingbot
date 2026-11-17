@@ -615,8 +615,10 @@ async function syncBountyBoard(guildId) {
     need--;
   }
 
-  // Post / edit each bounty message.
-  for (const bounty of active) {
+  // Post / edit each bounty message, in category order: artisan, slayer,
+  // boss, raid. Existing messages are edited in place (keeping their
+  // position); new ones go out in that order.
+  for (const bounty of bounties.sortBoard(active)) {
     const payload = await bountyPayload(bounty);
     if (bounty.message_id) {
       const msg = await channel.messages.fetch(bounty.message_id).catch(() => null);

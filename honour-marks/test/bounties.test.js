@@ -38,6 +38,24 @@ function main() {
   }
   check("sizes are random across boards (more than one size seen)", seenSizes.size > 1);
 
+  // ---- Board display order: artisan, slayer, boss, raid ----
+  {
+    const shuffled = [
+      { category: "raid", npc_name: "R" },
+      { category: "boss", npc_name: "B" },
+      { category: "mercenary", npc_name: "M" },
+      { category: "artisan", npc_name: "A2" },
+      { category: "artisan", npc_name: "A1" },
+    ];
+    const sorted = bounties.sortBoard(shuffled);
+    check(
+      "sortBoard orders artisan, slayer, boss, raid",
+      sorted.map((b) => b.category).join(",") === "artisan,artisan,mercenary,boss,raid"
+    );
+    check("sortBoard is stable within a category", sorted[0].npc_name === "A2" && sorted[1].npc_name === "A1");
+    check("sortBoard does not mutate the input", shuffled[0].category === "raid");
+  }
+
   // ---- Rewards are 2.5x the normal quest of the same size ----
   check("solo bounty HM is 2.5x weekly (150)", bounties.bountyRewards("solo").hm === 375);
   check("duo bounty HM is 2.5x duo (250)", bounties.bountyRewards("duo").hm === 625);
