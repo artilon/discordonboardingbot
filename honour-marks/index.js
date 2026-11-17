@@ -548,9 +548,33 @@ async function ensureBountyChannelPermissions(guild, channel) {
     .catch(() => {});
 }
 
+// Per-guild lock so only one bounty board sync runs at a time. The
+// progress tick, panel refreshes and /hm bounty-reset all sync the same
+// board; without the lock, a tick mid-sync can re-post messages for
+// bounties a reset just expired — orphaned posts no future sync cleans
+// up, and a scrambled board order.
+const bountySyncLocks = new Map();
+
+async function withBountySyncLock(guildId, fn) {
+  const prev = bountySyncLocks.get(guildId) || Promise.resolve();
+  let release;
+  const next = new Promise((resolve) => { release = resolve; });
+  bountySyncLocks.set(guildId, prev.then(() => next));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+async function syncBountyBoard(guildId) {
+  return withBountySyncLock(guildId, () => syncBountyBoardInner(guildId));
+}
+
 // Post new bounties / refresh existing ones / retire expired ones so the
 // board always shows the current 5.
-async function syncBountyBoard(guildId) {
+async function syncBountyBoardInner(guildId) {
   const supabase = getSupabase();
   if (!supabase) return;
   const channel = await getBountyChannel(guildId);
@@ -563,6 +587,7 @@ async function syncBountyBoard(guildId) {
 
   // Retire bounties past their window: 3h cycle, or 96h from last accept if
   // someone is actively hunting.
+  const expiredIds = new Set();
   for (const b of active) {
     const createdMs = new Date(b.created_at).getTime();
     const lastAcceptMs = b.last_accepted_at ? new Date(b.last_accepted_at).getTime() : 0;
@@ -571,6 +596,7 @@ async function syncBountyBoard(guildId) {
       ? Math.min(createdMs + bounties.BOUNTY_MAX_ACTIVE_MS, lastAcceptMs + bounties.BOUNTY_MAX_ACTIVE_MS)
       : createdMs + bounties.BOUNTY_CYCLE_MS;
     if (now > deadline) {
+      expiredIds.add(b.id);
       await supabase.from("hm_bounties").update({ status: "expired" }).eq("id", b.id);
       if (b.message_id) {
         const msg = await channel.messages.fetch(b.message_id).catch(() => null);
@@ -578,7 +604,7 @@ async function syncBountyBoard(guildId) {
       }
     }
   }
-  active = active.filter((b) => b.status === "active" && now <= new Date(b.expires_at).getTime());
+  active = active.filter((b) => !expiredIds.has(b.id));
 
   // Top up to 5 total, respecting the category caps (2 skilling + 1
   // slayer + 1 boss + 1 raid) with a random size per bounty.
@@ -1177,25 +1203,30 @@ async function handleHm(interaction) {
 
   if (sub === "bounty-reset") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-    const supabase = getSupabase();
-    const channel = await getBountyChannel(interaction.guildId);
-    const active = await loadActiveBounties(interaction.guildId);
-    let deleted = 0;
-    for (const b of active) {
-      await supabase.from("hm_bounties").update({ status: "expired" }).eq("id", b.id);
-      if (b.message_id && channel) {
-        const msg = await channel.messages.fetch(b.message_id).catch(() => null);
-        if (msg) {
-          await msg.delete().catch(() => {});
-          deleted++;
+    // Hold the board lock across the whole reset so a concurrent progress
+    // tick or panel refresh can't re-post the bounties being cleared.
+    const { removed, deleted } = await withBountySyncLock(interaction.guildId, async () => {
+      const supabase = getSupabase();
+      const channel = await getBountyChannel(interaction.guildId);
+      const active = await loadActiveBounties(interaction.guildId);
+      let deletedCount = 0;
+      for (const b of active) {
+        await supabase.from("hm_bounties").update({ status: "expired" }).eq("id", b.id);
+        if (b.message_id && channel) {
+          const msg = await channel.messages.fetch(b.message_id).catch(() => null);
+          if (msg) {
+            await msg.delete().catch(() => {});
+            deletedCount++;
+          }
         }
       }
-    }
-    // Post a fresh board in the current format.
-    await syncBountyBoard(interaction.guildId);
+      // Post a fresh board in the current format.
+      await syncBountyBoardInner(interaction.guildId);
+      return { removed: active.length, deleted: deletedCount };
+    });
     return interaction.editReply({
       content:
-        `✅ **Bounty board reset.** Removed ${active.length} active bounties ` +
+        `✅ **Bounty board reset.** Removed ${removed} active bounties ` +
         `(${deleted} messages deleted) and posted a fresh board.`,
     });
   }
