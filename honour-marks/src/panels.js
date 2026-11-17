@@ -93,7 +93,7 @@ function buildPanelComponents(panelKey, pageIndex, pageCount) {
     rows.push(
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("hm_quest_start").setLabel("📋 Start a Solo Quest").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("hm_team_start").setLabel("👥 Start a Team Quest").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("hm_pool_start").setLabel("🏊 Start a Pool Quest").setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId("hm_check").setLabel("✅ Check Quests & Collect").setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId("hm_guide_open").setLabel("📖 How This Works").setStyle(ButtonStyle.Secondary)
       )
@@ -163,7 +163,7 @@ async function renderDatabase(guildId) {
       `**#${i + 1} — ${r.rsn}**${prestigeTag} — ${HM_EMOJI} \`${(Number(r.total_earned) || 0).toLocaleString()}\` earned • ` +
       `\`${(Number(r.balance) || 0).toLocaleString()}\` held\n` +
       `┗ Quests \`${total}\` • D \`${r.solo_daily || 0}\` · W \`${r.solo_weekly || 0}\` · M \`${r.solo_monthly || 0}\` · ` +
-      `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\` · ` +
+      `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\` · Pool \`${r.pool || 0}\` · ` +
       `Bounty \`${r.bounty || 0}\``
     );
   });
@@ -300,7 +300,8 @@ async function formatTeamQuestLine(q) {
   const expiresAt = `<t:${Math.floor(new Date(q.expires_at).getTime() / 1000)}:R>`;
   const prestiged = await getPrestigedSet(q.members).catch(() => new Set());
   const membersMention = q.members.map((m) => `<@${m}>${prestiged.has(m) ? ` ${PRESTIGE_EMOJI}` : ""}`).join(", ");
-  const head = `• **${q.size}** • ${q.tree} • 🎯 **${targetLabels}** — ${membersMention}`;
+  const sizeLabel = q.size === "pool" ? "Pool" : q.size;
+  const head = `• **${sizeLabel}** • ${q.tree} • 🎯 **${targetLabels}** — ${membersMention}`;
 
   const evaluated = await checkPartyQuest(q).catch(() => null);
   if (!evaluated || evaluated.error || !evaluated.progress) {
@@ -345,7 +346,7 @@ async function renderQuestBoard(guildId, setup = {}) {
   }
 
   if (activeTeams?.length) {
-    lines.push("**Team Quests In Progress**");
+    lines.push("**Pool Quests In Progress**");
     for (const q of activeTeams.slice(0, 15)) {
       lines.push(await formatTeamQuestLine(q));
     }
@@ -363,6 +364,27 @@ async function renderQuestBoard(guildId, setup = {}) {
 
   const chunks = chunkLines(lines, header);
 
+  // Join select for active pool quests (open to everyone — no fixed team).
+  const poolQuests = (activeTeams || []).filter((q) => q.size === "pool");
+  const joinRow = poolQuests.length
+    ? new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId("hm_join_pool")
+          .setPlaceholder("Join a pool quest…")
+          .addOptions(
+            poolQuests.slice(0, 25).map((q) => {
+              const tree = TREE_BY_KEY[q.tree];
+              const diff = PARTY_DIFFICULTY[q.difficulty] || PARTY_DIFFICULTY.easy;
+              return new StringSelectMenuOptionBuilder()
+                .setLabel(`Pool • ${diff.label} • ${tree?.label || q.tree} (${q.members.length} in)`)
+                .setDescription("Anyone can join — your progress counts toward the shared total")
+                .setValue(String(q.id))
+                .setEmoji("🏊");
+            })
+          )
+      )
+    : null;
+
   return chunks.map((chunk, i) => {
     const embed = new EmbedBuilder()
       .setColor(COLOR.main)
@@ -373,7 +395,9 @@ async function renderQuestBoard(guildId, setup = {}) {
       .setTimestamp();
     // Banner only on page 1 — see renderDatabase for why.
     if (i === 0) embed.setImage(MIMIR_SHOP_BANNER_URL);
-    return { embed, components: buildPanelComponents("quest_board", i, chunks.length) };
+    const components = buildPanelComponents("quest_board", i, chunks.length);
+    if (i === 0 && joinRow) components.push(joinRow);
+    return { embed, components };
   });
 }
 
@@ -418,8 +442,7 @@ async function renderOpenTeams(guildId) {
     }
   } else {
     lines.push(
-      "_No open teams right now._ On the quest board, press **Start a Team Quest** and choose " +
-      "**Post an Open Listing** to recruit here instead of picking everyone yourself."
+      "_No open teams right now._ Team quest listings appear here when someone posts one."
     );
   }
 
@@ -697,8 +720,8 @@ function buildGuideSections(setup = {}) {
         `**This guide is long on purpose** — it's meant to answer every question before you have to ask it, from ` +
         `your very first click to the exact numbers behind every quest type. What's in it, in order:\n` +
         `1. The Basics (this page) • 2. Your First 10 Minutes • 3. Solo Quests In Detail • ` +
-        `4. Boss PvM, Raids & Minigames Explained • 5. Team Quests Step By Step • ` +
-        `5b. Team Quests — Requirements & Rewards • 5c. Bounty Quests, The Simple Version • ` +
+        `4. Boss PvM, Raids & Minigames Explained • 5. Pool Quests Step By Step • ` +
+        `5b. Pool Quests — Requirements & Rewards • 5c. Bounty Quests, The Simple Version • ` +
         `6. Looking For Group Step By Step • 7. Checking Progress & Collecting Rewards • ` +
         `8. Shop: Perks • 8b. Shop: Items • 8c. Shop: Prestige • 9. Boss PvM Safety Check • ` +
         `10. Weighted Skill Rolls • 11. Shop: Boosts • 12. Shop: Consumables • 13. Your Inventory • ` +
@@ -759,7 +782,7 @@ function buildGuideSections(setup = {}) {
         `press ✅ Confirm before anything is saved. Pressing ✖ Cancel costs nothing — no HM, no Skip Token — ` +
         `and simply sends you back to pick a category again. This exists specifically so no one gets quietly ` +
         `assigned a boss they can't actually do yet (see Page 4).\n\n` +
-        `**Skilling quests have a difficulty picker**, exactly like team quests: after choosing a Gathering, ` +
+        `**Skilling quests have a difficulty picker**, exactly like pool quests: after choosing a Gathering, ` +
         `Production, Combat, or Utility category, you pick 🟢 **Easy** (1 skill), 🟡 **Medium** (2 skills), ` +
         `🔴 **Hard** (3 skills), or 🟣 **Extreme** (4 skills). Each tier up raises the XP needed **per skill** ` +
         `by 25% over the last, and scales the HM + Rank XP reward up by the exact same multiplier (1×/2×/3×/4×) ` +
@@ -828,67 +851,54 @@ function buildGuideSections(setup = {}) {
         `for a **team** quest, it's shown only to whoever is CREATING the team, before teammates are picked or ` +
         `the listing is posted — once confirmed, that target is locked in for the whole team. Skill and ` +
         `Minigame quests skip this step entirely and start the instant you finish picking, same as always.\n\n` +
-        `All of this applies to BOTH solo and team quests — team quests draw from exactly the same pools, just ` +
+        `All of this applies to BOTH solo and pool quests — pool quests draw from exactly the same pools, just ` +
         `with higher combined targets split across more people (Page 5).`,
     },
     {
-      short: "Team Quests",
-      title: "👥 Step 4: Team Quests, Step By Step",
+      short: "Pool Quests",
+      title: "🏊 Step 4: Pool Quests, Step By Step",
       body:
-        `A team quest (Duo, Trio, or Quad) shares ONE or more targets across the whole group — everyone's ` +
-        `gains are summed together toward each one, so it finishes faster the more people are pulling their ` +
-        `weight. It always runs for **14 days** regardless of size, and pays **every member the full ` +
-        `reward**, not a split share. You can be on up to **${MAX_ACTIVE_PARTY_QUESTS} team quests at once** — ` +
+        `A pool quest shares ONE or more targets across **everyone who wants to help** — there's no fixed ` +
+        `team, so nobody is ever the odd one out. Anyone in the clan can join and contribute, and everyone's ` +
+        `gains are summed together toward each shared target, so it finishes faster the more people are ` +
+        `pulling their weight. It always runs for **14 days**, and pays **every contributor the full ` +
+        `reward**, not a split share. You can be on up to **${MAX_ACTIVE_PARTY_QUESTS} pool quests at once** — ` +
         `starting or joining a 4th is blocked until one of the others finishes or expires.\n\n` +
         `**Starting one, step by step:**\n` +
-        `1. Open ${questsCh} and press **👥 Start a Team Quest**.\n` +
-        `2. Pick a size: **Duo** (2 people total), **Trio** (3 people total), or **Quad** (4 people total). You ` +
-        `count as the first member either way. Size sets how big EACH target is.\n` +
-        `3. Pick a difficulty: 🟢 **Easy** (1 target), 🟡 **Medium** (2 targets), or 🔴 **Hard** (3 targets). ` +
-        `Difficulty sets how MANY targets the team needs, and scales up ${HM_EMOJI} HM and Rank XP to match — ` +
-        `Medium pays double Easy's reward, Hard pays triple. Pick Easy any time the team just wants one quick, ` +
+        `1. Open ${questsCh} and press **🏊 Start a Pool Quest**. You're the first member of the pool.\n` +
+        `2. Pick a difficulty: 🟢 **Easy** (1 target), 🟡 **Medium** (2 targets), or 🔴 **Hard** (3 targets). ` +
+        `Difficulty sets how MANY targets the pool needs, and scales up ${HM_EMOJI} HM and Rank XP to match — ` +
+        `Medium pays double Easy's reward, Hard pays triple. Pick Easy any time you just want one quick, ` +
         `simple target instead of juggling several at once.\n` +
-        `4. Pick a category — the same seven choices as solo quests.\n` +
-        `4b. **If you (the person creating the team) own a 🎯 Quest Choice Token**, you're offered a choice ` +
-        `right here, before anyone else is involved: spend it to hand-pick the team's exact shared target(s) ` +
-        `(one pick per target the chosen difficulty needs), or skip it and let the bot roll the rest at random ` +
-        `(the token stays in your inventory either way if you skip it). This is the ONLY point a hand-pick can ` +
-        `happen — teammates and later joiners never get this choice, and it's locked in before the team is ` +
-        `finalized specifically so that anyone browsing the **Looking For Group** board can see the chosen ` +
-        `target(s) before deciding whether to join (Page 6).\n` +
-        `4c. **If the category is Boss PvM or Raids**, you (the creator) see a confirm/cancel preview of the ` +
-        `exact target(s) rolled or picked before the team is finalized — ✅ Confirm locks it in for the whole ` +
-        `team, ✖ Cancel costs nothing and sends you back to pick a category again (Page 4). Teammates never see ` +
-        `this step themselves; it's decided once, by the creator, before anyone else is involved.\n` +
-        `5. Choose how to fill the rest of the team:\n` +
-        `　• **Pick Teammates** — a member picker opens where you select the exact number of other people ` +
-        `needed (1 for Duo, 2 for Trio, 3 for Quad). Everyone picked must already be registered with ` +
-        `\`/register\`, or it fails to create. The quest starts **immediately** once confirmed.\n` +
-        `　• **📋 Post Open Listing** — skips picking anyone; instead it posts a public listing to the ` +
-        `**Looking For Group** board (Page 6) and starts automatically once enough other members join it.`,
+        `3. Pick a category — the same seven choices as solo quests. The bot rolls the target(s) at random ` +
+        `and the pool quest starts immediately.\n\n` +
+        `**Joining someone else's pool quest:**\n` +
+        `1. Open ${questsCh} and use the **"Join a pool quest…"** dropdown under the board.\n` +
+        `2. Pick the pool quest you want — each option shows the category, difficulty, and how many people ` +
+        `are already in.\n` +
+        `3. You're added immediately with a fresh baseline, so only progress you make **after** joining ` +
+        `counts. There's no limit to how many people can be in a pool — the more, the faster it finishes.\n\n` +
+        `Once a pool quest is running, press **Check Quests & Collect** on the quest board to see the combined ` +
+        `progress and collect when it's done.`,
     },
     {
-      short: "Team Quest Rewards",
-      title: "👥 Step 4b: Team Quests — Requirements & Rewards",
+      short: "Pool Quest Rewards",
+      title: "🏊 Step 4b: Pool Quests — Requirements & Rewards",
       body:
-        `**Per-target requirement**, by category and size — the team's combined gains must reach the full ` +
-        `amount on EACH target, same "never split or summed together across targets" rule as solo quests. ` +
-        `Difficulty only changes how many of these targets the quest has (1/2/3), never the amount per target:\n\n` +
-        `**Skill categories** — 135,000 combined XP per skill (Duo) • 200,000 (Trio) • 270,000 (Quad).\n` +
-        `**Boss PvM** — 150 combined KC per boss (Duo) • 250 (Trio) • 350 (Quad).\n` +
-        `**Raids** — 15 combined clears per raid (Duo) • 30 (Trio) • 45 (Quad). Still always hand-picked, ` +
-        `never rolled at random, free of charge regardless of difficulty or Quest Choice Token ownership — a ` +
-        `Hard raids quest means all 3 raids (Chambers of Xeric, Theatre of Blood, Tombs of Amascut).\n` +
-        `**Minigames** — 50 combined per minigame (Duo) • 125 (Trio) • 200 (Quad).\n\n` +
-        `**Rewards per member** (everyone gets the full amount, it is NOT split between you) — base amount ` +
-        `at Easy, then doubled at Medium and tripled at Hard:\n` +
-        `• **Duo** — Easy 250 ${HM_EMOJI} + 750 Rank XP • Medium 500 ${HM_EMOJI} + 1,500 Rank XP • ` +
-        `Hard 750 ${HM_EMOJI} + 2,250 Rank XP\n` +
-        `• **Trio** — Easy 350 ${HM_EMOJI} + 1,200 Rank XP • Medium 700 ${HM_EMOJI} + 2,400 Rank XP • ` +
-        `Hard 1,050 ${HM_EMOJI} + 3,600 Rank XP\n` +
-        `• **Quad** — Easy 450 ${HM_EMOJI} + 2,000 Rank XP • Medium 900 ${HM_EMOJI} + 4,000 Rank XP • ` +
-        `Hard 1,350 ${HM_EMOJI} + 6,000 Rank XP\n\n` +
-        `A team quest that runs out of time is simply cancelled for everyone — unlike solo quests there is no ` +
+        `**Per-target requirement** — the pool's combined gains must reach the full amount on EACH target, ` +
+        `same "never split or summed together across targets" rule as solo quests. Difficulty only changes ` +
+        `how many of these targets the quest has (1/2/3), never the amount per target. Pool requirements are ` +
+        `a regular trio team's total increased by 1.75x:\n\n` +
+        `**Skill categories** — 350,000 combined XP per skill.\n` +
+        `**Boss PvM** — 438 combined KC per boss.\n` +
+        `**Raids** — 53 combined clears per raid. A Hard raids quest means all 3 raids (Chambers of Xeric, ` +
+        `Theatre of Blood, Tombs of Amascut).\n` +
+        `**Minigames** — 219 combined per minigame.\n\n` +
+        `**Rewards per contributor** (everyone who contributed gets the full amount, it is NOT split between ` +
+        `you) — base amount at Easy, then doubled at Medium and tripled at Hard:\n` +
+        `• **Pool** — Easy 613 ${HM_EMOJI} + 2,100 Rank XP • Medium 1,226 ${HM_EMOJI} + 4,200 Rank XP • ` +
+        `Hard 1,839 ${HM_EMOJI} + 6,300 Rank XP\n\n` +
+        `A pool quest that runs out of time is simply cancelled for everyone — unlike solo quests there is no ` +
         `partial HM payout, and no one can cancel it early themselves (a Skip Token only works on solo quests).`,
     },
     {
@@ -940,20 +950,15 @@ function buildGuideSections(setup = {}) {
     },
     {
       short: "Looking For Group",
-      title: "🔍 Step 5: Looking For Group, Step By Step",
+      title: "🔍 Step 5: Looking For Group (Team Quests Only)",
       body:
-        `The **Looking For Group** board is a second panel posted right under the quest board. It lists every ` +
-        `team quest that's currently recruiting, with the category, size, difficulty, who's already joined, ` +
-        `and — if the poster hand-picked one with a 🎯 Quest Choice Token — the exact target(s), so you always ` +
-        `know what you're signing up for before you join.\n\n` +
-        `**Posting a listing, step by step:**\n` +
-        `1. Press **👥 Start a Team Quest** → pick a size → pick a difficulty → pick a category, exactly like ` +
-        `a normal team quest (Page 5). If you own a Quest Choice Token, this is also where you'd hand-pick the ` +
-        `team's target(s) — do it here, before posting, and it'll show on the board for everyone.\n` +
-        `2. On the "how do you want to fill it" screen, press **📋 Post Open Listing** instead of Pick Teammates.\n` +
-        `3. You're now the first member of an open listing, and it appears on the LFG board immediately.\n` +
-        `4. You can only have **one** open listing — or be a member of one — at a time, whether posting or ` +
-        `joining. Cancel or complete one before starting or joining another.\n\n` +
+        `The **Looking For Group** board is a second panel that appears under the quest board — but only ` +
+        `when there's an open team quest listing to fill. It lists every team quest that's currently ` +
+        `recruiting, with the category, size, difficulty, and who's already joined, so you always know what ` +
+        `you're signing up for before you join.\n\n` +
+        `**Pool quests don't use this board.** A pool quest (Page 5) is open to everyone — you just join it ` +
+        `straight from the quest board, no listing needed. The LFG board only shows up if someone posts a ` +
+        `regular team quest listing.\n\n` +
         `**Joining a listing, step by step:**\n` +
         `1. Open the LFG board and use the **"Join an open team…"** dropdown.\n` +
         `2. Pick the listing you want — each option shows the category, size, difficulty, and how many of its ` +
@@ -965,9 +970,7 @@ function buildGuideSections(setup = {}) {
         `**Expiry.** An open listing that never fills disappears after **24 hours**. Nothing is lost — whoever ` +
         `posted it can simply post again.\n\n` +
         `**Cancelling early.** Open **🎒 Inventory** — if you currently have a listing open, a **🗑️ Cancel My ` +
-        `Open Listing** button appears there. This only cancels a listing YOU personally posted.\n\n` +
-        `Once a listing converts into a real quest, it behaves exactly like any other team quest from Page 4 — ` +
-        `same rewards, same 14-day duration, checked and collected the exact same way.`,
+        `Open Listing** button appears there. This only cancels a listing YOU personally posted.`,
     },
     {
       short: "Checking & Collecting",
@@ -980,7 +983,7 @@ function buildGuideSections(setup = {}) {
         `target.\n` +
         `3. Any quest whose target has been fully met is paid out — ${HM_EMOJI} HM and Rank XP — immediately, ` +
         `and removed.\n` +
-        `4. If you're on a team quest, it also shows the whole team's combined progress (and pays everyone out ` +
+        `4. If you're on a pool quest, it also shows the whole pool's combined progress (and pays everyone out ` +
         `if the team just finished).\n` +
         `5. If you own any 🎫 Quest Skip Tokens AND have an active solo quest, cancel buttons appear underneath ` +
         `so you can scrap a quest you don't want anymore (Page 13).\n\n` +
@@ -1044,9 +1047,9 @@ function buildGuideSections(setup = {}) {
         `**Buying one:** open ${shopCh}, press **🗃️ Items**, and pick a purchase from the dropdown — it shows ` +
         `every slot across every category you haven't maxed, with its next tier's cost and effect. It's bought ` +
         `**immediately** if you can afford it, with no confirmation step.\n\n` +
-        `**Team quests:** every Item (and Perk) you own applies automatically to any team quest you're on in ` +
+        `**Pool quests:** every Item (and Perk) you own applies automatically to any pool quest you're on in ` +
         `that category too, and stacks with what your teammates own — if two of you each own +5% Clan Chat XP ` +
-        `Bonus in Combat, the team quest pays +10% total. The one exception is Quest Expansion's EXTRA-TARGET ` +
+        `Bonus in Combat, the pool quest pays +10% total. The one exception is Quest Expansion's EXTRA-TARGET ` +
         `(not percentage) effect on skill/Boss PvM categories — a team uses whichever single member owns the ` +
         `**highest** tier, not everyone's added together, so a 4-person team can't stack up to an unreasonable ` +
         `16 required targets from one purchase each.\n\n` +
@@ -1190,7 +1193,7 @@ function buildGuideSections(setup = {}) {
         `6. If the quest fails to create for any reason after you've spent the token (you already had one of ` +
         `that type, you'd already used that slot this period, a hiscores read failed, etc.), the token is ` +
         `**automatically refunded** and the error message confirms it.\n\n` +
-        `**Team quests work too — creator only.** Whoever creates a team quest and picks its category can ` +
+        `**Pool quests work too — creator only.** Whoever creates a pool quest and picks its category can ` +
         `spend a Quest Choice Token on the team's shared target the same way, right after picking the ` +
         `category and before the team is finalized (Page 5). Teammates and anyone who later joins from the ` +
         `Looking For Group board never get this choice — only the creator — and for an open listing the pick ` +
@@ -1328,7 +1331,7 @@ function buildGuideSections(setup = {}) {
         `progress made AFTER you start the quest counts. The bot snapshots your hiscores the instant you ` +
         `confirm a quest as your "baseline"; anything before that moment doesn't count toward it.\n\n` +
         `**"Can I change a quest's category or length after starting it?"** No — cancel it (with a Skip Token, ` +
-        `for a solo quest) and start a fresh one instead. A team quest can't be cancelled by anyone once started.\n\n` +
+        `for a solo quest) and start a fresh one instead. A pool quest can't be cancelled by anyone once started.\n\n` +
         `**"Why do I need to press Check Quests & Collect — can't it just pay me automatically?"** The bot ` +
         `deliberately doesn't watch your hiscores continuously, it only reads them when you ask, to keep ` +
         `hiscores lookups reasonable. There's no downside to pressing it often — do it whenever you remember.\n\n` +
@@ -1347,7 +1350,7 @@ function buildGuideSections(setup = {}) {
         `automatically refunded if the action you tried to use them for fails. If you believe one was lost ` +
         `anyway, bring it to a staff member with the details so they can check the log.\n\n` +
         `**"Where do I see everyone else's progress?"** The quest board lists every currently active solo and ` +
-        `team quest clan-wide, and ${dbCh} shows a running leaderboard, ranked by total HM earned, of ` +
+        `pool quest clan-wide, and ${dbCh} shows a running leaderboard, ranked by total HM earned, of ` +
         `completions and balances for every registered member.\n\n` +
         `Still stuck on something this guide didn't cover? Ask in the server — if it comes up more than once, ` +
         `it probably belongs on this page.`,

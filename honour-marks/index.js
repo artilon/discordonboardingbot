@@ -19,11 +19,11 @@ const { config, assertConfig } = require("./src/config");
 const { getSupabase, getConfigValue, setConfigValue } = require("./src/db");
 const { getRankForXp, formatRankProgress } = require("./src/ranks");
 const {
-  TREES, TREE_BY_KEY, QUEST_TREES, PARTY_SIZES, PARTY_DIFFICULTY, PARTY_DIFFICULTIES,
+  TREES, TREE_BY_KEY, QUEST_TREES, PARTY_SIZES, PARTY_DIFFICULTY, PARTY_DIFFICULTIES, LFG_EXPIRY_HOURS,
   SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES,
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActivePartyQuestsForUser,
-  cancelSoloQuest, createPartyQuest, creditHm,
+  cancelSoloQuest, createPartyQuest, joinPoolQuest, creditHm,
   createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams, getOpenTeamForUser,
   diffProgress, fetchHiscores, cleanRsn, soloHmReward, partyHmReward,
   soloTargetPool, partyTargetPool, buildPartyTargets, treeKind,
@@ -40,7 +40,7 @@ const {
   boostOwnedInventoryLine, boostActiveInventoryLine,
   getBalance, getPerks, getPerkTier, getItems, getItemTier, getItemTiers, getInventory, getActiveBoosts,
   buyPerk, buyItem, buyBoost, buyConsumable, grantConsumable, consumeItem, activateBoost,
-  createSoloQuestWithChoiceToken, createPartyQuestWithChoiceToken, createOpenTeamWithChoiceToken,
+  createSoloQuestWithChoiceToken,
   buildSoloQuestPreviewWithChoiceToken,
   PRESTIGE_COST, PRESTIGE_EMOJI, isPrestiged, getPrestigedSet, buyPrestige,
 } = require("./src/shop");
@@ -103,47 +103,6 @@ function questProgressEmbed(quest, progress) {
     .setFooter({ text: isSkill ? "Skill XP gained since the quest started" : "Kills gained since the quest started" });
 }
 
-// ── Team quest hand-pick (Quest Choice Token) pending state ────────────────
-// A team creator's hand-picked target has to survive several interaction
-// hops — pick target, then choose Pick Teammates vs Post Open Listing, then
-// pick members or post — before the quest or listing is actually created.
-// The picked keys (up to 4 boss keys for a hand-picked quad) are too long to
-// safely round-trip through Discord's 100-character customId budget, so
-// they're kept here instead, the same way `pendingRefresh` above already
-// keeps transient state in memory (this process is single-instance).
-// Keyed by `${guildId}:${creatorUserId}` so only the creator who made the
-// pick can ever have it read back — teammates/joiners never touch this Map.
-const pendingTeamPicks = new Map(); // key -> { size, difficulty, tree, picks, tokenConsumed, ts }
-const TEAM_PICK_TTL_MS = 15 * 60 * 1000;
-
-function teamPickKey(guildId, userId) {
-  return `${guildId}:${userId}`;
-}
-
-/** Stores (or clears, when picks is null) the creator's pending hand-pick
- *  for the team they're currently building. Starting a fresh category pick
- *  always clears whatever was here before, so nothing stale can leak into a
- *  different team later. */
-function setPendingTeamPick(guildId, userId, size, difficulty, tree, picks, tokenConsumed) {
-  const key = teamPickKey(guildId, userId);
-  if (!picks) { pendingTeamPicks.delete(key); return; }
-  pendingTeamPicks.set(key, { size, difficulty, tree, picks, tokenConsumed, ts: Date.now() });
-}
-
-/** Reads back (and clears) a pending hand-pick at the moment the team is
- *  actually finalized. Returns `{ picks, tokenConsumed }`, or null if there
- *  isn't one, it's gone stale (TTL), or it was made for a different
- *  size/difficulty/category than what's being finalized now (e.g. the
- *  creator backed all the way out and started over). */
-function takePendingTeamPick(guildId, userId, size, difficulty, tree) {
-  const key = teamPickKey(guildId, userId);
-  const entry = pendingTeamPicks.get(key);
-  pendingTeamPicks.delete(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > TEAM_PICK_TTL_MS) return null;
-  if (entry.size !== size || entry.difficulty !== difficulty || entry.tree !== tree) return null;
-  return { picks: entry.picks, tokenConsumed: entry.tokenConsumed };
-}
 
 // ── Boss/Raid confirm-or-cancel preview (solo) ──────────────────────────────
 // "Some members getting bosses they don't have completed" — a Boss or Raid
@@ -290,8 +249,6 @@ async function finalizePickSession(interaction, session) {
 
   if (mode === "solo_target") return handlePickTarget(interaction, questType, tree, picks, difficulty);
   if (mode === "solo_raid") return handleCreateSolo(interaction, questType, tree, picks, false);
-  if (mode === "team_target") return handleTeamPickTarget(interaction, size, difficulty, tree, picks);
-  if (mode === "team_raid") return handleTeamRaidPickTarget(interaction, size, difficulty, tree, picks);
   return interaction.update({ embeds: [emptyPage("Something went wrong", "That picker session is no longer valid — please start over.").embed], components: [] });
 }
 
@@ -384,6 +341,20 @@ async function deletePanelMessages(guildId, channel, panelKey) {
   }
 }
 
+/** Whether any open (unexpired) Looking For Group listings exist. */
+async function hasOpenListings(guildId) {
+  const supabase = getSupabase();
+  if (!supabase) return false;
+  const cutoff = new Date(Date.now() - LFG_EXPIRY_HOURS * 3600000).toISOString();
+  const { data } = await supabase
+    .from("hm_lfg_posts")
+    .select("id")
+    .eq("guild_id", guildId)
+    .gte("created_at", cutoff)
+    .limit(1);
+  return (data || []).length > 0;
+}
+
 /**
  * syncPanel() only ever EDITS an existing message in place — editing never
  * moves a message's position in a Discord channel, so simply changing the
@@ -446,7 +417,14 @@ async function refreshPanels(guildId) {
     // board (one shared monthly quest + any active clan-wide boost) leads
     // the channel, then the Looking For Group board, then the quest board.
     await syncPanel(guildId, questsCh, "clan_pool", await renderClanPool(guildId));
-    await syncPanel(guildId, questsCh, "open_teams", await renderOpenTeams(guildId));
+    // The Looking For Group board only posts when there's an open team
+    // quest listing to fill. Pool quests don't use listings, so the board
+    // stays hidden unless someone posts a team quest listing.
+    if (await hasOpenListings(guildId)) {
+      await syncPanel(guildId, questsCh, "open_teams", await renderOpenTeams(guildId));
+    } else {
+      await deletePanelMessages(guildId, questsCh, "open_teams").catch(() => {});
+    }
     await syncPanel(guildId, questsCh, "quest_board", await renderQuestBoard(guildId, setup));
   }
   if (shopCh) {
@@ -1732,76 +1710,48 @@ async function handleCheck(interaction) {
   return interaction.editReply({ embeds: embeds.slice(0, 10), components });
 }
 
-async function handleTeamStart(interaction) {
+async function handlePoolStart(interaction) {
   const menu = new StringSelectMenuBuilder()
-    .setCustomId("hm_pick_size")
-    .setPlaceholder("Select team size…")
+    .setCustomId("hm_pick_pool_difficulty")
+    .setPlaceholder("Select a difficulty…")
     .addOptions(
-      new StringSelectMenuOptionBuilder().setLabel("Duo (2)").setValue("duo"),
-      new StringSelectMenuOptionBuilder().setLabel("Trio (3)").setValue("trio"),
-      new StringSelectMenuOptionBuilder().setLabel("Quad (4)").setValue("quad")
+      PARTY_DIFFICULTIES.map((key) => {
+        const d = PARTY_DIFFICULTY[key];
+        return new StringSelectMenuOptionBuilder()
+          .setLabel(`${d.label} — ${d.count} target${d.count === 1 ? "" : "s"}`)
+          .setDescription(`Pays ${d.mult}x the base HM and Rank XP`)
+          .setValue(key)
+          .setEmoji(d.emoji);
+      })
     );
 
   return interaction.reply({
-    embeds: [emptyPage("👥 Start a Team Quest", "Team progress combines from everyone toward one shared target. Everyone gets the full reward.").embed],
+    embeds: [emptyPage("🏊 Start a Pool Quest", "A pool quest is open to everyone — anyone can contribute to one shared total, so there's no fixed team and no odd person out. Everyone who contributes gets the full reward when it completes.").embed],
     components: [new ActionRowBuilder().addComponents(menu)],
     flags: MessageFlags.Ephemeral,
   });
 }
 
-async function handlePickSize(interaction, size) {
-  if (!PARTY_SIZES[size]) {
-    return interaction.update({ embeds: [emptyPage("Unknown size", "Try again.").embed], components: [] });
+async function handlePickPoolDifficulty(interaction, difficulty) {
+  if (!PARTY_DIFFICULTY[difficulty]) {
+    return interaction.update({ embeds: [emptyPage("Unknown difficulty", "Try again.").embed], components: [] });
   }
-  return interaction.update({
-    embeds: [
-      emptyPage(
-        "👥 Pick a Difficulty",
-        `A **${size}** quest can ask for just **one** shared target (Easy) or stack up to **three** (Hard) — ` +
-        "the more targets, the more 🏅 HM and Rank XP the whole team earns when it's done:\n\n" +
-        PARTY_DIFFICULTIES.map((key) => {
-          const d = PARTY_DIFFICULTY[key];
-          return `${d.emoji} **${d.label}** — ${d.count} target${d.count === 1 ? "" : "s"}, ${d.mult}x the base reward`;
-        }).join("\n")
-      ).embed,
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder()
-          .setCustomId(`hm_pick_team_difficulty:${size}`)
-          .setPlaceholder("Select a difficulty…")
-          .addOptions(
-            PARTY_DIFFICULTIES.map((key) => {
-              const d = PARTY_DIFFICULTY[key];
-              return new StringSelectMenuOptionBuilder()
-                .setLabel(`${d.label} — ${d.count} target${d.count === 1 ? "" : "s"}`)
-                .setDescription(`Pays ${d.mult}x the base HM and Rank XP`)
-                .setValue(key)
-                .setEmoji(d.emoji);
-            })
-          )
-      ),
-    ],
-  });
+  return renderPoolCategoryPicker(interaction, difficulty);
 }
 
-/** Renders the team category picker. Shared by the initial difficulty pick
- *  AND the "Cancel" button on a Boss/Raid team-target confirm preview —
- *  Cancel always goes back to this exact step. Defer-aware (same ternary
- *  pattern as handleTeamMode) since Cancel calls it after an async step. */
-async function renderTeamCategoryPicker(interaction, size, difficulty) {
+async function renderPoolCategoryPicker(interaction, difficulty) {
   const diffLabel = PARTY_DIFFICULTY[difficulty].label;
   const payload = {
     embeds: [
       emptyPage(
-        "👥 Pick a Category",
-        `Your **${size} • ${diffLabel}** quest targets something in this category. Everyone on the team works toward one shared total.`
+        "🏊 Pick a Category",
+        `Your **Pool • ${diffLabel}** quest targets something in this category. Anyone can join and contribute to one shared total.`
       ).embed,
     ],
     components: [
       new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
-          .setCustomId(`hm_pick_team_tree:${size}:${difficulty}`)
+          .setCustomId(`hm_pick_pool_tree:${difficulty}`)
           .setPlaceholder("Select a category…")
           .addOptions(TREES.map((t) => new StringSelectMenuOptionBuilder().setLabel(t.label).setValue(t.key).setEmoji(t.emoji)))
       ),
@@ -1810,334 +1760,50 @@ async function renderTeamCategoryPicker(interaction, size, difficulty) {
   return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
 }
 
-async function handlePickTeamDifficulty(interaction, size, difficulty) {
-  if (!PARTY_SIZES[size]) {
-    return interaction.update({ embeds: [emptyPage("Unknown size", "Try again.").embed], components: [] });
-  }
-  if (!PARTY_DIFFICULTY[difficulty]) {
-    return interaction.update({ embeds: [emptyPage("Unknown difficulty", "Try again.").embed], components: [] });
-  }
-  return renderTeamCategoryPicker(interaction, size, difficulty);
+async function handlePoolTreeChosen(interaction, difficulty, tree) {
+  if (!PARTY_DIFFICULTY[difficulty]) difficulty = "easy";
+  return handleCreatePool(interaction, difficulty, tree);
 }
 
-/**
- * After a category is picked, the person CREATING the team — and only them,
- * since everything in this flow runs on their own ephemeral message — gets
- * offered the same Quest Choice Token hand-pick solo quests already have,
- * but for the whole team's shared target. It has to happen here, before
- * either "Pick Teammates" or "Post Open Listing" below, so that an open
- * listing is born with its target already locked in and visible to anyone
- * on the Looking For Group board deciding whether to join (see
- * `renderOpenTeams`). Nothing changes for a creator who doesn't own one —
- * straight to handleTeamMode, same as before this feature existed.
- */
-async function handleTeamTreeChosen(interaction, size, difficulty, tree) {
-  // A fresh category pick always discards anything left over from an
-  // abandoned attempt, so a stale hand-pick can never leak into this team.
-  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, null, false);
-
-  // Same exception as the solo flow: a team Raids quest is always picked by
-  // the creator, never rolled at random — a random raid could easily be one
-  // the team can't actually do together — and it never touches a Quest
-  // Choice Token, token or not. See handleTreeChosen for the full reasoning.
-  // This still applies at every difficulty — Hard just means all 3 raids.
-  if (treeKind(tree) === "raid") {
-    return handleTeamChoose(interaction, size, difficulty, tree, { free: true });
-  }
-
-  const inv = await getInventory(interaction.user.id);
-  const hasChoiceToken = inv.some((i) => i.tree === "quest_choice_token" && i.boost_tier === 0 && i.quantity > 0);
-
-  if (!hasChoiceToken) {
-    return handleTeamMode(interaction, size, difficulty, tree);
-  }
-
-  const count = PARTY_DIFFICULTY[difficulty].count;
-  const targetWord = count === 1 ? "target" : `${count} targets`;
-  return interaction.update({
-    embeds: [
-      emptyPage(
-        "🎯 You own a Quest Choice Token",
-        `Spend it to hand-pick this **${size} • ${PARTY_DIFFICULTY[difficulty].label}**'s exact shared ${targetWord} before the team is finalized — ` +
-        "anyone who later joins from the Looking For Group board will see it up front — " +
-        "or skip it and let the bot roll at random. The token stays in your inventory either way if you skip it."
-      ).embed,
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`hm_team_choose:${size}:${difficulty}:${tree}`).setLabel("🎯 Hand-pick (uses token)").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`hm_team_random:${size}:${difficulty}:${tree}`).setLabel("🎲 Random (keep token)").setStyle(ButtonStyle.Secondary)
-      ),
-    ],
-  });
-}
-
-/** Shows the pool for this category so the creator can pick the team's own
- *  target(s). `free` marks the mandatory, no-token Raids path (see
- *  handleTeamTreeChosen) — it routes the resulting select menu to
- *  handleTeamRaidPickTarget instead of the paid handleTeamPickTarget, so no
- *  Quest Choice Token is ever touched for a Raids pick. */
-async function handleTeamChoose(interaction, size, difficulty, tree, { free = false } = {}) {
-  const spec = partyTargetPool(tree, size, difficulty);
-  if (!spec || !spec.pool.length) {
-    return handleTeamMode(interaction, size, difficulty, tree);
-  }
-
-  startPickSession(interaction.guildId, interaction.user.id, { mode: free ? "team_raid" : "team_target", size, difficulty, tree, spec });
-  return interaction.update(renderPickSession(getPickSession(interaction.guildId, interaction.user.id)));
-}
-
-/**
- * Shows what the team's shared target is about to be and requires the
- * creator to Confirm before the pick is actually locked in for the team —
- * same reasoning as the solo Boss/Raid preview: teammates were ending up on
- * bosses nobody on the team could do. The pick itself is stashed in the same
- * `pendingTeamPicks` map a real hand-pick already uses, so Confirm just
- * continues into the ordinary Pick Teammates / Post Open Listing flow
- * (handleTeamMode) exactly as if the creator had hand-picked it themselves —
- * no separate insert path is needed. Cancel clears the stash and goes back
- * to category selection, free, same as the solo side.
- */
-async function renderTeamTargetConfirm(interaction, size, difficulty, tree, picks) {
-  const treeLabel = TREE_BY_KEY[tree]?.label || tree;
-  const diffLabel = PARTY_DIFFICULTY[difficulty]?.label || difficulty;
-  const kind = treeKind(tree);
-  const list = picks.map((p) => targetLabel(kind, p)).join(", ");
-
-  const payload = {
-    embeds: [
-      emptyPage(
-        kind === "raid" ? "⚔️ Confirm The Team's Raid" : "🎯 Confirm The Team's Target",
-        `**${size} • ${diffLabel} • ${treeLabel}**\n\n` +
-        `🎯 **${list}**\n\n` +
-        "Confirm to lock this in and continue building the team, or cancel to go back and pick a different category — no cost either way."
-      ).embed,
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`hm_team_target_confirm:${size}:${difficulty}:${tree}`).setLabel("✅ Confirm").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`hm_team_target_cancel:${size}:${difficulty}:${tree}`).setLabel("✖ Cancel").setStyle(ButtonStyle.Danger)
-      ),
-    ],
-  };
-  return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
-}
-
-async function handleTeamTargetConfirm(interaction, size, difficulty, tree) {
-  return handleTeamMode(interaction, size, difficulty, tree);
-}
-
-async function handleTeamTargetCancel(interaction, size, difficulty, tree) {
-  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
-  // A preview pick never spends a token (a random roll is free; a Raids pick
-  // is always free; and a token hand-pick's own Cancel is handled the same
-  // way here too, below) — so there's nothing to refund, only to clear.
-  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, null, false);
-  return renderTeamCategoryPicker(interaction, size, difficulty);
-}
-
-/**
- * The creator skipped the hand-pick on a Boss category — rolls a preview
- * target right now (using only the creator's own hiscores as the safety
- * baseline, since teammates aren't chosen yet) and shows it for
- * confirm-or-cancel, same as a solo Boss quest. Skill and Minigame
- * categories are unaffected — they still roll at team-finalization time,
- * same as before this feature existed.
- */
-async function handleTeamRandom(interaction, size, difficulty, tree) {
-  if (treeKind(tree) !== "boss") {
-    return handleTeamMode(interaction, size, difficulty, tree);
-  }
-
-  if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
-  const member = await getMember(interaction.user.id);
-  let baselines = null;
-  if (member?.rsn) {
-    const snap = await fetchHiscores(member.rsn);
-    if (snap) baselines = { [interaction.user.id]: snap };
-  }
-
-  const targets = buildPartyTargets(tree, size, difficulty, baselines, null, null);
-  const picks = Object.keys(targets.bosses);
-  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, picks, false);
-  return renderTeamTargetConfirm(interaction, size, difficulty, tree, picks);
-}
-
-/** The creator confirmed their picks: spend the token now (same timing as
- *  the solo flow) and stash the result for whichever finalize step the
- *  creator reaches next (handleCreateTeam or handlePostOpenTeam). If the
- *  token is somehow already gone (e.g. spent in another tab a moment ago),
- *  fall back to the random flow rather than leaving the creator stuck. A
- *  Boss hand-pick also goes through the same confirm-or-cancel preview as
- *  everything else in this category; Skill/Minigame hand-picks don't need
- *  one (the picker UI they just used already showed exactly what they
- *  chose), so they go straight into handleTeamMode as before. */
-async function handleTeamPickTarget(interaction, size, difficulty, tree, picks) {
+async function handleCreatePool(interaction, difficulty, tree) {
   await interaction.deferUpdate();
-  const used = await consumeItem(interaction.user.id, "quest_choice_token");
-  const finalPicks = used ? picks : null;
-  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, finalPicks, used);
-  if (used && treeKind(tree) === "boss") {
-    return renderTeamTargetConfirm(interaction, size, difficulty, tree, finalPicks);
-  }
-  return handleTeamMode(interaction, size, difficulty, tree);
-}
-
-/** The creator confirmed which raid(s) the team targets. No token is ever
- *  involved — a Raids pick is mandatory, not a paid extra. Raids always get
- *  the confirm-or-cancel preview, same reasoning as the solo side. */
-async function handleTeamRaidPickTarget(interaction, size, difficulty, tree, picks) {
-  await interaction.deferUpdate();
-  setPendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree, picks, false);
-  return renderTeamTargetConfirm(interaction, size, difficulty, tree, picks);
-}
-
-
-/** After the category is chosen, offer the two ways to fill a team: pick
- *  everyone yourself right now (closed group), or post an open listing on
- *  the Looking For Group board and let people join (see handlePostOpenTeam). */
-async function handleTeamMode(interaction, size, difficulty, tree) {
-  const treeLabel = TREE_BY_KEY[tree]?.label || tree;
-  const diffLabel = PARTY_DIFFICULTY[difficulty]?.label || difficulty;
-  // Reached either directly from a plain category pick (not yet
-  // acknowledged) or via handleTeamPickTarget/handleTeamRandom, both of
-  // which already deferred the update — so editReply has to be used there
-  // instead of a second update().
-  const pending = pendingTeamPicks.get(teamPickKey(interaction.guildId, interaction.user.id));
-  const targetNote = pending && pending.size === size && pending.difficulty === difficulty && pending.tree === tree
-    ? `\n\n🎯 **Target locked in:** ${pending.picks.map((p) => targetLabel(treeKind(tree), p)).join(", ")}`
-    : "";
-
-  const payload = {
-    embeds: [
-      emptyPage(
-        "👥 Pick Your Team Or Post It Publicly",
-        `**${size} • ${diffLabel} • ${treeLabel}** — how do you want to fill it?\n\n` +
-        "**Pick Teammates** — choose everyone yourself and start right away.\n" +
-        "**Post Open Listing** — recruit on the **Looking For Group** board instead; " +
-        "the quest starts automatically the moment it fills." +
-        targetNote
-      ).embed,
-    ],
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`hm_team_pick_members:${size}:${difficulty}:${tree}`).setLabel("Pick Teammates").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`hm_team_post_open:${size}:${difficulty}:${tree}`).setLabel("📋 Post Open Listing").setStyle(ButtonStyle.Success)
-      ),
-    ],
-  };
-
-  return (interaction.deferred || interaction.replied) ? interaction.editReply(payload) : interaction.update(payload);
-}
-
-async function handlePickTeamMembers(interaction, size, difficulty, tree) {
-  const needed = PARTY_SIZES[size] - 1; // you count as the first member
-  const picker = new UserSelectMenuBuilder()
-    .setCustomId(`hm_team_members:${size}:${difficulty}:${tree}`)
-    .setPlaceholder(`Pick ${needed} teammate${needed === 1 ? "" : "s"}…`)
-    .setMinValues(needed)
-    .setMaxValues(needed);
-
-  return interaction.update({
-    embeds: [
-      emptyPage(
-        "👥 Pick Your Team",
-        `A **${size}** needs ${PARTY_SIZES[size]} members total, so pick ${needed} more. ` +
-        `Everyone must have run \`/register\` first.`
-      ).embed,
-    ],
-    components: [new ActionRowBuilder().addComponents(picker)],
-  });
-}
-
-/** Posts an open listing instead of picking members directly. */
-async function handlePostOpenTeam(interaction, size, difficulty, tree) {
-  await interaction.deferUpdate();
-  const pending = takePendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree);
-  const picks = pending?.picks || null;
-  const tokenConsumed = pending?.tokenConsumed || false;
-
-  // createOpenTeamWithChoiceToken (src/shop.js) refunds the Quest Choice
-  // Token on ANY rejection reason when tokenConsumed is true, same rule as
-  // the solo flow — the token was already spent back when the creator
-  // confirmed their picks, well before this post attempt.
-  const result = await createOpenTeamWithChoiceToken({
-    guildId: interaction.guildId, posterId: interaction.user.id, size, difficulty, tree, picks, tokenConsumed,
-  });
-
-  if (result.error) {
-    const refundNote = result.refunded
-      ? "\n\n_Your Quest Choice Token was not spent — it's back in your inventory._"
-      : "";
-    return interaction.editReply({ embeds: [emptyPage("Couldn't post that listing", result.error + refundNote).embed], components: [] });
-  }
-
-  const targetNote = picks?.length
-    ? `\n\n🎯 **Target locked in:** ${picks.map((p) => targetLabel(treeKind(tree), p)).join(", ")} — visible to anyone browsing the board.`
-    : "";
-
-  scheduleRefresh(interaction.guildId);
-  return interaction.editReply({
-    embeds: [
-      emptyPage(
-        "📋 Listing posted",
-        `**${size} • ${PARTY_DIFFICULTY[difficulty].label} • ${TREE_BY_KEY[tree].label}** is now open on the **Looking For Group** board, under the quest board.\n\n` +
-        `Needs ${PARTY_SIZES[size] - 1} more. It starts automatically the moment it fills, ` +
-        `or expires in 24 hours if it doesn't. You can cancel it early from the LFG board.` +
-        targetNote
-      ).embed,
-    ],
-    components: [],
-  });
-}
-
-async function handleCreateTeam(interaction, size, difficulty, tree) {
-  await interaction.deferUpdate();
-  const picked = interaction.values.filter((id) => id !== interaction.user.id);
-  const members = [interaction.user.id, ...picked];
-
-  const pending = takePendingTeamPick(interaction.guildId, interaction.user.id, size, difficulty, tree);
-  const picks = pending?.picks || null;
-  const tokenConsumed = pending?.tokenConsumed || false;
-
-  // createPartyQuestWithChoiceToken (src/shop.js) refunds the Quest Choice
-  // Token on ANY rejection reason when tokenConsumed is true, same rule as
-  // the solo flow — the token was already spent back when the creator
-  // confirmed their picks, before teammates were even chosen.
-  const result = await createPartyQuestWithChoiceToken({
+  const result = await createPartyQuest({
     guildId: interaction.guildId,
-    members,
+    members: [interaction.user.id],
     tree,
-    size,
+    size: "pool",
     difficulty,
-    picks,
-    tokenConsumed,
-    userId: interaction.user.id,
+    picks: null,
   });
 
   if (result.error) {
-    const refundNote = result.refunded
-      ? "\n\n_Your Quest Choice Token was not spent — it's back in your inventory._"
-      : "";
-    return interaction.editReply({ embeds: [emptyPage("Couldn't start that quest", result.error + refundNote).embed], components: [] });
+    return interaction.editReply({ embeds: [emptyPage("Couldn't start that pool quest", result.error).embed], components: [] });
   }
-
-  const targetNote = picks?.length
-    ? `\n\n🎯 **Hand-picked target:** ${picks.map((p) => targetLabel(treeKind(tree), p)).join(", ")}`
-    : "";
 
   scheduleRefresh(interaction.guildId);
   return interaction.editReply({
     embeds: [
       emptyPage(
-        "👥 Team quest started",
-        `**${size} • ${PARTY_DIFFICULTY[difficulty].label} • ${TREE_BY_KEY[tree].label}**\n\n` +
-        `${members.map((m) => `<@${m}>`).join(", ")}\n\n` +
-        "Progress combines from everyone. Press **Check Quests & Collect** on the quest board when you think you've hit the target." +
-        targetNote
+        "🏊 Pool quest started",
+        `**Pool • ${PARTY_DIFFICULTY[difficulty].label} • ${TREE_BY_KEY[tree].label}**\n\n` +
+        `You're the first in the pool. Anyone can join from the quest board and contribute to the shared total — ` +
+        `everyone who contributes gets paid when it completes.\n\n` +
+        "Press **Check Quests & Collect** on the quest board when you think you've hit the target."
       ).embed,
     ],
     components: [],
+  });
+}
+
+async function handleJoinPoolQuest(interaction, questId) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = await joinPoolQuest({ guildId: interaction.guildId, questId: Number(questId), userId: interaction.user.id });
+  if (result.error) {
+    return interaction.editReply({ content: result.error });
+  }
+  scheduleRefresh(interaction.guildId);
+  return interaction.editReply({
+    content: `✅ You're in the pool quest. Your progress from now on counts toward the shared total — everyone who contributes gets paid when it completes.`,
   });
 }
 
@@ -2742,13 +2408,13 @@ async function handleInventoryUseChoiceToken(interaction) {
         "🎯 Use Your Quest Choice Token",
         "Your Quest Choice Token lets you hand-pick a quest's exact target instead of letting the bot roll one at " +
         "random. Start a quest below and you'll be offered the hand-pick option once you choose a category — for " +
-        "a team quest, only whoever creates the team gets the offer."
+        "a pool quest, only whoever creates the pool gets the offer."
       ).embed,
     ],
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("hm_quest_start").setLabel("📋 Start a Solo Quest").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("hm_team_start").setLabel("👥 Start a Team Quest").setStyle(ButtonStyle.Primary)
+        new ButtonBuilder().setCustomId("hm_pool_start").setLabel("🏊 Start a Pool Quest").setStyle(ButtonStyle.Primary)
       ),
     ],
     flags: MessageFlags.Ephemeral,
@@ -3023,30 +2689,6 @@ async function routeInteraction(interaction) {
         const [, type, questId] = btnId.split(":");
         return await handleForceCompleteConfirm(interaction, type, questId);
       }
-      if (btnId.startsWith("hm_team_choose:")) {
-        const [, size, difficulty, tree] = btnId.split(":");
-        return await handleTeamChoose(interaction, size, difficulty, tree);
-      }
-      if (btnId.startsWith("hm_team_random:")) {
-        const [, size, difficulty, tree] = btnId.split(":");
-        return await handleTeamRandom(interaction, size, difficulty, tree);
-      }
-      if (btnId.startsWith("hm_team_target_confirm:")) {
-        const [, size, difficulty, tree] = btnId.split(":");
-        return await handleTeamTargetConfirm(interaction, size, difficulty, tree);
-      }
-      if (btnId.startsWith("hm_team_target_cancel:")) {
-        const [, size, difficulty, tree] = btnId.split(":");
-        return await handleTeamTargetCancel(interaction, size, difficulty, tree);
-      }
-      if (btnId.startsWith("hm_team_pick_members:")) {
-        const [, size, difficulty, tree] = btnId.split(":");
-        return await handlePickTeamMembers(interaction, size, difficulty, tree);
-      }
-      if (btnId.startsWith("hm_team_post_open:")) {
-        const [, size, difficulty, tree] = btnId.split(":");
-        return await handlePostOpenTeam(interaction, size, difficulty, tree);
-      }
 
       switch (interaction.customId) {
         case "hm_pick_session_prev": return await handlePickSessionPage(interaction, -1);
@@ -3056,7 +2698,7 @@ async function routeInteraction(interaction) {
         case "hm_solo_target_cancel": return await handleSoloTargetCancel(interaction);
         case "hm_buy_prestige": return await handleBuyPrestige(interaction);
         case "hm_quest_start": return await handleQuestStart(interaction);
-        case "hm_team_start": return await handleTeamStart(interaction);
+        case "hm_pool_start": return await handlePoolStart(interaction);
         case "hm_check": return await handleCheck(interaction);
         case "hm_claim_role": return await handleClaimRole(interaction);
         case "hm_drop_role": return await handleDropRole(interaction);
@@ -3111,16 +2753,15 @@ async function routeInteraction(interaction) {
       if (id === "hm_buy_consumable") {
         return await handleBuyConsumable(interaction, interaction.values[0]);
       }
-      if (id === "hm_pick_size") {
-        return await handlePickSize(interaction, interaction.values[0]);
+      if (id === "hm_pick_pool_difficulty") {
+        return await handlePickPoolDifficulty(interaction, interaction.values[0]);
       }
-      if (id.startsWith("hm_pick_team_difficulty:")) {
-        const size = id.split(":")[1];
-        return await handlePickTeamDifficulty(interaction, size, interaction.values[0]);
+      if (id.startsWith("hm_pick_pool_tree:")) {
+        const difficulty = id.split(":")[1];
+        return await handlePoolTreeChosen(interaction, difficulty, interaction.values[0]);
       }
-      if (id.startsWith("hm_pick_team_tree:")) {
-        const [, size, difficulty] = id.split(":");
-        return await handleTeamTreeChosen(interaction, size, difficulty, interaction.values[0]);
+      if (id === "hm_join_pool") {
+        return await handleJoinPoolQuest(interaction, interaction.values[0]);
       }
       if (id === "hm_lfg_join") {
         return await handleLfgJoin(interaction, interaction.values[0]);
@@ -3138,11 +2779,6 @@ async function routeInteraction(interaction) {
     }
 
     if (interaction.isUserSelectMenu()) {
-      const id = interaction.customId;
-      if (id.startsWith("hm_team_members:")) {
-        const [, size, difficulty, tree] = id.split(":");
-        return await handleCreateTeam(interaction, size, difficulty, tree);
-      }
       return;
     }
 

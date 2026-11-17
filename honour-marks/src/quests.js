@@ -161,7 +161,7 @@ const SOLO_SKILL_XP = {
 // Flat HM. Team quests pay each member the same amount, because the target is
 // a single shared total — whoever did the most work doesn't change the reward.
 const SOLO_HM = { daily: 50, weekly: 150, monthly: 400 };
-const PARTY_HM_BY_SIZE = { duo: 250, trio: 350, quad: 450 };
+const PARTY_HM_BY_SIZE = { duo: 250, trio: 350, quad: 450, pool: 613 };
 
 // A team's DIFFICULTY picks how many shared targets the quest asks for —
 // Easy just one, Medium two, Hard three — not the team's SIZE, which only
@@ -184,6 +184,16 @@ const PARTY_REQUIREMENTS = {
   boss:     { duo: { kc: 150 },    trio: { kc: 250 },     quad: { kc: 350 } },
   raid:     { duo: { kc: 15 },     trio: { kc: 30 },      quad: { kc: 45 } },
   minigame: { duo: { kc: 50 },     trio: { kc: 125 },     quad: { kc: 200 } },
+};
+
+// Pool quests replace fixed team quests: anyone can contribute to one
+// shared total (no odd person out). The requirement is a regular trio
+// team's total increased by 1.75x.
+const POOL_REQUIREMENTS = {
+  skill:    { xp: 350000 },  // 200,000 x 1.75
+  boss:     { kc: 438 },     // 250 x 1.75
+  raid:     { kc: 53 },      // 30 x 1.75
+  minigame: { kc: 219 },     // 125 x 1.75
 };
 
 const QUEST_DURATION_DAYS = { daily: 1, weekly: 7, monthly: 30 };
@@ -691,7 +701,7 @@ function applyItemEffects(kind, baseCount, baseValue, effects = {}, poolLength =
  */
 function partyTargetPool(tree, size, difficulty) {
   const kind = treeKind(tree);
-  const req = PARTY_REQUIREMENTS[kind]?.[size];
+  const req = size === "pool" ? POOL_REQUIREMENTS[kind] : PARTY_REQUIREMENTS[kind]?.[size];
   if (!req) return null;
   const count = PARTY_DIFFICULTY[difficulty]?.count || PARTY_DIFFICULTY.easy.count;
 
@@ -898,8 +908,9 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
   if (!supabase) return { error: "Database unavailable." };
   if (!TREE_BY_KEY[tree]) return { error: "Unknown category." };
 
+  const isPool = size === "pool";
   const expected = { duo: 2, trio: 3, quad: 4 }[size];
-  if (!expected) return { error: "Unknown team size." };
+  if (!isPool && !expected) return { error: "Unknown team size." };
 
   // Falls back to "easy" (one target, the base reward) rather than erroring —
   // difficulty is a newer, optional dimension layered on top of size/tree,
@@ -907,8 +918,14 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
   if (!PARTY_DIFFICULTY[difficulty]) difficulty = "easy";
 
   const unique = [...new Set(members)].filter(Boolean);
-  if (unique.length !== expected) {
+  // Pool quests have an open roster — the creator starts it and anyone can
+  // join later — so there's no exact count to enforce. Fixed teams must
+  // have exactly their size.
+  if (!isPool && unique.length !== expected) {
     return { error: `A ${size} needs exactly ${expected} members (got ${unique.length}).` };
+  }
+  if (isPool && unique.length < 1) {
+    return { error: "A pool quest needs at least one member to start." };
   }
 
   // Every member needs a registered RSN, because progress is read per-RSN.
@@ -983,6 +1000,51 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
     return { error: "Couldn't create that team quest. Try again in a moment." };
   }
   return { ok: true };
+}
+
+/**
+ * Join an active pool quest: adds the member to the open roster with a
+ * fresh hiscores baseline, so only progress made after joining counts.
+ * Anyone can join a pool quest (no fixed team size, no odd person out).
+ */
+async function joinPoolQuest({ guildId, questId, userId }) {
+  const supabase = getSupabase();
+  if (!supabase) return { error: "Database unavailable." };
+
+  const { data: quest } = await supabase
+    .from("hm_party_quests")
+    .select("*")
+    .eq("id", questId)
+    .eq("guild_id", guildId)
+    .maybeSingle();
+  if (!quest) return { error: "That pool quest no longer exists." };
+  if (quest.size !== "pool") return { error: "That's not a pool quest." };
+  if (new Date(quest.expires_at).getTime() < Date.now()) {
+    return { error: "That pool quest has expired." };
+  }
+  if ((quest.members || []).includes(userId)) {
+    return { error: "You're already in this pool quest." };
+  }
+
+  const member = await getMember(userId);
+  if (!member?.rsn) return { error: "Register your RuneScape name first." };
+
+  const activeCount = (await getActivePartyQuestsForUser(userId)).length;
+  if (activeCount >= MAX_ACTIVE_PARTY_QUESTS) {
+    return { error: `You're already on ${MAX_ACTIVE_PARTY_QUESTS} team quests — the most allowed at once.` };
+  }
+
+  const snap = await fetchHiscores(member.rsn);
+  if (!snap) return { error: `Couldn't read hiscores for **${member.rsn}**.` };
+
+  const members = [...(quest.members || []), userId];
+  const baseline = { ...(quest.baseline || {}), [userId]: snap };
+  const { error } = await supabase
+    .from("hm_party_quests")
+    .update({ members, baseline })
+    .eq("id", questId);
+  if (error) return { error: "Couldn't join that pool quest. Try again in a moment." };
+  return { ok: true, quest };
 }
 
 // ── Looking For Group (open team listings) ─────────────────────────────────
@@ -1244,7 +1306,7 @@ async function bumpCounts({ guildId, userId, questType, size }) {
 module.exports = {
   TREES, TREE_BY_KEY, QUEST_TREES, SKILL_TREE, SKILLS_BY_TREE,
   BOSS_POOL, BOSS_GROUPS, BOSS_GROUP_MEMBERS, bossKeys, RAID_BOSSES, MINIGAME_BOSSES,
-  SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY, PARTY_DIFFICULTIES, PARTY_SIZES, LFG_EXPIRY_HOURS,
+  SOLO_HM, PARTY_HM_BY_SIZE, PARTY_DIFFICULTY, PARTY_DIFFICULTIES, PARTY_SIZES, PARTY_REQUIREMENTS, POOL_REQUIREMENTS, LFG_EXPIRY_HOURS,
   SOLO_SKILL_DIFFICULTY, SOLO_SKILL_DIFFICULTIES, SOLO_SKILL_XP,
   QUEST_DURATION_DAYS, PARTY_DURATION_DAYS, RESET_PERIOD, SOLO_QUEST_PERIOD_CAP, SOLO_RAID_MIN_KC,
   buildSoloTargets, buildPartyTargets, soloTargetPool, partyTargetPool, treeKind,
@@ -1253,7 +1315,7 @@ module.exports = {
   getMember, getMemberByRsn, getCounts,
   getActiveSoloQuests, getActiveSoloQuest, getActivePartyQuestsForUser, MAX_ACTIVE_PARTY_QUESTS,
   createSoloQuest, buildSoloQuestPayload, insertSoloQuestPayload,
-  cancelSoloQuest, createPartyQuest, creditHm, bumpCounts,
+  cancelSoloQuest, createPartyQuest, joinPoolQuest, creditHm, bumpCounts,
   getOpenTeams, getOpenTeamForUser, createOpenTeam, cancelOpenTeam, joinOpenTeam, sweepExpiredOpenTeams,
   awardRankXp,
   diffProgress, fetchHiscores, cleanRsn,
