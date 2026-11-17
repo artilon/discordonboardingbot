@@ -163,7 +163,8 @@ async function renderDatabase(guildId) {
       `**#${i + 1} — ${r.rsn}**${prestigeTag} — ${HM_EMOJI} \`${(Number(r.total_earned) || 0).toLocaleString()}\` earned • ` +
       `\`${(Number(r.balance) || 0).toLocaleString()}\` held\n` +
       `┗ Quests \`${total}\` • D \`${r.solo_daily || 0}\` · W \`${r.solo_weekly || 0}\` · M \`${r.solo_monthly || 0}\` · ` +
-      `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\``
+      `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\` · ` +
+      `Bounty \`${r.bounty || 0}\``
     );
   });
 
@@ -173,10 +174,11 @@ async function renderDatabase(guildId) {
       (Number(r.solo_monthly) || 0) + (Number(r.duo) || 0) + (Number(r.trio) || 0) + (Number(r.quad) || 0),
     0
   );
+  const totalBounties = rows.reduce((s, r) => s + (Number(r.bounty) || 0), 0);
 
   const header =
     `**Members:** \`${rows.length}\` • **HM in circulation:** \`${totalHm.toLocaleString()}\` • ` +
-    `**Quests completed:** \`${totalQuests}\`\n` +
+    `**Quests completed:** \`${totalQuests}\` • **Bounties completed:** \`${totalBounties}\`\n` +
     `Ranked by total HM earned — most earned at the top.\n\n`;
 
   const chunks = chunkLines(lines, header);

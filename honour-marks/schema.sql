@@ -359,6 +359,13 @@ party as (
          coalesce(sum(coalesce((rank_xp_breakdown ->> m)::numeric, 0)), 0)  as party_rank_xp
   from public.hm_party_quest_completions, unnest(members) as m
   group by m
+),
+bounty as (
+  -- Completed bounties per member, from the bounty acceptance ledger.
+  select user_id, count(*) as bounty
+  from public.hm_bounty_acceptances
+  where completed
+  group by user_id
 )
 select
   mem.user_id,
@@ -374,6 +381,7 @@ select
   coalesce(p.duo, 0)                                       as duo,
   coalesce(p.trio, 0)                                      as trio,
   coalesce(p.quad, 0)                                      as quad,
+  coalesce(bo.bounty, 0)                                   as bounty,
   coalesce(s.solo_total, 0) + coalesce(p.duo, 0) + coalesce(p.trio, 0) + coalesce(p.quad, 0)
                                                            as quests_total,
   coalesce(s.solo_hm, 0) + coalesce(p.party_hm, 0)         as hm_from_quests,
@@ -381,7 +389,8 @@ select
 from public.hm_members mem
 left join public.hm_balances b on b.user_id = mem.user_id
 left join solo s               on s.user_id = mem.user_id
-left join party p              on p.user_id = mem.user_id;
+left join party p              on p.user_id = mem.user_id
+left join bounty bo            on bo.user_id = mem.user_id;
 
 -- 15b. CLAN POOL — one shared monthly quest the whole clan works toward
 --      together (a toned-down revival of the original mimir.js Clan Pool
