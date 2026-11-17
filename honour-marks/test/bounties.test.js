@@ -119,16 +119,16 @@ function main() {
     check("embed has a title", !!embed.title);
     check("embed description names the NPC", embed.description.includes(b.npc_name));
     check("embed shows the reward", embed.description.includes(`${b.hm_reward} HM`));
-    check("embed shows requirements", b.requirements.every((r) => embed.description.includes(String(r.amount))));
+    check("embed shows requirements", b.requirements.every((r) => embed.description.includes(Number(r.amount).toLocaleString())));
     check("empty board says no hunters yet", /No hunters yet/.test(embed.description));
-    check("embed clearly labels the team size", embed.description.includes("**Team:** Team of 2 (Duo)"));
+    check("embed clearly labels the group size", embed.description.includes("**Group:** Group of 2 (Duo)"));
 
     const solo = bounties.generateBounty("solo");
     const soloEmbed = bounties.renderBountyEmbed(solo, []);
-    check("solo embed clearly labels solo", soloEmbed.description.includes("**Team:** Solo — just you"));
+    check("solo embed clearly labels solo", soloEmbed.description.includes("**Group:** Solo — just you"));
     const quad = bounties.generateBounty("quad");
     const quadEmbed = bounties.renderBountyEmbed(quad, []);
-    check("quad embed clearly labels team of 4", quadEmbed.description.includes("**Team:** Team of 4 (Quad)"));
+    check("quad embed clearly labels group of 4", quadEmbed.description.includes("**Group:** Group of 4 (Quad)"));
 
     const withAcc = bounties.renderBountyEmbed(b, [
       { user_id: "u1", displayName: "Torlokt", progressText: "5,000 / 15,000", completed: false },

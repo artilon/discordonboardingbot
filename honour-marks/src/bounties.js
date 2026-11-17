@@ -305,9 +305,9 @@ const SIZE_LABEL = { solo: "Solo", duo: "Duo", trio: "Trio", quad: "Quad" };
 // is solo or a team, and how many players the team is.
 const SIZE_TEAM_LABEL = {
   solo: "Solo — just you",
-  duo: "Team of 2 (Duo)",
-  trio: "Team of 3 (Trio)",
-  quad: "Team of 4 (Quad)",
+  duo: "Group of 2 (Duo)",
+  trio: "Group of 3 (Trio)",
+  quad: "Group of 4 (Quad)",
 };
 
 function formatRequirement(req) {
@@ -330,7 +330,7 @@ function renderBountyEmbed(bounty, acceptances = []) {
     `*"${bounty.flavor}"*`,
     "",
     `**Contract:** ${bounty.title}`,
-    `**Team:** ${teamLabel}`,
+    `**Group:** ${teamLabel}`,
     formatRequirements(bounty.requirements),
     "",
     `**Reward:** ${bounty.hm_reward} HM · ${bounty.rank_xp_reward} Rank XP`,

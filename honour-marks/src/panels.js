@@ -911,7 +911,7 @@ function buildGuideSections(setup = {}) {
         `**Step 1 — Open the bounty board.** You'll see 5 bounties at a time, each one posted by an NPC ` +
         `with a short message asking for help. The board always holds the same mix — 2 skilling, 1 slayer, ` +
         `1 boss and 1 raid — so it never floods with one kind. Every bounty is randomly solo or a team, ` +
-        `and the post says which one right at the top: **Solo — just you**, or **Team of 2/3/4**.\\n\\n` +
+        `and the post says which one right at the top: **Solo — just you**, or **Group of 2/3/4**.\\n\\n` +
         `**Step 2 — Read the request.** Every bounty tells you exactly what it needs, right on the post. ` +
         `Nothing is hidden. If it says "gain 50,000 Mining XP and 50,000 Smithing XP", that's the whole ` +
         `job — no surprises.\\n\\n` +
