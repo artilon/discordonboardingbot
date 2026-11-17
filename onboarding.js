@@ -7094,6 +7094,9 @@ async function syncOsrsRoleForMember(member) {
  * Staff/Leader roles at all. Skips the API call if it's already correct.
  */
 async function setMemberChannelAllow(channel, memberId, allowed, reason) {
+  // Some cached channels (e.g. certain voice/category states) have no
+  // permissionOverwrites object — there's nothing to override on them.
+  if (!channel.permissionOverwrites) return;
   const current = channel.permissionOverwrites.cache.get(memberId);
   if (allowed) {
     if (current && current.allow.has(PermissionFlagsBits.ViewChannel) && !current.deny.has(PermissionFlagsBits.ViewChannel)) return;
@@ -7120,6 +7123,9 @@ async function setMemberChannelAllow(channel, memberId, allowed, reason) {
  * it's already correct.
  */
 async function setMemberChannelBlock(channel, memberId, blocked, reason) {
+  // Some cached channels (e.g. certain voice/category states) have no
+  // permissionOverwrites object — there's nothing to override on them.
+  if (!channel.permissionOverwrites) return;
   const current = channel.permissionOverwrites.cache.get(memberId);
   if (blocked) {
     if (current && current.deny.has(PermissionFlagsBits.ViewChannel) && !current.allow.has(PermissionFlagsBits.ViewChannel)) return;
