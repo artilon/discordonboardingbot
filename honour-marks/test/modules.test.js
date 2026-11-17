@@ -277,17 +277,17 @@ check("buildGuideSections still works with no setup/channels passed at all", () 
   assert.ok(sections.every((s) => (s.body || "").length > 0));
 });
 
-check("guide doesn't mention a tutorial reward, and does document the team-quest difficulty choice", () => {
+check("guide doesn't mention a tutorial reward, and does document the pool-quest difficulty choice", () => {
   const sections = buildGuideSections({ channels: { claim: "1", quests: "2", shop: "3", database: "4" } });
   const all = sections.map((s) => `${s.title} ${s.body}`).join("\n").toLowerCase();
   assert.ok(!all.includes("tutorial"), "there is no tutorial-reward feature in the code");
 
-  const teamSection = sections.find((s) => s.title.includes("Team Quests"));
-  assert.ok(teamSection, "team quests section should exist");
+  const poolSection = sections.find((s) => s.title.includes("Pool Quests"));
+  assert.ok(poolSection, "pool quests section should exist");
   assert.ok(
-    /difficulty/i.test(teamSection.body) && /easy/i.test(teamSection.body) &&
-    /medium/i.test(teamSection.body) && /hard/i.test(teamSection.body),
-    "team quests now have a real Easy/Medium/Hard difficulty picker and the guide should document it"
+    /difficulty/i.test(poolSection.body) && /easy/i.test(poolSection.body) &&
+    /medium/i.test(poolSection.body) && /hard/i.test(poolSection.body),
+    "pool quests now have a real Easy/Medium/Hard difficulty picker and the guide should document it"
   );
 });
 

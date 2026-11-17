@@ -73,6 +73,7 @@ const config = {
     quest_party_duo: 750,
     quest_party_trio: 1200,
     quest_party_quad: 2000,
+    quest_party_pool: 2100,
     tutorial_complete: 500,
   },
 

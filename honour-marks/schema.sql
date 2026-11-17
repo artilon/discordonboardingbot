@@ -83,7 +83,7 @@ create table if not exists public.hm_party_quests (
   id              bigserial primary key,
   guild_id        text not null,
   tree            text not null,
-  size            text not null check (size in ('duo','trio','quad')),
+  size            text not null check (size in ('duo','trio','quad','pool')),
   difficulty      text not null default 'easy',
   members         text[] not null,
   targets         jsonb not null default '{}'::jsonb,
@@ -355,6 +355,7 @@ party as (
          count(*) filter (where size = 'duo'  and completed) as duo,
          count(*) filter (where size = 'trio' and completed) as trio,
          count(*) filter (where size = 'quad' and completed) as quad,
+         count(*) filter (where size = 'pool' and completed) as pool,
          coalesce(sum(coalesce((hm_breakdown ->> m)::numeric, 0)), 0)       as party_hm,
          coalesce(sum(coalesce((rank_xp_breakdown ->> m)::numeric, 0)), 0)  as party_rank_xp
   from public.hm_party_quest_completions, unnest(members) as m
@@ -381,6 +382,7 @@ select
   coalesce(p.duo, 0)                                       as duo,
   coalesce(p.trio, 0)                                      as trio,
   coalesce(p.quad, 0)                                      as quad,
+  coalesce(p.pool, 0)                                      as pool,
   coalesce(bo.bounty, 0)                                   as bounty,
   coalesce(s.solo_total, 0) + coalesce(p.duo, 0) + coalesce(p.trio, 0) + coalesce(p.quad, 0)
                                                            as quests_total,
