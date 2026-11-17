@@ -145,6 +145,7 @@ async function bindGuild(guildId, {
       quests: channels.quests || config.channels.quests || null,
       shop: channels.shop || config.channels.shop || null,
       database: channels.database || config.channels.database || null,
+      bounty: channels.bounty || config.channels.bounty || null,
       staff: channels.staff || config.channels.staff || null,
       log: channels.log || config.channels.log || null,
     },

@@ -457,3 +457,44 @@ begin
   end loop;
 exception when others then null;
 end $$;
+
+-- 18. Bounty Quests — the bounty board (12 active at a time: 3 per size).
+create table if not exists public.hm_bounties (
+  id               bigserial primary key,
+  guild_id         text not null,
+  category         text not null check (category in ('artisan','mercenary','boss','raid')),
+  size             text not null check (size in ('solo','duo','trio','quad')),
+  npc_name         text not null,
+  npc_title        text not null,
+  title            text not null,
+  flavor           text not null,
+  requirements     jsonb not null default '[]'::jsonb,
+  hm_reward        integer not null default 0,
+  rank_xp_reward   integer not null default 0,
+  message_id       text,
+  status           text not null default 'active' check (status in ('active','completed','expired')),
+  created_at       timestamptz not null default now(),
+  expires_at       timestamptz not null,
+  last_accepted_at timestamptz
+);
+
+create index if not exists idx_hm_bounties_active
+  on public.hm_bounties (guild_id, status, expires_at);
+
+-- 19. Bounty acceptances — who took a bounty + their progress baseline.
+create table if not exists public.hm_bounty_acceptances (
+  id            bigserial primary key,
+  bounty_id     bigint not null references public.hm_bounties(id) on delete cascade,
+  guild_id      text not null,
+  user_id       text not null,
+  baseline      jsonb not null default '{}'::jsonb,
+  progress      jsonb not null default '{}'::jsonb,
+  completed     boolean not null default false,
+  rewarded      boolean not null default false,
+  accepted_at   timestamptz not null default now()
+);
+
+create unique index if not exists uq_hm_bounty_acceptance
+  on public.hm_bounty_acceptances (bounty_id, user_id);
+create index if not exists idx_hm_bounty_acc_user
+  on public.hm_bounty_acceptances (guild_id, user_id);
