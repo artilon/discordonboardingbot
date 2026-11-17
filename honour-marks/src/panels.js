@@ -553,6 +553,8 @@ function renderClaimPanel(setup = {}) {
       `**Register RuneScape Name** — links your RuneScape name to your Discord account so the bot knows whose ` +
       `hiscores to check. Required before you can start a quest. Pressing it opens a small popup asking for your ` +
       `exact in-game name — no slash commands needed.\n\n` +
+      `**Change Tracked Account** — switched to a brand-new account? Move your Honour Marks and ` +
+      `rank tracking to your new account name. Your old account is saved as a backup in case you ever swap back.\n\n` +
       `_These channels are read-only. Everything you do happens through buttons on their panels._`
     )
     .setThumbnail(HM_ICON_URL)
@@ -574,7 +576,12 @@ function renderClaimPanel(setup = {}) {
       .setCustomId("hm_register_open")
       .setLabel("Register RuneScape Name")
       .setEmoji("📝")
-      .setStyle(ButtonStyle.Primary)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("hm_change_account")
+      .setLabel("Change Tracked Account")
+      .setEmoji("🔁")
+      .setStyle(ButtonStyle.Secondary)
   );
 
   return [{ embed, components: [row] }];

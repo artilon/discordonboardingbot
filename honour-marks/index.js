@@ -689,6 +689,8 @@ async function performRegistration(interaction, target, rsn) {
 // themselves; staff registering someone else still goes through `/register`.
 const REGISTER_MODAL_ID = "hm_register_modal";
 const REGISTER_MODAL_INPUT_ID = "hm_register_rsn_input";
+const CHANGE_ACCOUNT_MODAL_ID = "hm_change_account_modal";
+const CHANGE_ACCOUNT_MODAL_INPUT_ID = "hm_change_account_rsn_input";
 
 async function handleRegisterOpen(interaction) {
   const modal = new ModalBuilder().setCustomId(REGISTER_MODAL_ID).setTitle("Register Your RuneScape Name");
@@ -708,6 +710,84 @@ async function handleRegisterModalSubmit(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   const rsn = cleanRsn(interaction.fields.getTextInputValue(REGISTER_MODAL_INPUT_ID));
   return performRegistration(interaction, interaction.user, rsn);
+}
+
+// ---- Change Tracked Account ----
+// For a member who switched to a brand-new in-game account. HM currency is
+// keyed by Discord user_id, so the balance already follows the person; what
+// must move is the tracked RSN (hm_members.rsn + clan_members.rsn) that
+// drives hiscore and rank tracking. The old RSN is saved to
+// hm_members.previous_rsn as a backup so the member can swap back later.
+async function handleChangeAccountOpen(interaction) {
+  const modal = new ModalBuilder().setCustomId(CHANGE_ACCOUNT_MODAL_ID).setTitle("Change Tracked Account");
+  const input = new TextInputBuilder()
+    .setCustomId(CHANGE_ACCOUNT_MODAL_INPUT_ID)
+    .setLabel("Your NEW in-game username")
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(1)
+    .setMaxLength(12)
+    .setRequired(true)
+    .setPlaceholder("Type your new account name exactly as in game");
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return interaction.showModal(modal);
+}
+
+async function handleChangeAccountModalSubmit(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const newRsn = cleanRsn(interaction.fields.getTextInputValue(CHANGE_ACCOUNT_MODAL_INPUT_ID));
+  const userId = interaction.user.id;
+  const guildId = interaction.guildId;
+
+  if (newRsn.length < 1 || newRsn.length > 12) {
+    return interaction.editReply({ content: "That doesn't look like a RuneScape name (1–12 characters)." });
+  }
+
+  const member = await getMember(userId);
+  const oldRsn = member?.rsn;
+  if (!oldRsn) {
+    return interaction.editReply({ content: "You haven't registered a RuneScape name yet. Use **Register RuneScape Name** first." });
+  }
+  if (oldRsn.trim().toLowerCase() === newRsn.trim().toLowerCase()) {
+    return interaction.editReply({ content: `You're already tracking **${newRsn}**. No change needed.` });
+  }
+
+  const existingName = await getMemberByRsn(guildId, newRsn);
+  if (existingName && existingName.user_id !== userId) {
+    return interaction.editReply({ content: `**${newRsn}** is already registered to <@${existingName.user_id}>.` });
+  }
+
+  await interaction.editReply({ content: `Checking **${newRsn}** on the hiscores…` });
+  const snap = await fetchHiscores(newRsn);
+  if (!snap) {
+    return interaction.editReply({
+      content:
+        `Couldn't find **${newRsn}** on the OSRS hiscores.\n\n` +
+        `• Check the spelling and capitalisation\n` +
+        `• Make sure your profile isn't private\n` +
+        `• New accounts don't appear until they have some XP`,
+    });
+  }
+
+  const supabase = getSupabase();
+  const nowIso = new Date().toISOString();
+
+  // Shift tracking to the new account; save the old one as the backup.
+  const { error: hmErr } = await supabase
+    .from("hm_members")
+    .update({ rsn: newRsn, previous_rsn: oldRsn, updated_at: nowIso })
+    .eq("user_id", userId);
+  if (hmErr) return interaction.editReply({ content: `Couldn't save that: \`${hmErr.message}\`` });
+
+  // Keep rank/XP tracking (clan_members) pointing at the new account too.
+  await supabase.from("clan_members").update({ rsn: newRsn }).eq("user_id", userId);
+
+  scheduleRefresh(guildId);
+
+  return interaction.editReply({
+    content:
+      `✅ Your Honour Marks and rank tracking now follow **${newRsn}**. Your balance carried over.\n\n` +
+      `Your previous account **${oldRsn}** is saved as a backup — ask staff if you ever want to swap back.`,
+  });
 }
 
 async function handleHm(interaction) {
@@ -2590,6 +2670,7 @@ async function routeInteraction(interaction) {
         case "hm_claim_role": return await handleClaimRole(interaction);
         case "hm_drop_role": return await handleDropRole(interaction);
         case "hm_register_open": return await handleRegisterOpen(interaction);
+        case "hm_change_account": return await handleChangeAccountOpen(interaction);
         case "hm_shop_perks": return await handleShopPerks(interaction);
         case "hm_shop_items": return await handleShopItems(interaction);
         case "hm_shop_boosts": return await handleShopBoosts(interaction);
@@ -2677,6 +2758,9 @@ async function routeInteraction(interaction) {
     if (interaction.isModalSubmit()) {
       if (interaction.customId === REGISTER_MODAL_ID) {
         return await handleRegisterModalSubmit(interaction);
+      }
+      if (interaction.customId === CHANGE_ACCOUNT_MODAL_ID) {
+        return await handleChangeAccountModalSubmit(interaction);
       }
       return;
     }
