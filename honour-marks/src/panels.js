@@ -163,7 +163,8 @@ async function renderDatabase(guildId) {
       `**#${i + 1} — ${r.rsn}**${prestigeTag} — ${HM_EMOJI} \`${(Number(r.total_earned) || 0).toLocaleString()}\` earned • ` +
       `\`${(Number(r.balance) || 0).toLocaleString()}\` held\n` +
       `┗ Quests \`${total}\` • D \`${r.solo_daily || 0}\` · W \`${r.solo_weekly || 0}\` · M \`${r.solo_monthly || 0}\` · ` +
-      `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\``
+      `Duo \`${r.duo || 0}\` · Trio \`${r.trio || 0}\` · Quad \`${r.quad || 0}\` · ` +
+      `Bounty \`${r.bounty || 0}\``
     );
   });
 
@@ -173,10 +174,11 @@ async function renderDatabase(guildId) {
       (Number(r.solo_monthly) || 0) + (Number(r.duo) || 0) + (Number(r.trio) || 0) + (Number(r.quad) || 0),
     0
   );
+  const totalBounties = rows.reduce((s, r) => s + (Number(r.bounty) || 0), 0);
 
   const header =
     `**Members:** \`${rows.length}\` • **HM in circulation:** \`${totalHm.toLocaleString()}\` • ` +
-    `**Quests completed:** \`${totalQuests}\`\n` +
+    `**Quests completed:** \`${totalQuests}\` • **Bounties completed:** \`${totalBounties}\`\n` +
     `Ranked by total HM earned — most earned at the top.\n\n`;
 
   const chunks = chunkLines(lines, header);
@@ -671,6 +673,7 @@ function buildGuideSections(setup = {}) {
   const questsCh = setup.channels?.quests ? `<#${setup.channels.quests}>` : "**the quest board**";
   const shopCh = setup.channels?.shop ? `<#${setup.channels.shop}>` : "**the shop**";
   const dbCh = setup.channels?.database ? `<#${setup.channels.database}>` : "**the database channel**";
+  const bountyCh = setup.channels?.bounty ? `<#${setup.channels.bounty}>` : "**the bounty board**";
 
   const rankLadder = RANK_TIERS.map((t) => `${t.name} — ${t.xpNeeded.toLocaleString()} XP`).join(" • ");
 
@@ -695,7 +698,7 @@ function buildGuideSections(setup = {}) {
         `your very first click to the exact numbers behind every quest type. What's in it, in order:\n` +
         `1. The Basics (this page) • 2. Your First 10 Minutes • 3. Solo Quests In Detail • ` +
         `4. Boss PvM, Raids & Minigames Explained • 5. Team Quests Step By Step • ` +
-        `5b. Team Quests — Requirements & Rewards • ` +
+        `5b. Team Quests — Requirements & Rewards • 5c. Bounty Quests, The Simple Version • ` +
         `6. Looking For Group Step By Step • 7. Checking Progress & Collecting Rewards • ` +
         `8. Shop: Perks • 8b. Shop: Items • 8c. Shop: Prestige • 9. Boss PvM Safety Check • ` +
         `10. Weighted Skill Rolls • 11. Shop: Boosts • 12. Shop: Consumables • 13. Your Inventory • ` +
@@ -887,6 +890,49 @@ function buildGuideSections(setup = {}) {
         `Hard 1,350 ${HM_EMOJI} + 6,000 Rank XP\n\n` +
         `A team quest that runs out of time is simply cancelled for everyone — unlike solo quests there is no ` +
         `partial HM payout, and no one can cancel it early themselves (a Skip Token only works on solo quests).`,
+    },
+    {
+      short: "Bounty Quests",
+      title: "📜 Step 4c: Bounty Quests — The Simple Version",
+      body:
+        `Bounties are special quests posted by NPCs in ${bountyCh}. Think of it like a real bounty board ` +
+        `in a game: an NPC posts a request, you take it, you do the work, you get paid. That's the whole ` +
+        `system. Here's exactly how it works, step by step:\\n\\n` +
+        `**Step 1 — Open the bounty board.** You'll see 12 bounties at a time, each one posted by an NPC ` +
+        `with a short message asking for help.\\n\\n` +
+        `**Step 2 — Read the request.** Every bounty tells you exactly what it needs, right on the post. ` +
+        `Nothing is hidden. If it says "gain 50,000 Mining XP and 50,000 Smithing XP", that's the whole ` +
+        `job — no surprises.\\n\\n` +
+        `**Step 3 — Press Accept Bounty.** That's it. You don't need a team, you don't need permission, and ` +
+        `you don't need to tell anyone. Lots of people can accept the same bounty at the same time — ` +
+        `everyone who accepts gets paid when they finish. You can also accept as many bounties as you ` +
+        `want, all at once.\\n\\n` +
+        `**Step 4 — Play the game normally.** The bot watches your hiscores and tracks your progress ` +
+        `automatically. You don't have to press anything, check anything, or report anything. Just play.\\n\\n` +
+        `**Step 5 — Get paid.** When you finish, the HM and Rank XP land in your account on their own. ` +
+        `Bounties pay **2.5 times** what a normal quest of the same size pays:\\n` +
+        `• Solo bounty — 375 ${HM_EMOJI} + 3,750 Rank XP\\n` +
+        `• Duo bounty — 625 ${HM_EMOJI} + 6,250 Rank XP\\n` +
+        `• Trio bounty — 875 ${HM_EMOJI} + 8,750 Rank XP\\n` +
+        `• Quad bounty — 1,125 ${HM_EMOJI} + 11,250 Rank XP\\n\\n` +
+        `**The 4 kinds of bounties:**\\n` +
+        `• **Artisan** — train two skills that go together. A blacksmith wants Mining + Smithing. An ` +
+        `alchemist wants Farming + Herblore. The NPC's job tells you which two.\\n` +
+        `• **Mercenary** — kill creatures. Always Slayer + Prayer + Hitpoints + one combat skill. ` +
+        `The creature is never named — you just grind slayer tasks.\\n` +
+        `• **Boss Contract** — kill bosses. Sometimes it's a number of boss kills in general, sometimes ` +
+        `one specific boss, sometimes three bosses at once.\\n` +
+        `• **Raid Delver** — clear a raid. The bounty picks which one.\\n\\n` +
+        `**The rules, in plain words:**\\n` +
+        `• New bounties appear every **3 hours**, so the board is always fresh.\\n` +
+        `• If someone is working on a bounty, it can stay up for up to **96 hours** (4 days) from the ` +
+        `last person who accepted it.\\n` +
+        `• If time runs out before you finish, you **still get paid** — just a smaller amount based on ` +
+        `how far you got. You never lose everything for being slow.\\n` +
+        `• Finished bounties also count toward your clan quests, the same as any other quest.\\n` +
+        `• Your bounty completions show up on the leaderboard in ${dbCh} as a **Bounty** count, and the ` +
+        `clan-wide total is in the header at the top.\\n\\n` +
+        `If you can read a post and press a button, you can do bounties. That's genuinely all there is to it.`,
     },
     {
       short: "Looking For Group",

@@ -58,6 +58,7 @@ const {
   readSetup, bindGuild, createStructure, verifyBindings, seedDefaults,
   applyPermissions, checkRoleGranting,
 } = require("./src/setup");
+const { buildOverwrites, overwriteContext } = require("./src/permissions");
 const bounties = require("./src/bounties");
 
 assertConfig();
@@ -532,6 +533,20 @@ function bountyProgressText(bounty, acc) {
   return parts.join(" · ");
 }
 
+// The bounty channel is read-only for members (HM role can view + read
+// history, never post) while the bot keeps full post/edit access. The
+// channel may have been created by hand, so the bot re-applies the
+// overwrite matrix on every board sync — self-healing if someone edits
+// the permissions manually.
+async function ensureBountyChannelPermissions(guild, channel) {
+  if (!guild || !channel) return;
+  const setup = await readSetup(guild.id).catch(() => null);
+  const ctx = overwriteContext(guild, setup || {});
+  await channel.permissionOverwrites
+    .set(buildOverwrites(ctx, "honourMarks"))
+    .catch(() => {});
+}
+
 // Post new bounties / refresh existing ones / retire expired ones so the
 // board always shows the current 12.
 async function syncBountyBoard(guildId) {
@@ -539,6 +554,8 @@ async function syncBountyBoard(guildId) {
   if (!supabase) return;
   const channel = await getBountyChannel(guildId);
   if (!channel) return;
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  await ensureBountyChannelPermissions(guild, channel);
 
   const now = Date.now();
   let active = await loadActiveBounties(guildId);

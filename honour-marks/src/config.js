@@ -46,7 +46,7 @@ const config = {
     database: envStr("HM_DATABASE_CHANNEL_ID"),
     staff: envStr("HM_STAFF_CHANNEL_ID"),
     log: envStr("HM_LOG_CHANNEL_ID"),
-    bounty: envStr("HM_BOUNTY_CHANNEL_ID", "1565371879320064124"),
+    bounty: envStr("HM_BOUNTY_CHANNEL_ID", "1572385329091051671"),
   },
 
   // Optional pre-existing roles. The Honour Marks and Clan Member defaults are
