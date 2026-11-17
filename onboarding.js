@@ -2162,6 +2162,13 @@ async function createOsrsVoiceChannel(guild, creatorUser) {
   return created;
 }
 
+// User IDs with a hub->temp-channel creation currently in flight. Discord
+// can fire more than one VoiceStateUpdate for a single join, and channel
+// creation + move is async — without this guard, each event would create
+// its own "OSRS Voice N" channel, leaving duplicates. Only one creation
+// per user runs at a time; later events for the same join are ignored.
+const osrsVoiceCreationInFlight = new Set();
+
 async function handleVoiceStateUpdate(oldState, newState) {
   const joinedChannel = newState?.channel;
   const leftChannel = oldState?.channel;
@@ -2170,11 +2177,16 @@ async function handleVoiceStateUpdate(oldState, newState) {
   // "OSRS Voice N" channel and moves the member straight into it — they
   // never actually end up sitting in the hub channel itself.
   if (joinedChannel && joinedChannel.id === OSRS_VOICE_HUB_CHANNEL_ID) {
+    const userId = newState.member?.id;
+    if (userId && osrsVoiceCreationInFlight.has(userId)) return; // already creating for this join
+    if (userId) osrsVoiceCreationInFlight.add(userId);
     try {
       const created = await createOsrsVoiceChannel(joinedChannel.guild, newState.member?.user);
       await newState.setChannel(created, "Redirected from the OSRS Voice hub into a new temporary channel");
     } catch (err) {
       console.error(`[OsrsVoice] Could not redirect ${newState.member?.id} out of the OSRS Voice hub:`, err.message);
+    } finally {
+      if (userId) osrsVoiceCreationInFlight.delete(userId);
     }
     return;
   }
@@ -10922,6 +10934,7 @@ module.exports = {
   getNextOsrsVoiceChannelNumber,
   createOsrsVoiceChannel,
   handleVoiceStateUpdate,
+  osrsVoiceCreationInFlight,
   scheduleTempVoiceDeletion,
   clearTempVoiceTimer,
   scanExistingTempVoiceChannels,
