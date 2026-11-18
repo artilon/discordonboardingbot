@@ -905,61 +905,49 @@ function buildGuideSections(setup = {}) {
       short: "Bounty Quests",
       title: "📜 Step 4c: Bounty Quests — The Simple Version",
       body:
-        `Bounties are special quests posted by NPCs in ${bountyCh}. Think of it like a real bounty board ` +
-        `in a game: an NPC posts a request, you take it, you do the work, you get paid. That's the whole ` +
-        `system. Here's exactly how it works, step by step:\\n\\n` +
-        `**Step 1 — Open the bounty board.** You'll see 5 bounties at a time, each one posted by an NPC ` +
-        `with a short message asking for help. The board always holds the same mix — 2 skilling, 1 slayer, ` +
-        `1 boss and 1 raid — so it never floods with one kind. Every bounty is randomly **solo** or **collective**, and the post says which one right at the top.\\n\\n` +
+        `Bounties are special quests posted by NPCs in ${bountyCh}: an NPC posts a request, you take it, ` +
+        `you do the work, you get paid. Here's how it works, step by step:\\n\\n` +
+        `**Step 1 — Open the bounty board.** You'll see 5 bounties at a time, each posted by an NPC asking ` +
+        `for help. The board always holds the same mix — 2 skilling, 1 slayer, 1 boss and 1 raid — ` +
+        `so it never floods with one kind. Every bounty is randomly **solo** or **collective**, and ` +
+        `the post says which one at the top.\\n\\n` +
         `**Step 2 — Read the request.** Every bounty tells you exactly what it needs, right on the post. ` +
-        `Nothing is hidden. If it says "gain 50,000 Mining XP and 50,000 Smithing XP", that's the whole ` +
-        `job — no surprises.\\n\\n` +
-        `**Step 3 — Press Accept Bounty.** That's it. You don't need a team, and you don't need to tell ` +
-        `anyone. Lots of people can accept the same bounty at the same time. You can also accept as many bounties ` +
-        `as you want, all at once. The only ` +
+        `Nothing is hidden — if it says "gain 50,000 Mining XP and 50,000 Smithing XP", that's the whole job.\\n\\n` +
+        `**Step 3 — Press Accept Bounty.** That's it. You don't need a team or tell anyone. Lots of people ` +
+        `can accept the same bounty at once, and you can accept as many as you want. The only ` +
         `thing you need is a **server nickname** (the name Heimdall sets to match your RuneScape name) — ` +
-        `it's how you show up on the board. No popup, no confirmation message: the board just updates to ` +
-        `show you're hunting.\\n\\n` +
+        `it's how you show up on the board. No popup: the board just updates to show you're hunting.\\n\\n` +
         `**Step 4 — Play the game normally.** The bot watches your hiscores and tracks your progress ` +
-        `automatically. You don't have to press anything, check anything, or report anything. Just play.\\n\\n` +
+        `automatically. You don't have to press, check, or report anything. Just play.\\n\\n` +
         `**Solo bounties** track only you — your progress, your finish, your payout.\\n\\n` +
         `**Collective bounties** pool everyone together: every hunter's progress adds into one shared ` +
         `total, and the bounty finishes when the whole crew hits the target. The target starts small ` +
-        `and grows as more hunters join, so a small crew is never handed a huge target:\\n` +
-        `• 2 hunters — smallest target (375 boss kills, 25,000 skill XP, or 3 raid clears)\\n` +
-        `• 3–6 hunters — 625 boss kills, 40,000 skill XP, or 4 raid clears\\n` +
-        `• 7–11 hunters — 875 boss kills, 60,000 skill XP, or 5 raid clears\\n` +
-        `• 12–18 hunters — 1,125 boss kills, 85,000 skill XP, or 6 raid clears\\n` +
-        `• 19–30 hunters — biggest target (1,375 boss kills, 115,000 skill XP, or 7 raid clears)\\n\\n` +
+        `and grows as more hunters join, so a small crew is never handed a huge target ` +
+        `(boss kills / skill XP / raid clears):\\n` +
+        `• 2 hunters — 375 / 25,000 / 3\\n` +
+        `• 3–6 hunters — 625 / 40,000 / 4\\n` +
+        `• 7–11 hunters — 875 / 60,000 / 5\\n` +
+        `• 12–18 hunters — 1,125 / 85,000 / 6\\n` +
+        `• 19–30 hunters — 1,375 / 115,000 / 7\\n\\n` +
         `If someone joins mid-bounty, the target grows to match the new crew size — the post updates ` +
         `to show the new numbers. Everyone who actually contributed gets paid when it finishes; ` +
         `accepting and never lifting a finger pays nothing.\\n\\n` +
         `**Step 5 — Get paid.** When the bounty finishes, the HM and Rank XP land in your account on ` +
         `their own. Bounties pay **2.5 times** what a normal quest of the same scale pays:\\n` +
         `• Solo bounty — 375 ${HM_EMOJI} + 3,750 Rank XP\\n` +
-        `• Collective bounty — grows with the crew:\\n` +
-        `  • 2 hunters — 625 ${HM_EMOJI} + 6,250 Rank XP\\n` +
-        `  • 3–6 hunters — 875 ${HM_EMOJI} + 8,750 Rank XP\\n` +
-        `  • 7–11 hunters — 1,125 ${HM_EMOJI} + 11,250 Rank XP\\n` +
-        `  • 12–18 hunters — 1,375 ${HM_EMOJI} + 13,750 Rank XP\\n` +
-        `  • 19+ hunters — 1,625 ${HM_EMOJI} + 16,250 Rank XP\\n\\n` +
+        `• Collective bounty — grows with the crew (2 hunters: 625 HM / 6,250 XP · 3–6: 875 / 8,750 · ` +
+        `7–11: 1,125 / 11,250 · 12–18: 1,375 / 13,750 · 19+: 1,625 / 16,250)\\n\\n` +
         `**The 4 kinds of bounties:**\\n` +
-        `• **Artisan** — train two skills that go together. A blacksmith wants Mining + Smithing. An ` +
-        `alchemist wants Farming + Herblore. The NPC's job tells you which two.\\n` +
-        `• **Mercenary** — kill creatures. Always Slayer + Prayer + Hitpoints + one combat skill. ` +
-        `The creature is never named — you just grind slayer tasks.\\n` +
-        `• **Boss Contract** — kill bosses. Sometimes it's a number of boss kills in general, sometimes ` +
-        `one specific boss, sometimes three bosses at once.\\n` +
+        `• **Artisan** — train two paired skills (e.g. Mining + Smithing). The NPC's job tells you which two.\\n` +
+        `• **Mercenary** — kill creatures: always Slayer + Prayer + Hitpoints + one combat skill. The creature is never named — just grind slayer tasks.\\n` +
+        `• **Boss Contract** — kill bosses: a number of boss kills in general, one specific boss, or three at once.\\n` +
         `• **Raid Delver** — clear a raid. The bounty picks which one.\\n\\n` +
         `**The rules, in plain words:**\\n` +
         `• New bounties appear every **3 hours**, so the board is always fresh.\\n` +
-        `• If someone is working on a bounty, it can stay up for up to **96 hours** (4 days) from the ` +
-        `last person who accepted it.\\n` +
-        `• If time runs out before the bounty finishes, it expires and nobody gets paid for it — ` +
-        `so don't leave a bounty to the last minute.\\n` +
+        `• A bounty with hunters can stay up for up to **96 hours** (4 days) from the last accept.\\n` +
+        `• If time runs out first, the bounty expires and nobody gets paid — don't leave it to the last minute.\\n` +
         `• Finished bounties also count toward your clan quests, the same as any other quest.\\n` +
-        `• Your bounty completions show up on the leaderboard in ${dbCh} as a **Bounty** count, and the ` +
-        `clan-wide total is in the header at the top.\\n\\n` +
+        `• Your bounty completions show on the leaderboard in ${dbCh} as a **Bounty** count, with the clan-wide total in the header.\\n\\n` +
         `If you can read a post and press a button, you can do bounties. That's genuinely all there is to it.`,
     },
     {
