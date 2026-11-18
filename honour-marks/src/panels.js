@@ -917,8 +917,10 @@ function buildGuideSections(setup = {}) {
         `can accept the same bounty at once, and you can accept as many as you want. The only ` +
         `thing you need is a **server nickname** (the name Heimdall sets to match your RuneScape name) — ` +
         `it's how you show up on the board. No popup: the board just updates to show you're hunting.\\n\\n` +
-        `**Step 4 — Play the game normally.** The bot watches your hiscores and tracks your progress ` +
-        `automatically. You don't have to press, check, or report anything. Just play.\\n\\n` +
+        `**Step 4 — Play the game normally.** The bot watches your hiscores and checks your progress ` +
+        `every 5 minutes on its own — you don't have to report anything, just play. Want to check ` +
+        `sooner? Press **Check Progress** on the bounty post to refresh your progress (and finish ` +
+        `the bounty) right away.\\n\\n` +
         `**Solo bounties** track only you — your progress, your finish, your payout.\\n\\n` +
         `**Collective bounties** pool everyone together: every hunter's progress adds into one shared ` +
         `total, and the bounty finishes when the whole crew hits the target. The target starts small ` +

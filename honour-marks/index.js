@@ -445,6 +445,7 @@ async function refreshPanels(guildId) {
 // from the last accept.
 
 const BOUNTY_ACCEPT_PREFIX = "hm_bounty_accept:";
+const BOUNTY_CHECK_PREFIX = "hm_bounty_check:";
 
 // A member's server nickname (which Heimdall keeps matching their RSN), or
 // null if they don't have one. New registrations require one (it's stored
@@ -488,13 +489,18 @@ async function loadBountyAcceptances(bountyId) {
   return data || [];
 }
 
-function bountyAcceptRow(bountyId) {
+function bountyButtons(bountyId) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`${BOUNTY_ACCEPT_PREFIX}${bountyId}`)
       .setLabel("Accept Bounty")
       .setEmoji("📜")
-      .setStyle(ButtonStyle.Success)
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`${BOUNTY_CHECK_PREFIX}${bountyId}`)
+      .setLabel("Check Progress")
+      .setEmoji("🔍")
+      .setStyle(ButtonStyle.Primary)
   );
 }
 
@@ -515,7 +521,7 @@ async function bountyPayload(bounty) {
     });
   }
   const embed = bounties.renderBountyEmbed(bounty, enriched);
-  return { embeds: [new EmbedBuilder(embed)], components: [bountyAcceptRow(bounty.id)] };
+  return { embeds: [new EmbedBuilder(embed)], components: [bountyButtons(bounty.id)] };
 }
 
 function bountyProgressText(effReqs, acc) {
@@ -710,6 +716,86 @@ async function handleBountyAccept(interaction) {
   await syncBountyBoard(interaction.guildId);
 }
 
+// Process one bounty's progress for all its hunters: solo bounties
+// complete individually, collective bounties pool every hunter's delta
+// into one shared total (only contributors get paid). Returns per-hunter
+// results plus the collective pool totals, so the on-demand "Check
+// Progress" button can report back to the clicking member.
+async function processBountyProgress(bounty) {
+  const supabase = getSupabase();
+  if (!supabase) return { results: [], poolTotals: null };
+  const acceptances = await loadBountyAcceptances(bounty.id);
+  const results = [];
+  if (bounty.size === "group") {
+    // Collective bounty: every hunter's hiscores delta pools into one
+    // shared total, judged against the scale for the current hunter
+    // count. When the pool meets the target the bounty completes for
+    // everyone — but only hunters who actually contributed get paid.
+    const effReqs = bounties.effectiveRequirements(bounty, acceptances.length);
+    const perReqList = [];
+    const contributorIds = new Set();
+    const byId = new Map();
+    for (const acc of acceptances) {
+      if (acc.completed) continue;
+      const member = await getMember(acc.user_id).catch(() => null);
+      if (!member?.rsn) continue;
+      const snap = await fetchHiscores(member.rsn);
+      if (!snap) continue;
+      const current = { skills: snap.skills || {}, activities: snap.activities || {} };
+      const { perReq } = bounties.computeProgress(effReqs, acc.baseline, current);
+      const progress = {};
+      let contributed = false;
+      for (const p of perReq) {
+        progress[bounties.reqKey(p.req)] = p.gained;
+        if (p.gained > 0) contributed = true;
+      }
+      await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
+      perReqList.push(perReq);
+      if (contributed) contributorIds.add(acc.id);
+      byId.set(acc.id, { userId: acc.user_id, progress, contributed, completedNow: false, rewards: null });
+    }
+    const { totals, complete } = bounties.collectiveProgress(effReqs, perReqList);
+    if (complete) {
+      const rewards = bounties.effectiveRewards(bounty, acceptances.length);
+      for (const acc of acceptances) {
+        if (acc.completed) continue;
+        const entry = byId.get(acc.id);
+        if (contributorIds.has(acc.id)) {
+          await completeBountyAcceptance(bounty, acc, 1, rewards);
+          if (entry) { entry.completedNow = true; entry.rewards = rewards; }
+        } else {
+          // Accepted but never contributed — the bounty is done for
+          // them too, just without a payout.
+          await supabase.from("hm_bounty_acceptances").update({ completed: true }).eq("id", acc.id);
+          if (entry) entry.completedNow = true;
+        }
+      }
+    }
+    for (const entry of byId.values()) results.push(entry);
+    return { results, poolTotals: totals };
+  }
+  for (const acc of acceptances) {
+    if (acc.completed) continue;
+    const member = await getMember(acc.user_id).catch(() => null);
+    if (!member?.rsn) continue;
+    const snap = await fetchHiscores(member.rsn);
+    if (!snap) continue;
+    const current = { skills: snap.skills || {}, activities: snap.activities || {} };
+    const { perReq, complete } = bounties.computeProgress(bounty.requirements, acc.baseline, current);
+    const progress = {};
+    for (const p of perReq) progress[bounties.reqKey(p.req)] = p.gained;
+    await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
+    const entry = { userId: acc.user_id, progress, contributed: perReq.some((p) => p.gained > 0), completedNow: false, rewards: null };
+    if (complete) {
+      await completeBountyAcceptance(bounty, acc, 1);
+      entry.completedNow = true;
+      entry.rewards = { hm: bounty.hm_reward, rankXp: bounty.rank_xp_reward };
+    }
+    results.push(entry);
+  }
+  return { results, poolTotals: null };
+}
+
 // Periodic progress + completion sweep.
 async function bountyProgressTick() {
   const supabase = getSupabase();
@@ -718,67 +804,69 @@ async function bountyProgressTick() {
   for (const guildId of guildIds) {
     const active = await loadActiveBounties(guildId);
     for (const bounty of active) {
-      const acceptances = await loadBountyAcceptances(bounty.id);
-      if (bounty.size === "group") {
-        // Collective bounty: every hunter's hiscores delta pools into one
-        // shared total, judged against the scale for the current hunter
-        // count. When the pool meets the target the bounty completes for
-        // everyone — but only hunters who actually contributed get paid.
-        const effReqs = bounties.effectiveRequirements(bounty, acceptances.length);
-        const perReqList = [];
-        const contributorIds = new Set();
-        for (const acc of acceptances) {
-          if (acc.completed) continue;
-          const member = await getMember(acc.user_id).catch(() => null);
-          if (!member?.rsn) continue;
-          const snap = await fetchHiscores(member.rsn);
-          if (!snap) continue;
-          const current = { skills: snap.skills || {}, activities: snap.activities || {} };
-          const { perReq } = bounties.computeProgress(effReqs, acc.baseline, current);
-          const progress = {};
-          let contributed = false;
-          for (const p of perReq) {
-            progress[bounties.reqKey(p.req)] = p.gained;
-            if (p.gained > 0) contributed = true;
-          }
-          await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
-          perReqList.push(perReq);
-          if (contributed) contributorIds.add(acc.id);
-        }
-        const { complete } = bounties.collectiveProgress(effReqs, perReqList);
-        if (complete) {
-          const rewards = bounties.effectiveRewards(bounty, acceptances.length);
-          for (const acc of acceptances) {
-            if (acc.completed) continue;
-            if (contributorIds.has(acc.id)) {
-              await completeBountyAcceptance(bounty, acc, 1, rewards);
-            } else {
-              // Accepted but never contributed — the bounty is done for
-              // them too, just without a payout.
-              await supabase.from("hm_bounty_acceptances").update({ completed: true }).eq("id", acc.id);
-            }
-          }
-        }
-        continue;
-      }
-      for (const acc of acceptances) {
-        if (acc.completed) continue;
-        const member = await getMember(acc.user_id).catch(() => null);
-        if (!member?.rsn) continue;
-        const snap = await fetchHiscores(member.rsn);
-        if (!snap) continue;
-        const current = { skills: snap.skills || {}, activities: snap.activities || {} };
-        const { perReq, complete } = bounties.computeProgress(bounty.requirements, acc.baseline, current);
-        const progress = {};
-        for (const p of perReq) progress[bounties.reqKey(p.req)] = p.gained;
-        await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
-        if (complete) {
-          await completeBountyAcceptance(bounty, acc, 1);
-        }
-      }
+      await processBountyProgress(bounty);
     }
     await syncBountyBoard(guildId).catch(() => {});
   }
+}
+
+// On-demand progress check for the clicking member: refreshes this
+// bounty's progress from hiscores (the same processing the 5-minute
+// sweep uses), updates the board post, and completes + pays if the
+// bounty is finished. A member who already completed this bounty can't
+// restart it — the accept flow rejects re-accepts, and this just tells
+// them it's done.
+async function handleBountyCheck(interaction) {
+  const bountyId = Number(interaction.customId.slice(BOUNTY_CHECK_PREFIX.length));
+  const supabase = getSupabase();
+  if (!supabase) return interaction.reply({ content: "Database unavailable.", flags: MessageFlags.Ephemeral });
+
+  const { data: bounty } = await supabase.from("hm_bounties").select("*").eq("id", bountyId).single();
+  if (!bounty || bounty.status !== "active") {
+    return interaction.reply({ content: "That bounty is no longer active.", flags: MessageFlags.Ephemeral });
+  }
+
+  const userId = interaction.user.id;
+  const member = await getMember(userId);
+  if (!member?.rsn) {
+    return interaction.reply({ content: "Register your RuneScape name first (button on the role panel).", flags: MessageFlags.Ephemeral });
+  }
+
+  const { data: mine } = await supabase
+    .from("hm_bounty_acceptances")
+    .select("*")
+    .eq("bounty_id", bountyId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!mine) {
+    return interaction.reply({ content: "You haven't accepted this bounty yet — press **Accept Bounty** first.", flags: MessageFlags.Ephemeral });
+  }
+  if (mine.completed) {
+    return interaction.reply({ content: "You've already completed this bounty — it can't be started again.", flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const { results, poolTotals } = await processBountyProgress(bounty);
+  await syncBountyBoard(interaction.guildId);
+
+  const entry = results.find((r) => r.userId === userId);
+  if (!entry) {
+    return interaction.editReply({ content: "Couldn't check your progress right now — your hiscores may be unavailable. Try again in a bit." });
+  }
+  if (entry.completedNow) {
+    const paid = entry.rewards
+      ? ` You earned **${entry.rewards.hm} HM** + **${entry.rewards.rankXp} Rank XP**.`
+      : " (No payout — you didn't contribute.)";
+    return interaction.editReply({ content: `✅ Bounty complete!${paid}` });
+  }
+  const acceptorCount = (await loadBountyAcceptances(bountyId)).length;
+  const effReqs = bounties.effectiveRequirements(bounty, acceptorCount);
+  const mineText = bountyProgressText(effReqs, { progress: entry.progress });
+  if (bounty.size === "group" && poolTotals) {
+    const poolText = bountyProgressText(effReqs, { progress: poolTotals });
+    return interaction.editReply({ content: `Checked — you've contributed **${mineText}**. Crew total: **${poolText}**.` });
+  }
+  return interaction.editReply({ content: `Checked — you're at **${mineText}**.` });
 }
 
 async function completeBountyAcceptance(bounty, acc, fraction, rewards) {
@@ -2717,6 +2805,9 @@ async function routeInteraction(interaction) {
       const btnId = interaction.customId;
       if (btnId.startsWith(BOUNTY_ACCEPT_PREFIX)) {
         return await handleBountyAccept(interaction);
+      }
+      if (btnId.startsWith(BOUNTY_CHECK_PREFIX)) {
+        return await handleBountyCheck(interaction);
       }
       if (btnId.startsWith("hm_pick_skill_difficulty:")) {
         const [, questType, tree, difficulty] = btnId.split(":");
