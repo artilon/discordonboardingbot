@@ -499,6 +499,7 @@ function bountyAcceptRow(bountyId) {
 
 async function bountyPayload(bounty) {
   const acceptances = await loadBountyAcceptances(bounty.id);
+  const effReqs = bounties.effectiveRequirements(bounty, acceptances.length);
   const enriched = [];
   for (const acc of acceptances) {
     const member = await getMember(acc.user_id).catch(() => null);
@@ -509,16 +510,16 @@ async function bountyPayload(bounty) {
       ...acc,
       displayName: nickname || member?.display_name || member?.rsn || null,
       rsn: member?.rsn || null,
-      progressText: bountyProgressText(bounty, acc),
+      progressText: bountyProgressText(effReqs, acc),
     });
   }
   const embed = bounties.renderBountyEmbed(bounty, enriched);
   return { embeds: [new EmbedBuilder(embed)], components: [bountyAcceptRow(bounty.id)] };
 }
 
-function bountyProgressText(bounty, acc) {
+function bountyProgressText(effReqs, acc) {
   const progress = acc.progress || {};
-  const parts = (bounty.requirements || []).map((req) => {
+  const parts = (effReqs || []).map((req) => {
     const gained = progress[bounties.reqKey(req)] ?? 0;
     return `${Number(gained).toLocaleString()} / ${req.amount.toLocaleString()}`;
   });
@@ -598,7 +599,7 @@ async function syncBountyBoardInner(guildId) {
   active = active.filter((b) => !expiredIds.has(b.id));
 
   // Top up to 5 total, respecting the category caps (2 skilling + 1
-  // slayer + 1 boss + 1 raid) with a random size per bounty.
+  // slayer + 1 boss + 1 raid) with a random type per bounty.
   const counts = {};
   for (const b of active) counts[b.category] = (counts[b.category] || 0) + 1;
   const recentNpcs = new Set(active.map((b) => b.npc_name));
@@ -688,6 +689,15 @@ async function handleBountyAccept(interaction) {
     return interaction.reply({ content: "You're already hunting this bounty.", flags: MessageFlags.Ephemeral });
   }
 
+  // A collective bounty whose hunters have all finished is done — no new
+  // hunters (a late join would only inflate the shared target).
+  if (bounty.size === "group") {
+    const all = await loadBountyAcceptances(bountyId);
+    if (all.length > 0 && all.every((a) => a.completed)) {
+      return interaction.reply({ content: "This collective bounty is already complete.", flags: MessageFlags.Ephemeral });
+    }
+  }
+
   // Silent accept: acknowledge the click with no popup. The board re-sync
   // below updates the post to show the new hunter — that's the confirmation.
   await interaction.deferUpdate();
@@ -717,6 +727,48 @@ async function bountyProgressTick() {
     const active = await loadActiveBounties(guildId);
     for (const bounty of active) {
       const acceptances = await loadBountyAcceptances(bounty.id);
+      if (bounty.size === "group") {
+        // Collective bounty: every hunter's hiscores delta pools into one
+        // shared total, judged against the scale for the current hunter
+        // count. When the pool meets the target the bounty completes for
+        // everyone — but only hunters who actually contributed get paid.
+        const effReqs = bounties.effectiveRequirements(bounty, acceptances.length);
+        const perReqList = [];
+        const contributorIds = new Set();
+        for (const acc of acceptances) {
+          if (acc.completed) continue;
+          const member = await getMember(acc.user_id).catch(() => null);
+          if (!member?.rsn) continue;
+          const snap = await fetchHiscores(member.rsn);
+          if (!snap) continue;
+          const current = { skills: snap.skills || {}, activities: snap.activities || {} };
+          const { perReq } = bounties.computeProgress(effReqs, acc.baseline, current);
+          const progress = {};
+          let contributed = false;
+          for (const p of perReq) {
+            progress[bounties.reqKey(p.req)] = p.gained;
+            if (p.gained > 0) contributed = true;
+          }
+          await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
+          perReqList.push(perReq);
+          if (contributed) contributorIds.add(acc.id);
+        }
+        const { complete } = bounties.collectiveProgress(effReqs, perReqList);
+        if (complete) {
+          const rewards = bounties.effectiveRewards(bounty, acceptances.length);
+          for (const acc of acceptances) {
+            if (acc.completed) continue;
+            if (contributorIds.has(acc.id)) {
+              await completeBountyAcceptance(bounty, acc, 1, rewards);
+            } else {
+              // Accepted but never contributed — the bounty is done for
+              // them too, just without a payout.
+              await supabase.from("hm_bounty_acceptances").update({ completed: true }).eq("id", acc.id);
+            }
+          }
+        }
+        continue;
+      }
       for (const acc of acceptances) {
         if (acc.completed) continue;
         const member = await getMember(acc.user_id).catch(() => null);
@@ -737,11 +789,11 @@ async function bountyProgressTick() {
   }
 }
 
-async function completeBountyAcceptance(bounty, acc, fraction) {
+async function completeBountyAcceptance(bounty, acc, fraction, rewards) {
   const supabase = getSupabase();
   if (!supabase || acc.rewarded) return;
-  const hm = Math.round(bounty.hm_reward * fraction);
-  const rankXp = Math.round(bounty.rank_xp_reward * fraction);
+  const hm = Math.round((rewards?.hm ?? bounty.hm_reward) * fraction);
+  const rankXp = Math.round((rewards?.rankXp ?? bounty.rank_xp_reward) * fraction);
   await supabase.from("hm_bounty_acceptances").update({ completed: true, rewarded: true }).eq("id", acc.id);
   if (hm > 0) {
     await creditHm({
