@@ -910,25 +910,29 @@ function buildGuideSections(setup = {}) {
         `system. Here's exactly how it works, step by step:\\n\\n` +
         `**Step 1 — Open the bounty board.** You'll see 5 bounties at a time, each one posted by an NPC ` +
         `with a short message asking for help. The board always holds the same mix — 2 skilling, 1 slayer, ` +
-        `1 boss and 1 raid — so it never floods with one kind. Every bounty is randomly solo or a team, ` +
-        `and the post says which one right at the top: **Solo — just you**, or **Group of 2/3/4**.\\n\\n` +
+        `1 boss and 1 raid — so it never floods with one kind. Every bounty is randomly **solo** or **collective**, and the post says which one right at the top.\\n\\n` +
         `**Step 2 — Read the request.** Every bounty tells you exactly what it needs, right on the post. ` +
         `Nothing is hidden. If it says "gain 50,000 Mining XP and 50,000 Smithing XP", that's the whole ` +
         `job — no surprises.\\n\\n` +
         `**Step 3 — Press Accept Bounty.** That's it. You don't need a team, and you don't need to tell ` +
-        `anyone. Lots of people can accept the same bounty at the same time — everyone who accepts gets ` +
-        `paid when they finish. You can also accept as many bounties as you want, all at once. The only ` +
+        `anyone. Lots of people can accept the same bounty at the same time. You can also accept as many bounties ` +
+        `as you want, all at once. The only ` +
         `thing you need is a **server nickname** (the name Heimdall sets to match your RuneScape name) — ` +
         `it's how you show up on the board. No popup, no confirmation message: the board just updates to ` +
         `show you're hunting.\\n\\n` +
         `**Step 4 — Play the game normally.** The bot watches your hiscores and tracks your progress ` +
         `automatically. You don't have to press anything, check anything, or report anything. Just play.\\n\\n` +
-        `**Step 5 — Get paid.** When you finish, the HM and Rank XP land in your account on their own. ` +
-        `Bounties pay **2.5 times** what a normal quest of the same size pays:\\n` +
+        `**Solo bounties** track only you — your progress, your finish, your payout.\\n\\n` +
+        `**Collective bounties** pool everyone together: every hunter's progress adds into one shared ` +
+        `total, and the bounty finishes when the whole crew hits the target. The target starts small ` +
+        `and grows as more hunters join — 2 hunters face the smallest target, and it scales up as the ` +
+        `crew grows (up to 30 hunters). Everyone who actually contributed gets paid when it finishes; ` +
+        `accepting and never lifting a finger pays nothing.\\n\\n` +
+        `**Step 5 — Get paid.** When the bounty finishes, the HM and Rank XP land in your account on ` +
+        `their own. Bounties pay **2.5 times** what a normal quest of the same scale pays:\\n` +
         `• Solo bounty — 375 ${HM_EMOJI} + 3,750 Rank XP\\n` +
-        `• Duo bounty — 625 ${HM_EMOJI} + 6,250 Rank XP\\n` +
-        `• Trio bounty — 875 ${HM_EMOJI} + 8,750 Rank XP\\n` +
-        `• Quad bounty — 1,125 ${HM_EMOJI} + 11,250 Rank XP\\n\\n` +
+        `• Collective bounty — starts at 625 ${HM_EMOJI} + 6,250 Rank XP with 2 hunters and grows ` +
+        `with the crew, up to 1,625 ${HM_EMOJI} + 16,250 Rank XP at 19+ hunters\\n\\n` +
         `**The 4 kinds of bounties:**\\n` +
         `• **Artisan** — train two skills that go together. A blacksmith wants Mining + Smithing. An ` +
         `alchemist wants Farming + Herblore. The NPC's job tells you which two.\\n` +
@@ -941,8 +945,8 @@ function buildGuideSections(setup = {}) {
         `• New bounties appear every **3 hours**, so the board is always fresh.\\n` +
         `• If someone is working on a bounty, it can stay up for up to **96 hours** (4 days) from the ` +
         `last person who accepted it.\\n` +
-        `• If time runs out before you finish, you **still get paid** — just a smaller amount based on ` +
-        `how far you got. You never lose everything for being slow.\\n` +
+        `• If time runs out before the bounty finishes, it expires and nobody gets paid for it — ` +
+        `so don't leave a bounty to the last minute.\\n` +
         `• Finished bounties also count toward your clan quests, the same as any other quest.\\n` +
         `• Your bounty completions show up on the leaderboard in ${dbCh} as a **Bounty** count, and the ` +
         `clan-wide total is in the header at the top.\\n\\n` +

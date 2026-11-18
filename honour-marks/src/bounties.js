@@ -5,26 +5,30 @@
  * 5 active bounties at a time, posted as requests from NPCs. The board's
  * category mix is capped so it never floods with one kind: at most 2
  * skilling (Artisan), 1 slayer (Mercenary), 1 boss and 1 raid — which
- * sums to exactly the 5 slots. Each bounty rolls a random size (solo, or
- * a team of 2/3/4) and is clearly labeled with it. The NPC type
- * determines the contract:
+ * sums to exactly the 5 slots. Each bounty rolls a random type: solo
+ * (tracked per hunter) or collective (everyone's progress pools into one
+ * shared total). The NPC type determines the contract:
  *   - Artisan:       paired gathering + artisan skills (blacksmith, alchemist…)
  *   - Mercenary:     "creatures" — always Slayer + Prayer + Hitpoints + one
  *                    random combat style (pure slayer training)
  *   - Boss Contract: generic boss KC, a named boss, or a brutal triple
  *   - Raid Delver:   a random raid
  *
- * Multiple people can accept the same bounty; no limit on teams per person.
- * Requirements are visible before accepting. Progress is tracked from a
- * hiscores snapshot taken at accept time. Bounties cycle every 3 hours, but
- * one with an active hunter endures up to 96 hours from the last accept —
- * after which it auto-completes at partial reward based on progress.
- * Completed bounties count toward active clan quests.
+ * Multiple people can accept the same bounty. Solo bounties track each
+ * hunter's progress separately; collective bounties sum every hunter's
+ * hiscores delta into one pool, and the target scales with how many
+ * hunters have accepted (2 hunters face the smallest target, growing up
+ * to 30). Only hunters who actually contributed get paid when a
+ * collective bounty completes. Requirements are visible before
+ * accepting. Progress is tracked from a hiscores snapshot taken at
+ * accept time. Bounties cycle every 3 hours, but one with an active
+ * hunter endures up to 96 hours from the last accept. Completed bounties
+ * count toward active clan quests.
  *
- * Rewards are 2.5x the normal HM quest of the same size.
+ * Rewards are 2.5x the normal HM quest of the same scale.
  */
 
-const BOUNTY_SIZES = ["solo", "duo", "trio", "quad"];
+const BOUNTY_SIZES = ["solo", "group"];
 const BOUNTY_TOTAL = 5;
 // Board category caps — they sum to exactly BOUNTY_TOTAL, so a full board
 // is always 2 skilling + 1 slayer + 1 boss + 1 raid, never more.
@@ -33,18 +37,41 @@ const BOUNTY_CYCLE_MS = 3 * 60 * 60 * 1000; // 3 hours
 const BOUNTY_MAX_ACTIVE_MS = 96 * 60 * 60 * 1000; // 96 hours from last accept
 const REWARD_MULTIPLIER = 2.5;
 
-// Base HM reward per size (mirrors the normal HM quest of the same size),
-// scaled by REWARD_MULTIPLIER. Solo uses the weekly quest as its counterpart.
-const BASE_HM_BY_SIZE = { solo: 150, duo: 250, trio: 350, quad: 450 };
-const BASE_RANK_XP_BY_SIZE = { solo: 1500, duo: 2500, trio: 3500, quad: 4500 };
+// Base HM reward per scale (mirrors the normal HM quest of the same
+// scale), scaled by REWARD_MULTIPLIER. Solo uses the weekly quest as its
+// counterpart. Collective bounties scale with hunter count (see
+// GROUP_TIERS); the stored bounty always carries the smallest (duo)
+// scale, and the effective scale is derived from the acceptor count.
+const BASE_HM_BY_SIZE = { solo: 150, duo: 250, trio: 350, quad: 450, five: 550, six: 650 };
+const BASE_RANK_XP_BY_SIZE = { solo: 1500, duo: 2500, trio: 3500, quad: 4500, five: 5500, six: 6500 };
 
 function bountyRewards(size) {
-  const base = BASE_HM_BY_SIZE[size] || 0;
-  const rankBase = BASE_RANK_XP_BY_SIZE[size] || 0;
+  const key = size === "group" ? "duo" : size;
+  const base = BASE_HM_BY_SIZE[key] || 0;
+  const rankBase = BASE_RANK_XP_BY_SIZE[key] || 0;
   return {
     hm: Math.round(base * REWARD_MULTIPLIER),
     rankXp: Math.round(rankBase * REWARD_MULTIPLIER),
   };
+}
+
+// Collective bounty scale tiers by hunter (acceptor) count: 2 hunters
+// face the duo scale, growing through trio/quad/5-man/6-man as more join,
+// so a small crew is never handed a huge target. Past 30 it stays at the
+// 6-man scale.
+const GROUP_TIERS = [
+  { key: "duo", max: 2 },
+  { key: "trio", max: 6 },
+  { key: "quad", max: 11 },
+  { key: "five", max: 18 },
+  { key: "six", max: Infinity },
+];
+
+function tierForCount(n) {
+  for (const tier of GROUP_TIERS) {
+    if (n <= tier.max) return tier.key;
+  }
+  return "six";
 }
 
 // ── NPC pools ──────────────────────────────────────────────────────────────
@@ -137,15 +164,19 @@ function pickMany(arr, n, exclude = new Set()) {
 }
 
 // Skill XP target scaled by party size (bigger party, bigger grind).
-const SKILL_XP_BY_SIZE = { solo: 15000, duo: 25000, trio: 40000, quad: 60000 };
+const SKILL_XP_BY_SIZE = { solo: 15000, duo: 25000, trio: 40000, quad: 60000, five: 85000, six: 115000 };
 // Boss KC target scaled by party size. Bounties pay 2.5x a normal quest,
 // so the KC is 2.5x the normal quest's requirement (solo weekly 40, duo
 // 150, trio 250, quad 350) — the effort matches the reward.
-const KC_BY_SIZE = { solo: 100, duo: 375, trio: 625, quad: 875 };
-const RAID_BY_SIZE = { solo: 2, duo: 3, trio: 4, quad: 5 };
+const KC_BY_SIZE = { solo: 100, duo: 375, trio: 625, quad: 875, five: 1125, six: 1375 };
+const RAID_BY_SIZE = { solo: 2, duo: 3, trio: 4, quad: 5, five: 6, six: 7 };
 
-function skillReq(skill, size) {
-  return { kind: "skill", skill, amount: SKILL_XP_BY_SIZE[size] || 15000 };
+// Every requirement carries `frac` — its share of the scale's full
+// amount (1 = full, 0.5 = half, ...). Collective bounties are stored at
+// the duo scale and re-scaled to the current tier via scaleRequirements,
+// so frac is what lets amounts move between scales exactly.
+function skillReq(skill, size, frac = 1) {
+  return { kind: "skill", skill, amount: Math.round((SKILL_XP_BY_SIZE[size] || 15000) * frac), frac };
 }
 
 // ── Category generators ────────────────────────────────────────────────────
@@ -167,7 +198,6 @@ function genArtisan(size, recentNpcs) {
 function genMercenary(size, recentNpcs) {
   const npc = pick(MERCENARY_NPCS, recentNpcs);
   const style = pick(COMBAT_STYLES);
-  const base = SKILL_XP_BY_SIZE[size] || 15000;
   return {
     category: "mercenary",
     npc_name: npc.name,
@@ -175,10 +205,10 @@ function genMercenary(size, recentNpcs) {
     title: "Creature Cull",
     flavor: npc.flavor,
     requirements: [
-      { kind: "skill", skill: "Slayer", amount: base },
-      { kind: "skill", skill: "Prayer", amount: Math.round(base * 0.5) },
-      { kind: "skill", skill: "Hitpoints", amount: Math.round(base * 0.5) },
-      { kind: "skill", skill: style, amount: Math.round(base * 0.75) },
+      skillReq("Slayer", size, 1),
+      skillReq("Prayer", size, 0.5),
+      skillReq("Hitpoints", size, 0.5),
+      skillReq(style, size, 0.75),
     ],
   };
 }
@@ -195,7 +225,7 @@ function genBoss(size, recentNpcs) {
       npc_title: npc.title,
       title: "The Ledger Hungers",
       flavor: npc.flavor,
-      requirements: [{ kind: "boss_kc", boss: null, amount: kc }],
+      requirements: [{ kind: "boss_kc", boss: null, amount: kc, frac: 1 }],
     };
   }
   if (roll < 0.75) {
@@ -207,7 +237,7 @@ function genBoss(size, recentNpcs) {
       npc_title: npc.title,
       title: `${boss} Contract`,
       flavor: npc.flavor,
-      requirements: [{ kind: "boss_kc", boss, amount: Math.max(3, Math.round(kc / 2)) }],
+      requirements: [{ kind: "boss_kc", boss, amount: Math.max(3, Math.round(kc / 2)), frac: 0.5 }],
     };
   }
   // The triple — three named bosses (hardest).
@@ -219,7 +249,7 @@ function genBoss(size, recentNpcs) {
     npc_title: npc.title,
     title: "The Triad",
     flavor: npc.flavor,
-    requirements: bosses.map((boss) => ({ kind: "boss_kc", boss, amount: per })),
+    requirements: bosses.map((boss) => ({ kind: "boss_kc", boss, amount: per, frac: 0.25 })),
   };
 }
 
@@ -232,7 +262,7 @@ function genRaid(size, recentNpcs) {
     npc_title: npc.title,
     title: `Delve: ${raid}`,
     flavor: npc.flavor,
-    requirements: [{ kind: "raid", raid, amount: RAID_BY_SIZE[size] || 2 }],
+    requirements: [{ kind: "raid", raid, amount: RAID_BY_SIZE[size] || 2, frac: 1 }],
   };
 }
 
@@ -250,7 +280,8 @@ function sortBoard(list) {
   );
 }
 
-// Roll a random bounty size: solo, or a team of 2/3/4.
+// Roll a random bounty type: solo (individual progress) or collective
+// (shared progress pool, target scales with hunter count).
 function randomSize() {
   return pick(BOUNTY_SIZES);
 }
@@ -262,26 +293,30 @@ function pickCategory(counts) {
   return pick(available);
 }
 
-// Build one bounty spec for a size, avoiding recently-used NPCs.
+// Build one bounty spec for a type, avoiding recently-used NPCs. Group
+// bounties are generated at the duo scale (the smallest collective
+// tier); the effective scale grows with the acceptor count.
 function generateBounty(size, recentNpcs = new Set()) {
   const category = pick(CATEGORIES);
-  const spec = GENERATORS[category](size, recentNpcs);
+  const scale = size === "group" ? "duo" : size;
+  const spec = GENERATORS[category](scale, recentNpcs);
   const rewards = bountyRewards(size);
   return { ...spec, size, hm_reward: rewards.hm, rank_xp_reward: rewards.rankXp };
 }
 
-// Build one bounty for the board: category respects the caps, size is
+// Build one bounty for the board: category respects the caps, type is
 // rolled at random. `counts` is the running per-category tally.
 function generateBountyForBoard(counts, recentNpcs = new Set()) {
   const category = pickCategory(counts);
   const size = randomSize();
-  const spec = GENERATORS[category](size, recentNpcs);
+  const scale = size === "group" ? "duo" : size;
+  const spec = GENERATORS[category](scale, recentNpcs);
   const rewards = bountyRewards(size);
   return { ...spec, size, hm_reward: rewards.hm, rank_xp_reward: rewards.rankXp };
 }
 
 // Generate the full board (5 bounties: 2 skilling + 1 slayer + 1 boss +
-// 1 raid, each with a random size), tracking recent NPCs so the same
+// 1 raid, each with a random type), tracking recent NPCs so the same
 // ones don't repeat within a single board.
 function generateBoard(recentNpcs = new Set()) {
   const used = new Set(recentNpcs);
@@ -300,14 +335,11 @@ function generateBoard(recentNpcs = new Set()) {
 
 const CATEGORY_EMOJI = { artisan: "🔨", mercenary: "⚔️", boss: "💀", raid: "🗿" };
 const CATEGORY_LABEL = { artisan: "Artisan", mercenary: "Mercenary", boss: "Boss Contract", raid: "Raid Delver" };
-const SIZE_LABEL = { solo: "Solo", duo: "Duo", trio: "Trio", quad: "Quad" };
-// Explicit team-size label so it's obvious at a glance whether a bounty
-// is solo or a team, and how many players the team is.
-const SIZE_TEAM_LABEL = {
+// Explicit type label so it's obvious at a glance whether a bounty is
+// solo (tracked per hunter) or collective (shared progress pool).
+const TYPE_LABEL = {
   solo: "Solo — just you",
-  duo: "Group of 2 (Duo)",
-  trio: "Group of 3 (Trio)",
-  quad: "Group of 4 (Quad)",
+  group: "Collective — target grows with hunters",
 };
 
 function formatRequirement(req) {
@@ -324,17 +356,29 @@ function formatRequirements(requirements) {
 // Render one bounty as an embed payload (pure — no Discord calls).
 function renderBountyEmbed(bounty, acceptances = []) {
   const emoji = CATEGORY_EMOJI[bounty.category] || "📜";
-  const teamLabel = SIZE_TEAM_LABEL[bounty.size] || SIZE_LABEL[bounty.size] || bounty.size;
+  const isGroup = bounty.size === "group";
+  const typeLabel = TYPE_LABEL[bounty.size] || TYPE_LABEL.group;
+  const effReqs = effectiveRequirements(bounty, acceptances.length);
+  const effRewards = effectiveRewards(bounty, acceptances.length);
   const lines = [
     `**From:** *${bounty.npc_name} ${bounty.npc_title}*`,
     `*"${bounty.flavor}"*`,
     "",
     `**Contract:** ${bounty.title}`,
-    `**Group:** ${teamLabel}`,
-    formatRequirements(bounty.requirements),
+    `**Type:** ${typeLabel}`,
+    formatRequirements(effReqs),
     "",
-    `**Reward:** ${bounty.hm_reward} HM · ${bounty.rank_xp_reward} Rank XP`,
+    `**Reward:** ${effRewards.hm} HM · ${effRewards.rankXp} Rank XP`,
   ];
+
+  // Collective bounties show the shared pool total above the hunter list.
+  if (isGroup && acceptances.length) {
+    const parts = effReqs.map((req) => {
+      const sum = acceptances.reduce((s, acc) => s + (acc.progress?.[reqKey(req)] || 0), 0);
+      return `${Number(sum).toLocaleString()} / ${req.amount.toLocaleString()}`;
+    });
+    lines.push(`**Collective:** ${parts.join(" · ")}`);
+  }
 
   if (acceptances.length) {
     lines.push("", "**Hunters:**");
@@ -390,6 +434,49 @@ function computeProgress(requirements, baseline = {}, current = {}) {
   return { perReq, complete: perReq.every((p) => p.done) };
 }
 
+// Re-scale stored (duo-scale) requirements to a collective tier.
+function scaleRequirements(requirements, tier) {
+  return (requirements || []).map((req) => {
+    const frac = req.frac ?? 1;
+    let amount = req.amount;
+    if (req.kind === "skill") {
+      amount = Math.round((SKILL_XP_BY_SIZE[tier] || 15000) * frac);
+    } else if (req.kind === "boss_kc") {
+      amount = Math.max(2, Math.round((KC_BY_SIZE[tier] || 100) * frac));
+    } else if (req.kind === "raid") {
+      amount = Math.round((RAID_BY_SIZE[tier] || 2) * frac);
+    }
+    return { ...req, amount };
+  });
+}
+
+// The requirements a bounty is currently judged against. Solo bounties
+// use their stored requirements; collective bounties scale with the
+// acceptor count.
+function effectiveRequirements(bounty, acceptorCount = 0) {
+  if (bounty.size !== "group") return bounty.requirements || [];
+  return scaleRequirements(bounty.requirements, tierForCount(acceptorCount));
+}
+
+// The rewards paid on completion, at the current collective scale.
+function effectiveRewards(bounty, acceptorCount = 0) {
+  if (bounty.size !== "group") return { hm: bounty.hm_reward, rankXp: bounty.rank_xp_reward };
+  return bountyRewards(tierForCount(acceptorCount));
+}
+
+// Sum per-acceptor progress arrays into one collective pool and check
+// whether the pool meets every requirement.
+function collectiveProgress(requirements, perReqList) {
+  const totals = {};
+  for (const perReq of perReqList || []) {
+    for (const p of perReq) {
+      totals[reqKey(p.req)] = (totals[reqKey(p.req)] || 0) + p.gained;
+    }
+  }
+  const complete = (requirements || []).every((req) => (totals[reqKey(req)] || 0) >= req.amount);
+  return { totals, complete };
+}
+
 // Fraction (0..1) of total progress, for partial rewards on auto-complete.
 function progressFraction(requirements, baseline = {}, current = {}) {
   const { perReq } = computeProgress(requirements, baseline, current);
@@ -417,7 +504,16 @@ module.exports = {
   CATEGORY_EMOJI,
   CATEGORY_LABEL,
   CATEGORY_ORDER,
-  SIZE_TEAM_LABEL,
+  TYPE_LABEL,
+  GROUP_TIERS,
+  tierForCount,
+  scaleRequirements,
+  effectiveRequirements,
+  effectiveRewards,
+  collectiveProgress,
+  SKILL_XP_BY_SIZE,
+  KC_BY_SIZE,
+  RAID_BY_SIZE,
   randomSize,
   pickCategory,
   sortBoard,

@@ -1,6 +1,7 @@
 // Coverage for the Bounty Quests generator: board shape (5 bounties with
-// category caps + random sizes), category validity, reward scaling (2.5x),
-// NPC variety, and team-size labeling.
+// category caps + random types), category validity, reward scaling (2.5x),
+// NPC variety, solo/collective labeling, collective tier scaling, and
+// collective progress pooling.
 const assert = require("assert");
 const path = require("path");
 
@@ -21,7 +22,7 @@ function main() {
   check("board has 1 boss bounty", board.filter((b) => b.category === "boss").length === 1);
   check("board has 1 raid bounty", board.filter((b) => b.category === "raid").length === 1);
   for (const b of board) {
-    check("bounty size is a valid size", ["solo", "duo", "trio", "quad"].includes(b.size));
+    check("bounty size is a valid size", ["solo", "group"].includes(b.size));
   }
   // Caps hold across many boards, and sizes vary (random, not fixed per slot).
   const seenSizes = new Set();
@@ -56,11 +57,15 @@ function main() {
     check("sortBoard does not mutate the input", shuffled[0].category === "raid");
   }
 
-  // ---- Rewards are 2.5x the normal quest of the same size ----
+  // ---- Rewards are 2.5x the normal quest of the same scale ----
   check("solo bounty HM is 2.5x weekly (150)", bounties.bountyRewards("solo").hm === 375);
-  check("duo bounty HM is 2.5x duo (250)", bounties.bountyRewards("duo").hm === 625);
-  check("trio bounty HM is 2.5x trio (350)", bounties.bountyRewards("trio").hm === 875);
-  check("quad bounty HM is 2.5x quad (450)", bounties.bountyRewards("quad").hm === 1125);
+  check("duo scale HM is 2.5x duo (250)", bounties.bountyRewards("duo").hm === 625);
+  check("trio scale HM is 2.5x trio (350)", bounties.bountyRewards("trio").hm === 875);
+  check("quad scale HM is 2.5x quad (450)", bounties.bountyRewards("quad").hm === 1125);
+  check("five scale HM is 2.5x five (550)", bounties.bountyRewards("five").hm === 1375);
+  check("six scale HM is 2.5x six (650)", bounties.bountyRewards("six").hm === 1625);
+  check("group bounty starts at the duo scale", bounties.bountyRewards("group").hm === 625);
+  check("group bounty Rank XP starts at the duo scale", bounties.bountyRewards("group").rankXp === 6250);
   for (const b of board) {
     check(`bounty (${b.size}) reward matches 2.5x`, b.hm_reward === bounties.bountyRewards(b.size).hm);
   }
@@ -114,28 +119,104 @@ function main() {
 
   // ---- Rendering ----
   {
-    const b = bounties.generateBounty("duo");
+    const b = bounties.generateBounty("group");
     const embed = bounties.renderBountyEmbed(b, []);
     check("embed has a title", !!embed.title);
     check("embed description names the NPC", embed.description.includes(b.npc_name));
     check("embed shows the reward", embed.description.includes(`${b.hm_reward} HM`));
     check("embed shows requirements", b.requirements.every((r) => embed.description.includes(Number(r.amount).toLocaleString())));
     check("empty board says no hunters yet", /No hunters yet/.test(embed.description));
-    check("embed clearly labels the group size", embed.description.includes("**Group:** Group of 2 (Duo)"));
+    check("group embed clearly labels collective", embed.description.includes("**Type:** Collective — target grows with hunters"));
 
     const solo = bounties.generateBounty("solo");
     const soloEmbed = bounties.renderBountyEmbed(solo, []);
-    check("solo embed clearly labels solo", soloEmbed.description.includes("**Group:** Solo — just you"));
-    const quad = bounties.generateBounty("quad");
-    const quadEmbed = bounties.renderBountyEmbed(quad, []);
-    check("quad embed clearly labels group of 4", quadEmbed.description.includes("**Group:** Group of 4 (Quad)"));
+    check("solo embed clearly labels solo", soloEmbed.description.includes("**Type:** Solo — just you"));
+    check("solo embed has no collective line", !soloEmbed.description.includes("**Collective:**"));
 
     const withAcc = bounties.renderBountyEmbed(b, [
-      { user_id: "u1", displayName: "Torlokt", progressText: "5,000 / 15,000", completed: false },
-      { user_id: "u2", displayName: "Em Bri", progressText: "15,000 / 15,000", completed: true },
+      { user_id: "u1", displayName: "Torlokt", progressText: "5,000 / 25,000", completed: false, progress: {} },
+      { user_id: "u2", displayName: "Em Bri", progressText: "15,000 / 25,000", completed: true, progress: {} },
     ]);
     check("embed lists acceptors", withAcc.description.includes("Torlokt") && withAcc.description.includes("Em Bri"));
     check("embed marks completions", /Complete!/.test(withAcc.description));
+    check("group embed shows the collective pool line", withAcc.description.includes("**Collective:**"));
+  }
+
+  // ---- Collective tiers: scale grows with hunter count ----
+  {
+    check("0-2 hunters face the duo scale", bounties.tierForCount(0) === "duo" && bounties.tierForCount(1) === "duo" && bounties.tierForCount(2) === "duo");
+    check("3-6 hunters face the trio scale", bounties.tierForCount(3) === "trio" && bounties.tierForCount(6) === "trio");
+    check("7-11 hunters face the quad scale", bounties.tierForCount(7) === "quad" && bounties.tierForCount(11) === "quad");
+    check("12-18 hunters face the 5-man scale", bounties.tierForCount(12) === "five" && bounties.tierForCount(18) === "five");
+    check("19-30 hunters face the 6-man scale", bounties.tierForCount(19) === "six" && bounties.tierForCount(30) === "six");
+    check("past 30 hunters stays at the 6-man scale", bounties.tierForCount(31) === "six" && bounties.tierForCount(100) === "six");
+  }
+
+  // ---- Re-scaling stored (duo-scale) requirements to a tier ----
+  {
+    // A duo-scale boss contract scaled to trio must match direct trio
+    // generation exactly (frac preserves the generic/named/triple share).
+    const duoBoss = [
+      { kind: "boss_kc", boss: null, amount: 375, frac: 1 },
+      { kind: "boss_kc", boss: "Zulrah", amount: 188, frac: 0.5 },
+      { kind: "boss_kc", boss: "Vorkath", amount: 94, frac: 0.25 },
+    ];
+    const trio = bounties.scaleRequirements(duoBoss, "trio");
+    check("generic KC scales duo->trio", trio[0].amount === 625);
+    check("named KC scales duo->trio exactly", trio[1].amount === 313);
+    check("triple KC scales duo->trio exactly", trio[2].amount === 156);
+    const six = bounties.scaleRequirements(duoBoss, "six");
+    check("generic KC scales duo->six", six[0].amount === 1375);
+    check("named KC scales duo->six", six[1].amount === 688);
+    check("triple KC scales duo->six", six[2].amount === 344);
+
+    const duoSkills = [
+      { kind: "skill", skill: "Slayer", amount: 25000, frac: 1 },
+      { kind: "skill", skill: "Prayer", amount: 12500, frac: 0.5 },
+      { kind: "skill", skill: "Hitpoints", amount: 12500, frac: 0.5 },
+      { kind: "skill", skill: "Attack", amount: 18750, frac: 0.75 },
+    ];
+    const quadSkills = bounties.scaleRequirements(duoSkills, "quad");
+    check("skill XP scales duo->quad", quadSkills[0].amount === 60000);
+    check("half-frac skill scales duo->quad", quadSkills[1].amount === 30000);
+    check("three-quarter-frac skill scales duo->quad", quadSkills[3].amount === 45000);
+
+    const duoRaid = [{ kind: "raid", raid: "Tombs of Amascut", amount: 3, frac: 1 }];
+    check("raid KC scales duo->five", bounties.scaleRequirements(duoRaid, "five")[0].amount === 6);
+    check("raid KC scales duo->six", bounties.scaleRequirements(duoRaid, "six")[0].amount === 7);
+  }
+
+  // ---- Effective requirements/rewards for a live bounty ----
+  {
+    const group = bounties.generateBounty("group");
+    const solo = bounties.generateBounty("solo");
+    check("solo effective requirements are the stored ones", bounties.effectiveRequirements(solo, 5) === solo.requirements);
+    check("group with 2 hunters keeps the stored duo amounts", bounties.effectiveRequirements(group, 2).every((r, i) => r.amount === group.requirements[i].amount));
+    check("group with 8 hunters uses quad amounts", bounties.effectiveRequirements(group, 8).every((r, i) => r.amount === bounties.scaleRequirements(group.requirements, "quad")[i].amount));
+    check("solo effective rewards are the stored ones", bounties.effectiveRewards(solo, 9).hm === solo.hm_reward);
+    check("group rewards grow with hunters", bounties.effectiveRewards(group, 2).hm === 625 && bounties.effectiveRewards(group, 8).hm === 1125 && bounties.effectiveRewards(group, 25).hm === 1625);
+    check("group Rank XP grows with hunters", bounties.effectiveRewards(group, 25).rankXp === 16250);
+  }
+
+  // ---- Collective progress pooling ----
+  {
+    const reqs = [{ kind: "boss_kc", boss: null, amount: 375 }];
+    const mk = (gained) => [{ req: reqs[0], gained, done: gained >= 375 }];
+    const { totals, complete } = bounties.collectiveProgress(reqs, [mk(200), mk(100), mk(74)]);
+    check("collective sums every hunter's delta", totals["boss:any"] === 374);
+    check("collective is short by one kill", complete === false);
+    check("collective completes at the target", bounties.collectiveProgress(reqs, [mk(200), mk(175)]).complete === true);
+    check("empty pool never completes", bounties.collectiveProgress(reqs, []).complete === false);
+  }
+
+  // ---- Generated requirements carry frac ----
+  {
+    for (let i = 0; i < 30; i++) {
+      const b = bounties.generateBounty("group");
+      for (const r of b.requirements) {
+        check("generated requirement carries a frac", typeof r.frac === "number" && r.frac > 0 && r.frac <= 1);
+      }
+    }
   }
 
   // ---- Progress computation ----

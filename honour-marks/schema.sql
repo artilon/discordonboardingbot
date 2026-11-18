@@ -469,12 +469,12 @@ begin
 exception when others then null;
 end $$;
 
--- 18. Bounty Quests — the bounty board (12 active at a time: 3 per size).
+-- 18. Bounty Quests — the bounty board (5 active at a time).
 create table if not exists public.hm_bounties (
   id               bigserial primary key,
   guild_id         text not null,
   category         text not null check (category in ('artisan','mercenary','boss','raid')),
-  size             text not null check (size in ('solo','duo','trio','quad')),
+  size             text not null check (size in ('solo','group')),
   npc_name         text not null,
   npc_title        text not null,
   title            text not null,
