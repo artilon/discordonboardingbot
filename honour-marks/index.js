@@ -726,13 +726,13 @@ async function rebaselineIfLegacy(supabase, acc, current) {
   const b = acc.baseline;
   const missingSkills = !b || typeof b.skills !== "object" || b.skills === null;
   const missingBosses = !b || typeof b.bosses !== "object" || b.bosses === null;
-  if (!missingSkills && !missingBosses) return b;
+  if (!missingSkills && !missingBosses) return { baseline: b, rebaselined: false };
   const baseline = {
     skills: missingSkills ? current.skills || {} : b.skills,
     bosses: missingBosses ? current.bosses || {} : b.bosses,
   };
   await supabase.from("hm_bounty_acceptances").update({ baseline }).eq("id", acc.id);
-  return baseline;
+  return { baseline, rebaselined: true };
 }
 
 // Process one bounty's progress for all its hunters: solo bounties
@@ -740,7 +740,13 @@ async function rebaselineIfLegacy(supabase, acc, current) {
 // into one shared total (only contributors get paid). Returns per-hunter
 // results plus the collective pool totals, so the on-demand "Check
 // Progress" button can report back to the clicking member.
-async function processBountyProgress(bounty) {
+//
+// With `onlyUserId` set (the button), only that hunter's hiscores are
+// refetched — everyone else's stored progress is pooled as-is (the
+// 5-minute sweep keeps it fresh, and deltas only grow, so the pool is
+// never overstated). `fresh` bypasses the hiscores cache. This keeps
+// the button to a single fetch instead of one per hunter.
+async function processBountyProgress(bounty, onlyUserId = null, fresh = false) {
   const supabase = getSupabase();
   if (!supabase) return { results: [], poolTotals: null };
   const acceptances = await loadBountyAcceptances(bounty.id);
@@ -756,12 +762,21 @@ async function processBountyProgress(bounty) {
     const byId = new Map();
     for (const acc of acceptances) {
       if (acc.completed) continue;
+      if (onlyUserId && acc.user_id !== onlyUserId) {
+        const stored = effReqs.map((req) => {
+          const gained = acc.progress?.[bounties.reqKey(req)] || 0;
+          return { req, gained, done: gained >= req.amount };
+        });
+        perReqList.push(stored);
+        if (stored.some((p) => p.gained > 0)) contributorIds.add(acc.id);
+        continue;
+      }
       const member = await getMember(acc.user_id).catch(() => null);
       if (!member?.rsn) continue;
-      const snap = await fetchHiscores(member.rsn);
+      const snap = await fetchHiscores(member.rsn, { useCache: !fresh });
       if (!snap) continue;
       const current = { skills: snap.skills || {}, bosses: snap.bosses || {} };
-      const baseline = await rebaselineIfLegacy(supabase, acc, current);
+      const { baseline, rebaselined } = await rebaselineIfLegacy(supabase, acc, current);
       const { perReq } = bounties.computeProgress(effReqs, baseline, current);
       const progress = {};
       let contributed = false;
@@ -772,7 +787,7 @@ async function processBountyProgress(bounty) {
       await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
       perReqList.push(perReq);
       if (contributed) contributorIds.add(acc.id);
-      byId.set(acc.id, { userId: acc.user_id, progress, contributed, completedNow: false, rewards: null });
+      byId.set(acc.id, { userId: acc.user_id, progress, contributed, completedNow: false, rewards: null, rebaselined });
     }
     const { totals, complete } = bounties.collectiveProgress(effReqs, perReqList);
     if (complete) {
@@ -796,17 +811,18 @@ async function processBountyProgress(bounty) {
   }
   for (const acc of acceptances) {
     if (acc.completed) continue;
+    if (onlyUserId && acc.user_id !== onlyUserId) continue;
     const member = await getMember(acc.user_id).catch(() => null);
     if (!member?.rsn) continue;
-    const snap = await fetchHiscores(member.rsn);
+    const snap = await fetchHiscores(member.rsn, { useCache: !fresh });
     if (!snap) continue;
     const current = { skills: snap.skills || {}, bosses: snap.bosses || {} };
-    const baseline = await rebaselineIfLegacy(supabase, acc, current);
+    const { baseline, rebaselined } = await rebaselineIfLegacy(supabase, acc, current);
     const { perReq, complete } = bounties.computeProgress(bounty.requirements, baseline, current);
     const progress = {};
     for (const p of perReq) progress[bounties.reqKey(p.req)] = p.gained;
     await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
-    const entry = { userId: acc.user_id, progress, contributed: perReq.some((p) => p.gained > 0), completedNow: false, rewards: null };
+    const entry = { userId: acc.user_id, progress, contributed: perReq.some((p) => p.gained > 0), completedNow: false, rewards: null, rebaselined };
     if (complete) {
       await completeBountyAcceptance(bounty, acc, 1);
       entry.completedNow = true;
@@ -867,7 +883,7 @@ async function handleBountyCheck(interaction) {
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const { results, poolTotals } = await processBountyProgress(bounty);
+  const { results, poolTotals } = await processBountyProgress(bounty, userId, true);
   await syncBountyBoard(interaction.guildId);
 
   const entry = results.find((r) => r.userId === userId);
@@ -883,11 +899,14 @@ async function handleBountyCheck(interaction) {
   const acceptorCount = (await loadBountyAcceptances(bountyId)).length;
   const effReqs = bounties.effectiveRequirements(bounty, acceptorCount);
   const mineText = bountyProgressText(effReqs, { progress: entry.progress });
+  const note = entry.rebaselined
+    ? "\nProgress counts from this check onward — earlier progress predates the tracking fix and couldn't be recovered."
+    : "";
   if (bounty.size === "group" && poolTotals) {
     const poolText = bountyProgressText(effReqs, { progress: poolTotals });
-    return interaction.editReply({ content: `Checked — you've contributed **${mineText}**. Crew total: **${poolText}**.` });
+    return interaction.editReply({ content: `Checked — you've contributed **${mineText}**. Crew total: **${poolText}**.${note}` });
   }
-  return interaction.editReply({ content: `Checked — you're at **${mineText}**.` });
+  return interaction.editReply({ content: `Checked — you're at **${mineText}**.${note}` });
 }
 
 async function completeBountyAcceptance(bounty, acc, fraction, rewards) {
