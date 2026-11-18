@@ -72,6 +72,7 @@ const LIVE_STREAM = {
   userName: "SomeCoolStreamer",
   startedAt: "2026-10-18T12:00:00Z",
   thumbnailUrl: "https://images.kick.com/video_thumbnails/example/720.webp",
+  viewerCount: 45,
 };
 const OFFLINE_STATUS = { live: false };
 
@@ -129,6 +130,7 @@ const OFFLINE_STATUS = { live: false };
       lastAlertMessage: { id: "msg-1" },
       lastTitle: LIVE_STREAM.title,
       lastGameName: LIVE_STREAM.gameName,
+      lastViewerCount: LIVE_STREAM.viewerCount,
       lastImageRefreshAt: Date.now() - 10 * 60 * 1000,
     };
     const originalInterval = bot.config.kickImageRefreshIntervalMs;
@@ -143,6 +145,13 @@ const OFFLINE_STATUS = { live: false };
       { now: Date.now() }
     );
     check("a title change on the same ongoing session triggers an in-place update, not a new alert", titleChanged.shouldAlert === false && titleChanged.shouldUpdate === true);
+
+    const viewersChanged = bot.decideKickAlert(
+      { ...basePrevState, lastImageRefreshAt: Date.now() },
+      { ...LIVE_STREAM, viewerCount: 99 },
+      { now: Date.now() }
+    );
+    check("a viewer-count change on the same ongoing session also triggers an in-place update", viewersChanged.shouldUpdate === true);
 
     const noMessageOnFile = bot.decideKickAlert(
       { ...basePrevState, lastAlertMessage: null, lastImageRefreshAt: Date.now() },
@@ -183,6 +192,10 @@ const OFFLINE_STATUS = { live: false };
   check(
     "the game/activity is included as a field when known",
     built.embeds[0].data.fields?.some((f) => f.value === "Old School RuneScape")
+  );
+  check(
+    "the viewer count is included as a field when known",
+    built.embeds[0].data.fields?.some((f) => f.name === "Viewers" && f.value === "45")
   );
   check(
     "the thumbnail is set directly (Kick's thumbnail URL needs no {width}/{height} substitution)",

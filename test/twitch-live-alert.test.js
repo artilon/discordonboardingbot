@@ -68,6 +68,7 @@ const LIVE_STREAM = {
   userName: "SomeCoolStreamer",
   startedAt: "2026-10-18T12:00:00Z",
   thumbnailUrl: "https://static-cdn.jtvnw.net/previews-ttv/live_user_x-{width}x{height}.jpg",
+  viewerCount: 123,
 };
 const OFFLINE_STATUS = { live: false };
 
@@ -138,6 +139,7 @@ const OFFLINE_STATUS = { live: false };
       lastAlertMessage: { id: "msg-1" },
       lastTitle: LIVE_STREAM.title,
       lastGameName: LIVE_STREAM.gameName,
+      lastViewerCount: LIVE_STREAM.viewerCount,
       lastImageRefreshAt: Date.now(),
     };
 
@@ -149,6 +151,9 @@ const OFFLINE_STATUS = { live: false };
 
     const gameChanged = bot.decideTwitchAlert(basePrevState, { ...LIVE_STREAM, gameName: "A different game" }, { now: Date.now() });
     check("a game change on the same ongoing session also triggers an in-place update", gameChanged.shouldUpdate === true);
+
+    const viewersChanged = bot.decideTwitchAlert(basePrevState, { ...LIVE_STREAM, viewerCount: 456 }, { now: Date.now() });
+    check("a viewer-count change on the same ongoing session also triggers an in-place update", viewersChanged.shouldUpdate === true);
 
     const imageDue = bot.decideTwitchAlert(basePrevState, LIVE_STREAM, {
       now: basePrevState.lastImageRefreshAt + 10 * 60 * 1000,
@@ -197,6 +202,10 @@ const OFFLINE_STATUS = { live: false };
   check(
     "the game/activity is included as a field when known",
     built.embeds[0].data.fields?.some((f) => f.value === "Old School RuneScape")
+  );
+  check(
+    "the viewer count is included as a field when known",
+    built.embeds[0].data.fields?.some((f) => f.name === "Viewers" && f.value === "123")
   );
   check(
     "the thumbnail's {width}/{height} placeholders are resolved to real numbers",
