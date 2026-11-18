@@ -925,14 +925,24 @@ function buildGuideSections(setup = {}) {
         `**Solo bounties** track only you — your progress, your finish, your payout.\\n\\n` +
         `**Collective bounties** pool everyone together: every hunter's progress adds into one shared ` +
         `total, and the bounty finishes when the whole crew hits the target. The target starts small ` +
-        `and grows as more hunters join — 2 hunters face the smallest target, and it scales up as the ` +
-        `crew grows (up to 30 hunters). Everyone who actually contributed gets paid when it finishes; ` +
+        `and grows as more hunters join, so a small crew is never handed a huge target:\\n` +
+        `• 2 hunters — smallest target (375 boss kills, 25,000 skill XP, or 3 raid clears)\\n` +
+        `• 3–6 hunters — 625 boss kills, 40,000 skill XP, or 4 raid clears\\n` +
+        `• 7–11 hunters — 875 boss kills, 60,000 skill XP, or 5 raid clears\\n` +
+        `• 12–18 hunters — 1,125 boss kills, 85,000 skill XP, or 6 raid clears\\n` +
+        `• 19–30 hunters — biggest target (1,375 boss kills, 115,000 skill XP, or 7 raid clears)\\n\\n` +
+        `If someone joins mid-bounty, the target grows to match the new crew size — the post updates ` +
+        `to show the new numbers. Everyone who actually contributed gets paid when it finishes; ` +
         `accepting and never lifting a finger pays nothing.\\n\\n` +
         `**Step 5 — Get paid.** When the bounty finishes, the HM and Rank XP land in your account on ` +
         `their own. Bounties pay **2.5 times** what a normal quest of the same scale pays:\\n` +
         `• Solo bounty — 375 ${HM_EMOJI} + 3,750 Rank XP\\n` +
-        `• Collective bounty — starts at 625 ${HM_EMOJI} + 6,250 Rank XP with 2 hunters and grows ` +
-        `with the crew, up to 1,625 ${HM_EMOJI} + 16,250 Rank XP at 19+ hunters\\n\\n` +
+        `• Collective bounty — grows with the crew:\\n` +
+        `  • 2 hunters — 625 ${HM_EMOJI} + 6,250 Rank XP\\n` +
+        `  • 3–6 hunters — 875 ${HM_EMOJI} + 8,750 Rank XP\\n` +
+        `  • 7–11 hunters — 1,125 ${HM_EMOJI} + 11,250 Rank XP\\n` +
+        `  • 12–18 hunters — 1,375 ${HM_EMOJI} + 13,750 Rank XP\\n` +
+        `  • 19+ hunters — 1,625 ${HM_EMOJI} + 16,250 Rank XP\\n\\n` +
         `**The 4 kinds of bounties:**\\n` +
         `• **Artisan** — train two skills that go together. A blacksmith wants Mining + Smithing. An ` +
         `alchemist wants Farming + Herblore. The NPC's job tells you which two.\\n` +
