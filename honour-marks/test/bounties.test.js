@@ -6,6 +6,7 @@ const assert = require("assert");
 const path = require("path");
 
 const bounties = require(path.join(__dirname, "..", "src", "bounties.js"));
+const { SKILL_MAP, ACTIVITY_MAP } = require(path.join(__dirname, "..", "src", "jagex.js"));
 
 let passed = 0;
 function check(label, cond) {
@@ -246,6 +247,50 @@ function main() {
     const b2 = { skills: {}, activities: { Zulrah: 10, Vorkath: 5 } };
     const c2 = { skills: {}, activities: { Zulrah: 13, Vorkath: 9 } };
     check("any-boss sums deltas across bosses", bounties.computeProgress(anyReqs, b2, c2).perReq[0].gained === 7);
+  }
+  {
+    // Regression: real fetchHiscores snapshots are keyed by internal keys
+    // ("mining", "tombs_of_amascut") with { experience } / { kills } object
+    // values, while requirements carry display names ("Mining", "Tombs of
+    // Amascut"). computeProgress must translate + unwrap — the old code
+    // read plain numbers from a non-existent `activities` section and
+    // reported 0 for everything.
+    const baseline = {
+      skills: { mining: { experience: 5000, level: 40 }, slayer: { experience: 10000, level: 50 } },
+      bosses: { tombs_of_amascut: { kills: 10 }, zulrah: { kills: 20 } },
+    };
+    const current = {
+      skills: { mining: { experience: 12000, level: 45 }, slayer: { experience: 16000, level: 55 } },
+      bosses: { tombs_of_amascut: { kills: 13 }, zulrah: { kills: 24 } },
+    };
+    const reqs = [
+      { kind: "skill", skill: "Mining", amount: 7000 },
+      { kind: "skill", skill: "Slayer", amount: 6000 },
+      { kind: "raid", raid: "Tombs of Amascut", amount: 3 },
+      { kind: "boss_kc", boss: "Zulrah", amount: 4 },
+    ];
+    const { perReq, complete } = bounties.computeProgress(reqs, baseline, current);
+    check("real snapshot: skill XP delta unwraps {experience}", perReq[0].gained === 7000);
+    check("real snapshot: second skill delta", perReq[1].gained === 6000);
+    check("real snapshot: raid delta reads bosses section", perReq[2].gained === 3);
+    check("real snapshot: named boss delta", perReq[3].gained === 4);
+    check("real snapshot: completes when all met", complete === true);
+
+    const anyReqs = [{ kind: "boss_kc", boss: null, amount: 7 }];
+    check("real snapshot: any-boss sums all boss deltas", bounties.computeProgress(anyReqs, baseline, current).perReq[0].gained === 7);
+
+    // Internal keys in requirements resolve too (defensive).
+    const keyReqs = [{ kind: "skill", skill: "mining", amount: 7000 }];
+    check("real snapshot: internal skill key also resolves", bounties.computeProgress(keyReqs, baseline, current).perReq[0].gained === 7000);
+  }
+  {
+    // Every generated requirement must be trackable against a real
+    // hiscores snapshot — a display name with no map entry reads 0 forever.
+    check("every BOSS_POOL entry is a trackable hiscores activity", bounties.BOSS_POOL.every((b) => b in ACTIVITY_MAP));
+    check("every RAID is a trackable hiscores activity", bounties.RAIDS.every((r) => r in ACTIVITY_MAP));
+    const npcSkills = bounties.ARTISAN_NPCS.flatMap((n) => n.skills);
+    check("every NPC skill is a real hiscores skill", npcSkills.every((s) => s in SKILL_MAP));
+    check("every combat style is a real hiscores skill", bounties.COMBAT_STYLES.every((s) => s in SKILL_MAP));
   }
 
   console.log(`\n[bounties] ${passed} checks passed.`);
