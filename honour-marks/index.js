@@ -700,7 +700,7 @@ async function handleBountyAccept(interaction) {
   // below updates the post to show the new hunter — that's the confirmation.
   await interaction.deferUpdate();
   const snap = await fetchHiscores(member.rsn);
-  const baseline = snap ? { skills: snap.skills || {}, activities: snap.activities || {} } : { skills: {}, activities: {} };
+  const baseline = snap ? { skills: snap.skills || {}, bosses: snap.bosses || {} } : { skills: {}, bosses: {} };
 
   await supabase.from("hm_bounty_acceptances").insert({
     bounty_id: bountyId,
@@ -714,6 +714,25 @@ async function handleBountyAccept(interaction) {
   await supabase.from("hm_bounties").update({ last_accepted_at: new Date().toISOString() }).eq("id", bountyId);
 
   await syncBountyBoard(interaction.guildId);
+}
+
+// Baselines written before the snapshot-shape fix have no `bosses`
+// section (boss/raid counts were never recorded — they were read from a
+// non-existent `activities` field). Fill any missing section from the
+// current snapshot so boss progress restarts from now instead of
+// crediting all-time KC. Skill baselines were stored correctly (just in
+// object shape) and are preserved.
+async function rebaselineIfLegacy(supabase, acc, current) {
+  const b = acc.baseline;
+  const missingSkills = !b || typeof b.skills !== "object" || b.skills === null;
+  const missingBosses = !b || typeof b.bosses !== "object" || b.bosses === null;
+  if (!missingSkills && !missingBosses) return b;
+  const baseline = {
+    skills: missingSkills ? current.skills || {} : b.skills,
+    bosses: missingBosses ? current.bosses || {} : b.bosses,
+  };
+  await supabase.from("hm_bounty_acceptances").update({ baseline }).eq("id", acc.id);
+  return baseline;
 }
 
 // Process one bounty's progress for all its hunters: solo bounties
@@ -741,8 +760,9 @@ async function processBountyProgress(bounty) {
       if (!member?.rsn) continue;
       const snap = await fetchHiscores(member.rsn);
       if (!snap) continue;
-      const current = { skills: snap.skills || {}, activities: snap.activities || {} };
-      const { perReq } = bounties.computeProgress(effReqs, acc.baseline, current);
+      const current = { skills: snap.skills || {}, bosses: snap.bosses || {} };
+      const baseline = await rebaselineIfLegacy(supabase, acc, current);
+      const { perReq } = bounties.computeProgress(effReqs, baseline, current);
       const progress = {};
       let contributed = false;
       for (const p of perReq) {
@@ -780,8 +800,9 @@ async function processBountyProgress(bounty) {
     if (!member?.rsn) continue;
     const snap = await fetchHiscores(member.rsn);
     if (!snap) continue;
-    const current = { skills: snap.skills || {}, activities: snap.activities || {} };
-    const { perReq, complete } = bounties.computeProgress(bounty.requirements, acc.baseline, current);
+    const current = { skills: snap.skills || {}, bosses: snap.bosses || {} };
+    const baseline = await rebaselineIfLegacy(supabase, acc, current);
+    const { perReq, complete } = bounties.computeProgress(bounty.requirements, baseline, current);
     const progress = {};
     for (const p of perReq) progress[bounties.reqKey(p.req)] = p.gained;
     await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);

@@ -28,6 +28,8 @@
  * Rewards are 2.5x the normal HM quest of the same scale.
  */
 
+const { SKILL_MAP, ACTIVITY_MAP } = require("./jagex");
+
 const BOUNTY_SIZES = ["solo", "group"];
 const BOUNTY_TOTAL = 5;
 // Board category caps — they sum to exactly BOUNTY_TOTAL, so a full board
@@ -87,11 +89,11 @@ const ARTISAN_NPCS = [
   { name: "Fletcher Faye", title: "the Fletcher", flavor: "Bows are flyin' off the shelf and my fingers are cramping. Cut the strings, shape the shafts, and keep the archers supplied.", skills: ["Fletching", "Woodcutting"], contract: "Shafts & Strings" },
   { name: "Chef Burnie", title: "the Cook", flavor: "The feast is in two days and the larders are empty. Bring me the catch and I'll turn it into somethin' fit for a king.", skills: ["Cooking", "Fishing"], contract: "The Feast" },
   { name: "Jeweller Jem", title: "the Jeweller", flavor: "A noble's commissioned a ring and I need the stones and the setting both. Dig deep, cut clean, and don't scratch the gold.", skills: ["Mining", "Crafting"], contract: "Stones & Settings" },
-  { name: "Mason Mabel", title: "the Stonemason", flavor: "The new fountain's half-built and the quarry's gone quiet. Cut me blocks and set 'em true — the water won't wait.", skills: ["Quarry", "Construction"], contract: "Blocks & Mortar" },
+  { name: "Mason Mabel", title: "the Stonemason", flavor: "The new fountain's half-built and the quarry's gone quiet. Cut me blocks and set 'em true — the water won't wait.", skills: ["Mining", "Construction"], contract: "Blocks & Mortar" },
   { name: "Scribe Silas", title: "the Scribe", flavor: "The clan chronicle needs writin' and the ink's run dry. Gather the parchment and bind it proper — history waits for no one.", skills: ["Crafting", "Fletching"], contract: "Ink & Parchment" },
   { name: "Herbalist Hana", title: "the Herbalist", flavor: "The healers need tonics and the garden's overrun. Pull the weeds, pick the herbs, and mind the mandrakes — they bite.", skills: ["Farming", "Herblore"], contract: "Tonics & Tinctures" },
   { name: "Navigator Nell", title: "the Sailor", flavor: "Charts are useless without a crew who knows the tides. Haul the nets, trim the sails, and keep her steady through the strait.", skills: ["Sailing", "Fishing"], contract: "Tide & Timber" },
-  { name: "Runecarver Rook", title: "the Runecarver", flavor: "The rune stones are cracked and the altar's gone cold. Quarry the stone and carve it true — the gods are watchin'.", skills: ["Quarry", "Runecraft"], contract: "Stones of Power" },
+  { name: "Runecarver Rook", title: "the Runecarver", flavor: "The rune stones are cracked and the altar's gone cold. Quarry the stone and carve it true — the gods are watchin'.", skills: ["Mining", "Runecraft"], contract: "Stones of Power" },
   { name: "Weaver Willa", title: "the Weaver", flavor: "Winter's comin' and the looms sit idle. Shear the sheep, spin the wool, and weave us all warm cloaks.", skills: ["Hunter", "Crafting"], contract: "Wool & Weave" },
   { name: "Brewer Bruno", title: "the Brewer", flavor: "The tavern's barrels are dry and the regulars are restless. Malt the grain, ferment it slow, and don't let it turn to vinegar.", skills: ["Farming", "Cooking"], contract: "Malt & Mash" },
   { name: "Cartographer Cleo", title: "the Cartographer", flavor: "Half the map's blank and the other half's wrong. Survey the wilds and chart me a coastline worth the parchment.", skills: ["Hunter", "Sailing"], contract: "Charts & Coasts" },
@@ -120,14 +122,13 @@ const BOSS_NPCS = [
 // Bosses eligible for named/triple contracts. High-end / storyline bosses
 // that should never be assigned are simply absent from this pool.
 const BOSS_POOL = [
-  "Zulrah", "Vorkath", "Cerberus", "Kree'arra", "King Black Dragon",
-  "Chaos Elemental", "Crazy Archaeologist", "Scorpia", "King Sand Crab",
-  "Giant Mole", "Barrows: Dharok", "Barrows: Verac", "Barrows: Torag",
-  "Barrows: Karil", "Barrows: Guthan", "Barrows: Ahrim",
+  "Zulrah", "Vorkath", "Cerberus", "Kree'Arra", "King Black Dragon",
+  "Chaos Elemental", "Crazy Archaeologist", "Scorpia",
+  "Giant Mole",
   "Dagannoth Supreme", "Dagannoth Rex", "Dagannoth Prime",
   "Callisto", "Vet'ion", "Chaos Fanatic", "Scorpia",
   "Kalphite Queen", "Abyssal Sire", "Alchemical Hydra", "Thermonuclear Smoke Devil",
-  "Sarachnis", "Corporeal Beast", "Elemental", "Mimic",
+  "Sarachnis", "Corporeal Beast", "Mimic",
 ];
 
 const RAID_NPCS = [
@@ -412,22 +413,52 @@ function reqKey(req) {
   return req.kind;
 }
 
+// Snapshot value lookups. Requirements store display names ("Slayer",
+// "Zulrah", "Tombs of Amascut") while fetchHiscores snapshots are keyed by
+// internal keys ("slayer", "zulrah", "tombs_of_amascut") with object values
+// ({ experience } / { kills }) — translate + unwrap here so the two shapes
+// meet. Plain-number values (older stored baselines, tests) also work, as
+// does the legacy `activities` section name.
+function skillXp(snap, name) {
+  const key = SKILL_MAP[name] || name;
+  const v = snap?.skills?.[key] ?? snap?.skills?.[name];
+  return v?.experience ?? v ?? 0;
+}
+
+function bossKills(snap, name) {
+  const key = ACTIVITY_MAP[name] || name;
+  const v =
+    snap?.bosses?.[key] ?? snap?.bosses?.[name] ??
+    snap?.activities?.[key] ?? snap?.activities?.[name];
+  return v?.kills ?? v ?? 0;
+}
+
+function allBossKeys(...snaps) {
+  const keys = new Set();
+  for (const snap of snaps) {
+    for (const k of Object.keys(snap?.bosses || {})) keys.add(k);
+    for (const k of Object.keys(snap?.activities || {})) keys.add(k);
+  }
+  return keys;
+}
+
 function computeProgress(requirements, baseline = {}, current = {}) {
   const perReq = requirements.map((req) => {
     let gained = 0;
     if (req.kind === "skill") {
-      gained = Math.max(0, (current.skills?.[req.skill] || 0) - (baseline.skills?.[req.skill] || 0));
+      gained = Math.max(0, skillXp(current, req.skill) - skillXp(baseline, req.skill));
     } else if (req.kind === "boss_kc") {
       if (req.boss) {
-        gained = Math.max(0, (current.activities?.[req.boss] || 0) - (baseline.activities?.[req.boss] || 0));
+        gained = Math.max(0, bossKills(current, req.boss) - bossKills(baseline, req.boss));
       } else {
         // Any-boss: sum the delta across every tracked boss activity.
         gained = 0;
-        const keys = new Set([...Object.keys(baseline.activities || {}), ...Object.keys(current.activities || {})]);
-        for (const k of keys) gained += Math.max(0, (current.activities?.[k] || 0) - (baseline.activities?.[k] || 0));
+        for (const k of allBossKeys(baseline, current)) {
+          gained += Math.max(0, bossKills(current, k) - bossKills(baseline, k));
+        }
       }
     } else if (req.kind === "raid") {
-      gained = Math.max(0, (current.activities?.[req.raid] || 0) - (baseline.activities?.[req.raid] || 0));
+      gained = Math.max(0, bossKills(current, req.raid) - bossKills(baseline, req.raid));
     }
     return { req, gained, done: gained >= req.amount };
   });
