@@ -447,8 +447,9 @@ async function refreshPanels(guildId) {
 const BOUNTY_ACCEPT_PREFIX = "hm_bounty_accept:";
 
 // A member's server nickname (which Heimdall keeps matching their RSN), or
-// null if they don't have one. Honour Marks requires a server nickname to
-// register and participate, and shows it instead of the Discord username.
+// null if they don't have one. New registrations require one (it's stored
+// as the display name); already-registered members are exempt. The board
+// shows it instead of the Discord username when present.
 async function getServerNickname(guildId, userId) {
   const guild = await client.guilds.fetch(guildId).catch(() => null);
   if (!guild) return null;
@@ -669,15 +670,6 @@ async function handleBountyAccept(interaction) {
     return interaction.reply({ content: "Register your RuneScape name first (button on the role panel).", flags: MessageFlags.Ephemeral });
   }
 
-  const nickname = await getServerNickname(interaction.guildId, userId);
-  if (!nickname) {
-    return interaction.reply({
-      content:
-        "You need a **server nickname** to accept bounties. Your nickname should match your RuneScape name — " +
-        "ask staff or wait for Heimdall to set it.",
-      flags: MessageFlags.Ephemeral,
-    });
-  }
 
   const { data: existing } = await supabase
     .from("hm_bounty_acceptances")
@@ -1007,8 +999,11 @@ async function performRegistration(interaction, target, rsn) {
 
   // A server nickname (matching the RSN, set by Heimdall) is required to
   // register and participate — it's how the member is shown everywhere.
+  // Already-registered members are exempt: they keep the display name on
+  // file (e.g. the server owner, whose nickname the bot cannot set).
+  const existing = await getMember(target.id);
   const nickname = await getServerNickname(interaction.guildId, target.id);
-  if (!nickname) {
+  if (!nickname && !existing?.rsn) {
     return interaction.editReply({
       content:
         `You need a **server nickname** before registering. Your nickname should match your RuneScape name — ` +
@@ -1036,7 +1031,7 @@ async function performRegistration(interaction, target, rsn) {
       user_id: target.id,
       guild_id: interaction.guildId,
       rsn,
-      display_name: nickname,
+      display_name: nickname || existing?.display_name || rsn,
       active: true,
       updated_at: new Date().toISOString(),
     },
@@ -1527,10 +1522,12 @@ async function handleCreateSolo(interaction, questType, tree, picks = null, toke
   if (!interaction.deferred && !interaction.replied) await interaction.deferUpdate();
   const member = await getMember(interaction.user.id);
 
-  // A server nickname is required to do quests (same rule as registering
-  // and accepting bounties).
+  // A server nickname is required to do quests (same rule as registering)
+  // — but already-registered members are exempt: their RSN and display
+  // name are already on file (e.g. the server owner, whose nickname the
+  // bot cannot set).
   const nickname = await getServerNickname(interaction.guildId, interaction.user.id);
-  if (!nickname) {
+  if (!nickname && !member?.rsn) {
     return interaction.editReply({
       embeds: [emptyPage("Server nickname required", "You need a **server nickname** to do quests. Your nickname should match your RuneScape name — ask staff or wait for Heimdall to set it.").embed],
       components: [],
