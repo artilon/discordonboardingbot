@@ -435,7 +435,7 @@ const config = {
   geMappingFetcher: null,             // Optional override for testing GE /mapping fetches
   geLatestPriceFetcher: null,         // Optional override for testing GE /latest price fetches
   dropRateFetcher: null,              // Optional override for testing OSRS Wiki drop-rate (Bucket API) fetches
-  twitchPollIntervalMs: 90 * 1000,    // Check Twitch for a live-status change every 90 seconds
+  twitchPollIntervalMs: 5 * 60 * 1000,    // Check Twitch for a live-status change every 5 minutes
   twitchStreamFetcher: null,          // Optional override for testing Twitch API fetches
   // Once the live alert is posted, the preview image is also refreshed on a
   // slower cadence even when the title hasn't changed, so a multi-hour
@@ -472,7 +472,7 @@ const config = {
   // Same idea as the Twitch settings above, but for Kick — kept as a fully
   // separate poll/state so being live on both platforms at once tracks and
   // updates two independent alert messages.
-  kickPollIntervalMs: 90 * 1000,
+  kickPollIntervalMs: 5 * 60 * 1000,
   kickStreamFetcher: null,            // Optional override for testing Kick API fetches
   kickImageRefreshIntervalMs: 5 * 60 * 1000,
   kickLiveState: {
@@ -9817,7 +9817,7 @@ async function handleInteraction(interaction) {
 // Posts a no-ping "now live" announcement to the same channel as the Weekly
 // Recap and Rank-Up congrats messages whenever the configured Twitch channel
 // goes live. Polling-based (no public webhook endpoint required) — checks
-// every `config.twitchPollIntervalMs` (default 90s) via Twitch's Helix API.
+// every `config.twitchPollIntervalMs` (default 5min) via Twitch's Helix API.
 const TWITCH_COLOR = 0x9146ff; // Twitch brand purple
 const TWITCH_EMOJI = "<:twitch:1571618429168001146>"; // custom server emoji shown next to Twitch links in live alerts
 
@@ -9876,6 +9876,7 @@ async function fetchTwitchLiveStatus(username) {
     userName: stream.user_name || username,
     startedAt: stream.started_at || null,
     thumbnailUrl: stream.thumbnail_url || "",
+    viewerCount: typeof stream.viewer_count === "number" ? stream.viewer_count : null,
   };
 }
 
@@ -9891,6 +9892,9 @@ function buildTwitchLiveAlert(stream, username) {
     );
   if (stream.gameName) {
     embed.addFields({ name: "Playing", value: stream.gameName, inline: true });
+  }
+  if (typeof stream.viewerCount === "number") {
+    embed.addFields({ name: "Viewers", value: stream.viewerCount.toLocaleString(), inline: true });
   }
   if (stream.thumbnailUrl) {
     // The thumbnail URL is a template with literal {width}/{height} placeholders;
@@ -9977,8 +9981,8 @@ async function findExistingTwitchLiveMessage(username) {
  * a fresh status fetch, decides whether this is a genuinely new "went live"
  * event (as opposed to the same continuous session still being live), or —
  * for a session already alerted on — whether the EXISTING alert message
- * should instead be edited to keep its title/game/preview image current
- * (either because one of those actually changed, or because enough time has
+ * should instead be edited to keep its title/game/viewer count/preview
+ * image current (either because one of those actually changed, or because enough time has
  * passed that the preview image deserves a refresh anyway), and what state
  * to remember for the next poll. `shouldAlert` and `shouldUpdate` are never
  * both true at once: a brand new session always posts fresh rather than
@@ -10003,6 +10007,7 @@ function decideLiveAlert(prevState, status, opts = {}) {
         lastAlertMessage: null,
         lastTitle: null,
         lastGameName: null,
+        lastViewerCount: null,
         lastImageRefreshAt: 0,
       },
     };
@@ -10022,6 +10027,7 @@ function decideLiveAlert(prevState, status, opts = {}) {
         lastAlertMessage: null,
         lastTitle: null,
         lastGameName: null,
+        lastViewerCount: null,
         lastImageRefreshAt: 0,
       },
     };
@@ -10032,8 +10038,9 @@ function decideLiveAlert(prevState, status, opts = {}) {
   // moment it was first sent.
   const titleChanged = (status.title || "") !== (prevState.lastTitle || "");
   const gameChanged = (status.gameName || "") !== (prevState.lastGameName || "");
+  const viewersChanged = (status.viewerCount ?? null) !== (prevState.lastViewerCount ?? null);
   const imageDue = now - (Number(prevState.lastImageRefreshAt) || 0) >= imageRefreshIntervalMs;
-  const shouldUpdate = !!prevState.lastAlertMessage && (titleChanged || gameChanged || imageDue);
+  const shouldUpdate = !!prevState.lastAlertMessage && (titleChanged || gameChanged || viewersChanged || imageDue);
 
   return {
     shouldAlert: false,
@@ -10084,6 +10091,7 @@ async function checkTwitchLiveStatus() {
         lastGameName: status?.live ? status.gameName || "" : null,
         lastThumbnailUrl: status?.live ? status.thumbnailUrl || "" : "",
         lastUserName: status?.live ? status.userName || TWITCH_USERNAME : TWITCH_USERNAME,
+        lastViewerCount: status?.live ? (status.viewerCount ?? null) : null,
       };
       await reconcileLiveAlerts();
       return;
@@ -10098,6 +10106,7 @@ async function checkTwitchLiveStatus() {
         lastGameName: status.gameName || "",
         lastThumbnailUrl: status.thumbnailUrl || "",
         lastUserName: status.userName || TWITCH_USERNAME,
+        lastViewerCount: status.viewerCount ?? null,
         lastImageRefreshAt: Date.now(),
       };
     } else if (shouldUpdate) {
@@ -10109,6 +10118,7 @@ async function checkTwitchLiveStatus() {
             lastGameName: status.gameName || "",
             lastThumbnailUrl: status.thumbnailUrl || "",
             lastUserName: status.userName || TWITCH_USERNAME,
+            lastViewerCount: status.viewerCount ?? null,
             lastImageRefreshAt: Date.now(),
           }
         : // The message is gone (e.g. deleted) — stop trying to update it for
@@ -10156,6 +10166,7 @@ async function primeTwitchLiveState() {
         lastAlertMessage: adoptedAsCombined ? null : existingMessage,
         lastTitle: null,
         lastGameName: null,
+        lastViewerCount: null,
         lastThumbnailUrl: status.thumbnailUrl || "",
         lastUserName: status.userName || TWITCH_USERNAME,
         lastImageRefreshAt: 0,
@@ -10263,6 +10274,7 @@ async function fetchKickLiveStatus(username) {
     userName: channel.slug || username,
     startedAt: channel.stream.start_time || null,
     thumbnailUrl: channel.stream.thumbnail || "",
+    viewerCount: typeof channel.stream.viewer_count === "number" ? channel.stream.viewer_count : null,
   };
 }
 
@@ -10278,6 +10290,9 @@ function buildKickLiveAlert(stream, username) {
     );
   if (stream.gameName) {
     embed.addFields({ name: "Playing", value: stream.gameName, inline: true });
+  }
+  if (typeof stream.viewerCount === "number") {
+    embed.addFields({ name: "Viewers", value: stream.viewerCount.toLocaleString(), inline: true });
   }
   if (stream.thumbnailUrl) {
     // Unlike Twitch, Kick's thumbnail URL isn't a {width}/{height} template —
@@ -10374,6 +10389,7 @@ async function checkKickLiveStatus() {
         lastGameName: status?.live ? status.gameName || "" : null,
         lastThumbnailUrl: status?.live ? status.thumbnailUrl || "" : "",
         lastUserName: status?.live ? status.userName || KICK_USERNAME : KICK_USERNAME,
+        lastViewerCount: status?.live ? (status.viewerCount ?? null) : null,
       };
       await reconcileLiveAlerts();
       return;
@@ -10388,6 +10404,7 @@ async function checkKickLiveStatus() {
         lastGameName: status.gameName || "",
         lastThumbnailUrl: status.thumbnailUrl || "",
         lastUserName: status.userName || KICK_USERNAME,
+        lastViewerCount: status.viewerCount ?? null,
         lastImageRefreshAt: Date.now(),
       };
     } else if (shouldUpdate) {
@@ -10399,6 +10416,7 @@ async function checkKickLiveStatus() {
             lastGameName: status.gameName || "",
             lastThumbnailUrl: status.thumbnailUrl || "",
             lastUserName: status.userName || KICK_USERNAME,
+            lastViewerCount: status.viewerCount ?? null,
             lastImageRefreshAt: Date.now(),
           }
         : // The message is gone (e.g. deleted) — stop trying to update it for
@@ -10432,6 +10450,7 @@ async function primeKickLiveState() {
         lastAlertMessage: adoptedAsCombined ? null : existingMessage,
         lastTitle: null,
         lastGameName: null,
+        lastViewerCount: null,
         lastThumbnailUrl: status.thumbnailUrl || "",
         lastUserName: status.userName || KICK_USERNAME,
         lastImageRefreshAt: 0,
@@ -10507,13 +10526,15 @@ function buildCombinedLiveAlert(firstPlatform) {
   const header = sameName
     ? `🔴 **${twitchUser}** is now live on Twitch and Kick!`
     : `🔴 **${twitchUser}** is now live on Twitch and **${kickUser}** is now live on Kick!`;
+  const twitchViewers = typeof twitchState.lastViewerCount === "number" ? ` — ${twitchState.lastViewerCount.toLocaleString()} watching` : "";
+  const kickViewers = typeof kickState.lastViewerCount === "number" ? ` — ${kickState.lastViewerCount.toLocaleString()} watching` : "";
   const embed = new EmbedBuilder()
     .setColor(firstIsTwitch ? TWITCH_COLOR : KICK_COLOR)
     .setDescription(
       `${header}\n\n` +
-      `🟣 **Twitch:** ${twitchState.lastTitle || "No title set"}\n` +
+      `🟣 **Twitch:** ${twitchState.lastTitle || "No title set"}${twitchViewers}\n` +
       `${TWITCH_EMOJI} https://twitch.tv/${TWITCH_USERNAME}\n\n` +
-      `🟢 **Kick:** ${kickState.lastTitle || "No title set"}\n` +
+      `🟢 **Kick:** ${kickState.lastTitle || "No title set"}${kickViewers}\n` +
       `${KICK_EMOJI} https://kick.com/${KICK_USERNAME}`
     );
   if (twitchState.lastGameName) {

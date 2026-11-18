@@ -86,6 +86,7 @@ const TWITCH_LIVE = {
   userName: "TestTwitch",
   startedAt: "2026-11-14T12:00:00Z",
   thumbnailUrl: "https://static-cdn.jtvnw.net/previews-ttv/live_user_testtwitch-{width}x{height}.jpg",
+  viewerCount: 123,
 };
 const KICK_LIVE = {
   live: true,
@@ -95,11 +96,12 @@ const KICK_LIVE = {
   userName: "TestKick",
   startedAt: "2026-11-14T12:05:00Z",
   thumbnailUrl: "https://images.kick.com/video/live/testkick-thumb.jpg",
+  viewerCount: 45,
 };
 const OFFLINE = { live: false };
 
 function blankState() {
-  return { wasLive: false, lastAlertedStreamId: null, lastAlertMessage: null, lastTitle: null, lastGameName: null, lastThumbnailUrl: null, lastUserName: null, lastImageRefreshAt: 0 };
+  return { wasLive: false, lastAlertedStreamId: null, lastAlertMessage: null, lastTitle: null, lastGameName: null, lastViewerCount: null, lastThumbnailUrl: null, lastUserName: null, lastImageRefreshAt: 0 };
 }
 function blankCombined() {
   return { message: null, imagePlatform: null, dead: false, lastEditAt: 0, lastTwitchTitle: null, lastTwitchGame: null, lastTwitchStreamId: null, lastKickTitle: null, lastKickGame: null, lastKickStreamId: null };
@@ -116,8 +118,8 @@ function resetAll() {
   // ================= buildCombinedLiveAlert (embed shape) =================
 
   resetAll();
-  bot.config.twitchLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: TWITCH_LIVE.id, lastTitle: TWITCH_LIVE.title, lastGameName: TWITCH_LIVE.gameName, lastThumbnailUrl: TWITCH_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
-  bot.config.kickLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: KICK_LIVE.id, lastTitle: KICK_LIVE.title, lastGameName: KICK_LIVE.gameName, lastThumbnailUrl: KICK_LIVE.thumbnailUrl, lastUserName: KICK_LIVE.userName };
+  bot.config.twitchLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: TWITCH_LIVE.id, lastTitle: TWITCH_LIVE.title, lastGameName: TWITCH_LIVE.gameName, lastViewerCount: TWITCH_LIVE.viewerCount, lastThumbnailUrl: TWITCH_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
+  bot.config.kickLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: KICK_LIVE.id, lastTitle: KICK_LIVE.title, lastGameName: KICK_LIVE.gameName, lastViewerCount: KICK_LIVE.viewerCount, lastThumbnailUrl: KICK_LIVE.thumbnailUrl, lastUserName: KICK_LIVE.userName };
 
   const twitchFirst = bot.buildCombinedLiveAlert("twitch");
   const twitchFirstDesc = twitchFirst.embeds[0].data.description;
@@ -131,6 +133,8 @@ function resetAll() {
   check("the combined alert shows the Kick title", twitchFirstDesc.includes("Kick title one"));
   check("the Twitch title is marked with a purple circle", twitchFirstDesc.includes("🟣 **Twitch:** Twitch title one"));
   check("the Kick title is marked with a green circle", twitchFirstDesc.includes("🟢 **Kick:** Kick title one"));
+  check("the combined alert shows the Twitch viewer count", twitchFirstDesc.includes("123 watching"));
+  check("the combined alert shows the Kick viewer count", twitchFirstDesc.includes("45 watching"));
   check("the combined alert shows both games as fields", twitchFirst.embeds[0].data.fields?.some((f) => f.value === "Old School RuneScape") && twitchFirst.embeds[0].data.fields.length === 2);
   check("Twitch-first uses Twitch's brand color", twitchFirst.embeds[0].data.color === 0x9146ff);
   check("Twitch-first shows the Twitch preview image (placeholders resolved)", twitchFirst.embeds[0].data.image?.url.includes("previews-ttv") && !twitchFirst.embeds[0].data.image.url.includes("{width}"));
@@ -281,8 +285,8 @@ function resetAll() {
     // Simulate the pre-restart process: both live, combined alert posted.
     // Same display name on both platforms, like the real setup — so the
     // posted combined alert uses the single-name header.
-    bot.config.twitchLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: TWITCH_LIVE.id, lastTitle: TWITCH_LIVE.title, lastGameName: TWITCH_LIVE.gameName, lastThumbnailUrl: TWITCH_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
-    bot.config.kickLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: KICK_LIVE.id, lastTitle: KICK_LIVE.title, lastGameName: KICK_LIVE.gameName, lastThumbnailUrl: KICK_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
+    bot.config.twitchLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: TWITCH_LIVE.id, lastTitle: TWITCH_LIVE.title, lastGameName: TWITCH_LIVE.gameName, lastViewerCount: TWITCH_LIVE.viewerCount, lastThumbnailUrl: TWITCH_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
+    bot.config.kickLiveState = { ...blankState(), wasLive: true, lastAlertedStreamId: KICK_LIVE.id, lastTitle: KICK_LIVE.title, lastGameName: KICK_LIVE.gameName, lastViewerCount: KICK_LIVE.viewerCount, lastThumbnailUrl: KICK_LIVE.thumbnailUrl, lastUserName: TWITCH_LIVE.userName };
     await bot.postCombinedLiveAlert("twitch");
     check("setup: the pre-restart combined alert is sitting in the channel", ch._sent.length === 1);
     check("setup: the pre-restart combined alert uses the single-name header", ch._sent[0].embeds[0].data.description.includes("**TestTwitch** is now live on Twitch and Kick!"));
