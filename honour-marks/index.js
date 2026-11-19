@@ -796,8 +796,8 @@ async function processBountyProgress(bounty, onlyUserId = null, fresh = false) {
         if (acc.completed) continue;
         const entry = byId.get(acc.id);
         if (contributorIds.has(acc.id)) {
-          await completeBountyAcceptance(bounty, acc, 1, rewards);
-          if (entry) { entry.completedNow = true; entry.rewards = rewards; }
+          const paid = await completeBountyAcceptance(bounty, acc, 1, rewards);
+          if (entry && paid) { entry.completedNow = true; entry.rewards = rewards; }
         } else {
           // Accepted but never contributed — the bounty is done for
           // them too, just without a payout.
@@ -824,9 +824,11 @@ async function processBountyProgress(bounty, onlyUserId = null, fresh = false) {
     await supabase.from("hm_bounty_acceptances").update({ progress }).eq("id", acc.id);
     const entry = { userId: acc.user_id, progress, contributed: perReq.some((p) => p.gained > 0), completedNow: false, rewards: null, rebaselined };
     if (complete) {
-      await completeBountyAcceptance(bounty, acc, 1);
-      entry.completedNow = true;
-      entry.rewards = { hm: bounty.hm_reward, rankXp: bounty.rank_xp_reward };
+      const paid = await completeBountyAcceptance(bounty, acc, 1);
+      if (paid) {
+        entry.completedNow = true;
+        entry.rewards = { hm: bounty.hm_reward, rankXp: bounty.rank_xp_reward };
+      }
     }
     results.push(entry);
   }
@@ -909,25 +911,30 @@ async function handleBountyCheck(interaction) {
   return interaction.editReply({ content: `Checked — you're at **${mineText}**.${note}` });
 }
 
+// Pays out a completed bounty acceptance, then marks it completed.
+// Returns true once the acceptance is marked. Payout comes FIRST: if a
+// credit fails, the acceptance stays open and the next sweep/check
+// retries. Both credits are idempotent (ledger key / pending_rank_xp
+// unique key), so a retry after a partial failure can't double-pay.
 async function completeBountyAcceptance(bounty, acc, fraction, rewards) {
   const supabase = getSupabase();
-  if (!supabase || acc.rewarded) return;
+  if (!supabase || acc.rewarded) return false;
   const hm = Math.round((rewards?.hm ?? bounty.hm_reward) * fraction);
   const rankXp = Math.round((rewards?.rankXp ?? bounty.rank_xp_reward) * fraction);
-  await supabase.from("hm_bounty_acceptances").update({ completed: true, rewarded: true }).eq("id", acc.id);
   if (hm > 0) {
-    await creditHm({
+    const res = await creditHm({
       guildId: bounty.guild_id,
       userId: acc.user_id,
       amount: hm,
       kind: "bounty",
       reason: `Bounty: ${bounty.title}`,
       idempotencyKey: `bounty:${bounty.id}:${acc.user_id}`,
-    }).catch(() => {});
+    });
+    if (!res.ok) return false;
   }
   if (rankXp > 0) {
     const member = await getMember(acc.user_id).catch(() => null);
-    await supabase.from("pending_rank_xp").insert({
+    const { error } = await supabase.from("pending_rank_xp").insert({
       guild_id: bounty.guild_id,
       user_id: acc.user_id,
       rsn: member?.rsn || null,
@@ -935,10 +942,17 @@ async function completeBountyAcceptance(bounty, acc, fraction, rewards) {
       reason: `Bounty: ${bounty.title}`,
       event_key: "bounty",
       idempotency_key: `bounty_xp:${bounty.id}:${acc.user_id}`,
-    }).catch(() => {});
+    });
+    // 23505 = unique violation = already queued. Not an error.
+    if (error && error.code !== "23505") {
+      console.error("[Bounties] pending_rank_xp insert:", error.message);
+      return false;
+    }
   }
+  await supabase.from("hm_bounty_acceptances").update({ completed: true, rewarded: true }).eq("id", acc.id);
   // Completed bounties count toward active clan quests (they are
   // hiscores-backed, so matching clan quests advance on their next sync).
+  return true;
 }
 
 // ── Interaction: slash commands ──────────────────────────────────────────────
