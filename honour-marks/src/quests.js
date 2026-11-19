@@ -1221,6 +1221,18 @@ async function creditHm({ guildId, userId, amount, kind, reason, idempotencyKey,
   const supabase = getSupabase();
   if (!supabase || amount <= 0) return { ok: false, balance: 0 };
 
+  // Idempotency: the ledger's idempotency_key is unique — if this exact
+  // award already landed, the balance was already updated. Skip so a
+  // retry after a partial failure can't double-pay.
+  if (idempotencyKey) {
+    const { data: existing } = await supabase
+      .from("hm_transactions")
+      .select("balance_after")
+      .eq("idempotency_key", idempotencyKey)
+      .maybeSingle();
+    if (existing) return { ok: true, balance: Number(existing.balance_after) || 0, duplicate: true };
+  }
+
   const { data: bal } = await supabase
     .from("hm_balances")
     .select("*")
