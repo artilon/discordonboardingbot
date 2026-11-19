@@ -60,12 +60,14 @@ const {
 } = require("./src/setup");
 const { buildOverwrites, overwriteContext } = require("./src/permissions");
 const bounties = require("./src/bounties");
+const { initLogger, logEvent } = require("./src/logger");
 
 assertConfig();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
+initLogger(client);
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 const { commands } = require("./src/commands");
@@ -597,6 +599,15 @@ async function syncBountyBoardInner(guildId) {
     if (now > deadline) {
       expiredIds.add(b.id);
       await supabase.from("hm_bounties").update({ status: "expired" }).eq("id", b.id);
+      logEvent(guildId, {
+        title: "⌛ Bounty Cycled",
+        color: 0x95a5a6,
+        fields: [
+          { name: "Bounty", value: b.title, inline: true },
+          { name: "Category", value: `${b.category} (${b.size})`, inline: true },
+          { name: "Reason", value: hasHunters ? "96h max active window" : "3h cycle", inline: true },
+        ],
+      });
       if (b.message_id) {
         const msg = await channel.messages.fetch(b.message_id).catch(() => null);
         await msg?.delete().catch(() => {});
@@ -636,6 +647,16 @@ async function syncBountyBoardInner(guildId) {
     if (!error && inserted) {
       active.push(inserted);
       counts[spec.category] = (counts[spec.category] || 0) + 1;
+      logEvent(guildId, {
+        title: "📋 Bounty Posted",
+        color: 0x95a5a6,
+        fields: [
+          { name: "Bounty", value: inserted.title, inline: true },
+          { name: "Category", value: `${inserted.category} (${inserted.size})`, inline: true },
+          { name: "Reward", value: `${inserted.hm_reward} HM + ${inserted.rank_xp_reward} Rank XP`, inline: true },
+          { name: "Requirements", value: bounties.formatRequirements(inserted.requirements) },
+        ],
+      });
     }
     need--;
   }
@@ -712,6 +733,16 @@ async function handleBountyAccept(interaction) {
     rewarded: false,
   });
   await supabase.from("hm_bounties").update({ last_accepted_at: new Date().toISOString() }).eq("id", bountyId);
+
+  logEvent(interaction.guildId, {
+    title: "📜 Bounty Accepted",
+    color: 0xf1c40f,
+    fields: [
+      { name: "Member", value: `<@${userId}>`, inline: true },
+      { name: "Bounty", value: bounty.title, inline: true },
+      { name: "Category", value: `${bounty.category} (${bounty.size})`, inline: true },
+    ],
+  });
 
   await syncBountyBoard(interaction.guildId);
 }
@@ -821,6 +852,15 @@ async function processBountyProgress(bounty, onlyUserId = null, fresh = false) {
           // Accepted but never contributed — the bounty is done for
           // them too, just without a payout.
           await supabase.from("hm_bounty_acceptances").update({ completed: true }).eq("id", acc.id);
+          logEvent(bounty.guild_id, {
+            title: "✅ Bounty Completed",
+            color: 0x57f287,
+            fields: [
+              { name: "Member", value: `<@${acc.user_id}>`, inline: true },
+              { name: "Bounty", value: bounty.title, inline: true },
+              { name: "Awarded", value: "No payout — didn't contribute", inline: true },
+            ],
+          });
           if (entry) entry.completedNow = true;
         }
       }
@@ -997,6 +1037,15 @@ async function completeBountyAcceptance(bounty, acc, fraction, rewards) {
     }
   }
   await supabase.from("hm_bounty_acceptances").update({ completed: true, rewarded: true }).eq("id", acc.id);
+  logEvent(bounty.guild_id, {
+    title: "✅ Bounty Completed",
+    color: 0x57f287,
+    fields: [
+      { name: "Member", value: `<@${acc.user_id}>`, inline: true },
+      { name: "Bounty", value: bounty.title, inline: true },
+      { name: "Awarded", value: `${hm} HM + ${rankXp} Rank XP`, inline: true },
+    ],
+  });
   // Completed bounties count toward active clan quests (they are
   // hiscores-backed, so matching clan quests advance on their next sync).
   return true;
@@ -1472,6 +1521,14 @@ async function handleHm(interaction) {
       // Post a fresh board in the current format.
       await syncBountyBoardInner(interaction.guildId);
       return { removed: active.length, deleted: deletedCount };
+    });
+    logEvent(interaction.guildId, {
+      title: "🧹 Bounty Board Reset",
+      color: 0xed4245,
+      fields: [
+        { name: "By", value: `<@${interaction.user.id}>`, inline: true },
+        { name: "Removed", value: `${removed} bounties (${deleted} messages deleted)`, inline: true },
+      ],
     });
     return interaction.editReply({
       content:

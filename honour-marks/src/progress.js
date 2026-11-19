@@ -6,6 +6,7 @@ const {
 } = require("./quests");
 const { getBoostMultiplier, isPrestiged, prestigeHmMultiplier, prestigeRankXpMultiplier } = require("./shop");
 const { getActiveClanBoost, clanBoostMultiplier } = require("./clanpool");
+const { logEvent } = require("./logger");
 
 /**
  * Quest completion and expiry.
@@ -103,6 +104,16 @@ async function completeSoloQuest(quest, { guildId, userId, memberRsn }) {
   });
 
   await bumpCounts({ guildId, userId, questType: quest.quest_type });
+
+  logEvent(guildId, {
+    title: "✅ Solo Quest Completed",
+    color: 0x57f287,
+    fields: [
+      { name: "Member", value: `<@${userId}>`, inline: true },
+      { name: "Quest", value: `${quest.quest_type} ${quest.tree} (${quest.difficulty})`, inline: true },
+      { name: "Awarded", value: `${hm} HM + ${xpResult.amount || 0} Rank XP`, inline: true },
+    ],
+  });
 
   return { ok: true, hm, xp: xpResult.amount || 0 };
 }
@@ -274,6 +285,16 @@ async function completePartyQuest(quest, progress) {
     rank_xp_breakdown: rankXpBreakdown,
   });
 
+  logEvent(quest.guild_id, {
+    title: quest.size === "pool" ? "✅ Pool Quest Completed" : "✅ Party Quest Completed",
+    color: 0x57f287,
+    fields: [
+      { name: "Members", value: quest.members.map((id) => `<@${id}>`).join(" "), inline: true },
+      { name: "Quest", value: `${quest.size} ${quest.tree} (${quest.difficulty})`, inline: true },
+      { name: "Awarded", value: `${totalHm} HM + ${totalRankXp} Rank XP total`, inline: true },
+    ],
+  });
+
   return { ok: true, hm: totalHm };
 }
 
@@ -334,6 +355,17 @@ async function sweepExpiredQuests() {
       progress_pct: pct,
     });
 
+    logEvent(quest.guild_id, {
+      title: "⌛ Solo Quest Expired",
+      color: 0x95a5a6,
+      fields: [
+        { name: "Member", value: `<@${quest.user_id}>`, inline: true },
+        { name: "Quest", value: `${quest.quest_type} ${quest.tree} (${quest.difficulty})`, inline: true },
+        { name: "Progress", value: `${pct}%`, inline: true },
+        { name: "Partial HM", value: `${hm} HM`, inline: true },
+      ],
+    });
+
     soloCount += 1;
   }
 
@@ -389,6 +421,17 @@ async function sweepExpiredQuests() {
       hm_awarded: hm,
       hm_breakdown: hmBreakdown,
       rank_xp_awarded: 0,
+    });
+
+    logEvent(quest.guild_id, {
+      title: quest.size === "pool" ? "⌛ Pool Quest Expired" : "⌛ Party Quest Expired",
+      color: 0x95a5a6,
+      fields: [
+        { name: "Members", value: quest.members.map((id) => `<@${id}>`).join(" "), inline: true },
+        { name: "Quest", value: `${quest.size} ${quest.tree} (${quest.difficulty})`, inline: true },
+        { name: "Progress", value: `${pct}%`, inline: true },
+        { name: "Partial HM", value: `${hm} HM each`, inline: true },
+      ],
     });
 
     partyCount += 1;

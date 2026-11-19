@@ -7,6 +7,7 @@ const {
 } = require("./jagex");
 const { awardRankXp } = require("./xpqueue");
 const { safeBossPool, levelsFromSnapshot, pickEasiestBoss } = require("./bossSafety");
+const { logEvent } = require("./logger");
 
 // ── Shop item slots that affect quest generation/rewards ───────────────────
 // Lives here (not src/shop.js) because createPartyQuest/joinOpenTeam need to
@@ -877,7 +878,21 @@ async function createSoloQuest(args) {
   if (!supabase) return { error: "Database unavailable." };
   const built = await buildSoloQuestPayload(args);
   if (built.error) return { error: built.error };
-  return insertSoloQuestPayload(built.payload);
+  const result = await insertSoloQuestPayload(built.payload);
+  if (!result.error) {
+    const pl = built.payload;
+    logEvent(pl.guild_id, {
+      title: "📜 Solo Quest Started",
+      color: 0x5865f2,
+      fields: [
+        { name: "Member", value: `<@${pl.user_id}>`, inline: true },
+        { name: "Quest", value: `${pl.quest_type} ${pl.tree} (${pl.difficulty})`, inline: true },
+        { name: "Reward", value: `${pl.hm_reward} HM + ${pl.rank_xp_reward} Rank XP`, inline: true },
+        { name: "Expires", value: `<t:${Math.floor(new Date(pl.expires_at).getTime() / 1000)}:F>`, inline: true },
+      ],
+    });
+  }
+  return result;
 }
 
 /**
@@ -999,6 +1014,16 @@ async function createPartyQuest({ guildId, members, tree, size, difficulty, pick
     console.error("[Quests] createPartyQuest:", error.message);
     return { error: "Couldn't create that team quest. Try again in a moment." };
   }
+  logEvent(guildId, {
+    title: isPool ? "🏊 Pool Quest Started" : "⚔️ Party Quest Started",
+    color: 0x5865f2,
+    fields: [
+      { name: "Members", value: unique.map((id) => `<@${id}>`).join(" "), inline: true },
+      { name: "Quest", value: `${size} ${tree} (${difficulty})`, inline: true },
+      { name: "Reward", value: `${hmReward} HM + ${rankXpReward} Rank XP each`, inline: true },
+      { name: "Expires", value: `<t:${Math.floor(expires.getTime() / 1000)}:F>`, inline: true },
+    ],
+  });
   return { ok: true };
 }
 
@@ -1044,6 +1069,15 @@ async function joinPoolQuest({ guildId, questId, userId }) {
     .update({ members, baseline })
     .eq("id", questId);
   if (error) return { error: "Couldn't join that pool quest. Try again in a moment." };
+  logEvent(guildId, {
+    title: "🏊 Pool Quest Joined",
+    color: 0x5865f2,
+    fields: [
+      { name: "Member", value: `<@${userId}>`, inline: true },
+      { name: "Quest", value: `pool ${quest.tree} (${quest.difficulty})`, inline: true },
+      { name: "Roster", value: `${members.length} member(s)`, inline: true },
+    ],
+  });
   return { ok: true, quest };
 }
 
@@ -1269,6 +1303,17 @@ async function creditHm({ guildId, userId, amount, kind, reason, idempotencyKey,
       idempotency_key: idempotencyKey || null,
     });
   } catch { /* ledger is best-effort; the balance is the source of truth */ }
+
+  logEvent(guildId, {
+    title: "💰 HM Awarded",
+    color: 0x57f287,
+    fields: [
+      { name: "Member", value: `<@${userId}>`, inline: true },
+      { name: "Amount", value: `**${amount} HM**`, inline: true },
+      { name: "Kind", value: kind, inline: true },
+      { name: "Reason", value: reason || "—" },
+    ],
+  });
 
   return { ok: true, balance: next };
 }

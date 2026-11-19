@@ -2,6 +2,7 @@
 const crypto = require("crypto");
 const { getSupabase } = require("./db");
 const { config } = require("./config");
+const { logEvent } = require("./logger");
 
 /**
  * Quest Rank XP leaves this bot through exactly one door: an INSERT into
@@ -62,6 +63,16 @@ async function awardRankXp({ guildId, userId, rsn, eventKey, reason, discriminat
       console.error("[XPQueue] insert failed:", error.message);
       return { ok: false, amount: 0, base, multiplier: mult };
     }
+    logEvent(guildId, {
+      title: "⭐ Rank XP Awarded",
+      color: 0xfee75c,
+      fields: [
+        { name: "Member", value: `<@${userId}>`, inline: true },
+        { name: "Amount", value: `**${amount} Rank XP**`, inline: true },
+        { name: "Event", value: eventKey, inline: true },
+        { name: "Reason", value: reason || "—" },
+      ],
+    });
     return { ok: true, amount, base, multiplier: mult };
   } catch (e) {
     console.error("[XPQueue] insert threw:", e.message);
