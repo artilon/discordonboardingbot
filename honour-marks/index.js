@@ -735,6 +735,25 @@ async function rebaselineIfLegacy(supabase, acc, current) {
   return { baseline, rebaselined: true };
 }
 
+// True when an acceptance went through the payout path (rewarded) but a
+// credit never landed — the pre-fix crash marked acceptances completed
+// before paying, leaving members stuck. Used by the Check Progress
+// button to reopen such acceptances instead of telling the member
+// they're done.
+async function bountyPayoutMissing(bounty, acc) {
+  const supabase = getSupabase();
+  if (!supabase) return false;
+  const hmKey = `bounty:${bounty.id}:${acc.user_id}`;
+  const xpKey = `bounty_xp:${bounty.id}:${acc.user_id}`;
+  const [{ data: ledger }, { data: xp }] = await Promise.all([
+    supabase.from("hm_transactions").select("id").eq("idempotency_key", hmKey).maybeSingle(),
+    supabase.from("pending_rank_xp").select("id").eq("idempotency_key", xpKey).maybeSingle(),
+  ]);
+  const hmOwed = (bounty.hm_reward || 0) > 0;
+  const xpOwed = (bounty.rank_xp_reward || 0) > 0;
+  return (hmOwed && !ledger) || (xpOwed && !xp);
+}
+
 // Process one bounty's progress for all its hunters: solo bounties
 // complete individually, collective bounties pool every hunter's delta
 // into one shared total (only contributors get paid). Returns per-hunter
@@ -881,7 +900,35 @@ async function handleBountyCheck(interaction) {
     return interaction.reply({ content: "You haven't accepted this bounty yet — press **Accept Bounty** first.", flags: MessageFlags.Ephemeral });
   }
   if (mine.completed) {
-    return interaction.reply({ content: "You've already completed this bounty — it can't be started again.", flags: MessageFlags.Ephemeral });
+    // Don't trust the flag blindly: pre-fix crashes marked acceptances
+    // completed before the payout landed. If the payout is missing (or
+    // a "non-contributor" actually contributed), reopen so this check
+    // pays them. Genuine completions still can't be restarted.
+    let stuck = false;
+    try {
+      if (mine.rewarded) {
+        stuck = await bountyPayoutMissing(bounty, mine);
+      } else if (member?.rsn) {
+        // Marked complete without a payout: either a genuine
+        // non-contributor or a misclassification from stale stored
+        // progress. A fresh hiscores check tells them apart.
+        const snap = await fetchHiscores(member.rsn, { useCache: false }).catch(() => null);
+        if (snap) {
+          const current = { skills: snap.skills || {}, bosses: snap.bosses || {} };
+          const { baseline } = await rebaselineIfLegacy(supabase, mine, current);
+          const acceptorCount = (await loadBountyAcceptances(bountyId)).length;
+          const effReqs = bounties.effectiveRequirements(bounty, acceptorCount);
+          const { perReq } = bounties.computeProgress(effReqs, baseline, current);
+          stuck = perReq.some((p) => p.gained > 0);
+        }
+      }
+    } catch {
+      stuck = false; // on any doubt, trust the completed flag
+    }
+    if (!stuck) {
+      return interaction.reply({ content: "You've already completed this bounty — it can't be started again.", flags: MessageFlags.Ephemeral });
+    }
+    await supabase.from("hm_bounty_acceptances").update({ completed: false, rewarded: false }).eq("id", mine.id);
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
