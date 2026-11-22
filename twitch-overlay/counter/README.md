@@ -1,7 +1,12 @@
-# Counter overlay (keyboard-driven)
+# ToA dry counter (keyboard-driven)
 
-A HUD that counts up and down while you stream — deaths, KC, dry streaks, "how
-many times did I forget my rune pouch". Press a key, the number moves.
+A HUD that counts **chests since your last purple** at Tombs of Amascut.
+
+- One press per chest → the number goes up.
+- One press when the purple lands → the streak gets banked, your **best** updates,
+  and the counter drops back to zero.
+- It also remembers how many purples you've had and every streak length, so
+  "how dry have I actually been" stops being a vibe and becomes a number.
 
 ```
 node twitch-overlay/counter/counter-server.js
@@ -12,9 +17,8 @@ Then add an OBS **Browser** source pointing at **`http://127.0.0.1:7391/`**.
 ## Why there's a server
 
 An OBS browser source only receives keystrokes while its **Interact** window has
-focus. Pressing a key in-game does nothing, by design — the source is a web page
-in a hidden browser, and OBS doesn't forward input to it. So the count can't live
-in the page.
+focus. Pressing a key in-game does nothing — the source is a web page in a hidden
+browser, and OBS doesn't forward input to it. So the count can't live in the page.
 
 Instead the page *listens*, and something that can see your keys *pushes*:
 
@@ -23,13 +27,13 @@ Instead the page *listens*, and something that can see your keys *pushes*:
                      (sees keys system-wide)                (holds the count)    (OBS)
 ```
 
-That's also why it survives: close OBS, restart the PC, the count is still there
+Which is also why it survives: close OBS, reboot, the streak is still there
 (it's written to `counter-state.json`).
 
 ## Quick start
 
 ```bash
-# 1. start the server (leave this window open, or run it on boot)
+# 1. start the server (leave the window open, or run it at login)
 node twitch-overlay/counter/counter-server.js
 #    → overlay  http://127.0.0.1:7391/
 #    → buttons  http://127.0.0.1:7391/app
@@ -40,38 +44,41 @@ node twitch-overlay/counter/counter-server.js
 # 3. Windows: right-click hotkeys.ps1 → Run with PowerShell
 ```
 
-Default keys: **Numpad +** adds one, **Numpad −** subtracts one, **Numpad 0**
-resets. Change them at the top of `hotkeys.ps1` — the numbers are Windows virtual
-key codes, and there's a cheat sheet in the file. `F7/F8/F9` are the other
-popular choice; numpad is safer because games rarely claim it.
+| Key | Does |
+| --- | --- |
+| **Numpad +** | chest opened, count +1 |
+| **Numpad −** | undo one (miscounted) |
+| **Numpad 0** or **Numpad .** | **GOT A PURPLE** — banks the streak, back to 0 |
 
-`hotkeys.ps1` uses `GetAsyncKeyState`, needs no admin rights, installs nothing,
-and only polls ~28 times a second.
+Change the keys at the top of `hotkeys.ps1`; the numbers are Windows virtual key
+codes and there's a cheat sheet in the file. `GetAsyncKeyState` polling needs no
+admin rights, installs nothing, and runs at ~28 Hz.
 
 ## Fixing a wrong count
 
-Open **`http://127.0.0.1:7391/app`** — three big buttons, live count. Bookmark it
-on your phone (same Wi-Fi, `http://<your-pc-ip>:7391/app`) and you have a remote
-control. Also handy on a Stream Deck's web-browser button.
+Open **`http://127.0.0.1:7391/app`** — big buttons, live count, best and purple
+total. Bookmark it on your phone (same Wi-Fi: `http://<your-pc-ip>:7391/app`).
+There's **Reset (no purple)** for a genuine miscount — it zeroes the live number
+*without* recording a streak or touching your best.
 
-## API (for Streamer.bot, a Stream Deck, curl, anything)
+## API (Streamer.bot, Stream Deck, curl, anything)
 
 All plain GETs, CORS-open:
 
 | Call | Effect |
 | --- | --- |
-| `/api/bump` or `/api/bump?d=1` | add 1 |
-| `/api/bump?d=-1` | subtract 1 |
-| `/api/bump?d=25` | add 25 |
-| `/api/reset` | back to 0 |
-| `/api/set?n=42` | jump to 42 |
-| `/api/state` | `{"count":42}` |
+| `/api/bump` or `/api/bump?d=1` | chest opened |
+| `/api/bump?d=-1` | undo one |
+| `/api/purple` | **purple** — banks the streak, returns `{count:0, streak:N, best, purples}` |
+| `/api/reset` | zero the count, record nothing |
+| `/api/set?n=12` | jump to 12 |
+| `/api/state` | `{"count":12,"best":41,"purples":3,"lastStreak":41,"history":[...]}` |
 | `/events` | Server-Sent Events stream (the overlay's feed) |
 
-**Streamer.bot:** action → sub-action **Core → HTTP Request** → `GET` →
-`http://127.0.0.1:7391/api/bump?d=1` → attach it to a hotkey or a channel-point
-reward. Same for Mix It Up. Or skip this whole server and let Streamer.bot's own
-globals drive a Text source — fewer moving parts, less pretty HUD.
+**Streamer.bot:** action → **Core → HTTP Request** → `GET`
+`http://127.0.0.1:7391/api/bump?d=1`, attach it to a hotkey; duplicate it for
+`/api/purple`. Same for Mix It Up. (You could also run the whole thing off
+Streamer.bot's own globals and a Text source — fewer moving parts, plainer HUD.)
 
 ## Overlay options
 
@@ -79,28 +86,32 @@ Append to the browser source URL:
 
 | Param | Default | |
 | --- | --- | --- |
-| `?label=Deaths` | `Deaths` | text above the number |
-| `&suffix=KC` | *(none)* | small text after the number |
+| `?eyebrow=Tombs of Amascut` | `Tombs of Amascut` | small gold line on top |
+| `&sub=chests since purple` | `chests since purple` | small line under the number |
+| `&stats=false` | shown | hide the `best 41 · 3 purples` line |
 | `&pos=pos-top-left` | `pos-bottom-left` | also `-bottom-right`, `-top-right`, `pos-center` |
-| `&scale=1.4` | `1` | bigger HUD |
-| `&hideWhenZero=true` | `false` | invisible until the count leaves 0 |
+| `&scale=1.3` | `1` | bigger HUD |
 
-e.g. `http://127.0.0.1:7391/?label=Kills&suffix=KC&pos=pos-top-right&scale=1.3`
+e.g. `http://127.0.0.1:7391/?pos=pos-top-right&scale=1.25&stats=false`
 
-The gold dot next to the label turns **red** if the overlay loses the server, so
-you can see at a glance that the counter has gone deaf.
+On a purple the HUD flashes violet, fires a shockwave ring, and floats
+`PURPLE! 41 dry` above the number while it drops back to 0. The gold dot beside
+the label turns **red** if the overlay loses the server, so a frozen HUD looks
+different from a dead one.
 
 ## Notes
 
+- **A dry streak can't go negative.** Undo below zero clamps at 0; the purple
+  count and best are never touched by undo or reset.
+- **History is capped at 200 streaks** (oldest dropped) so
+  `counter-state.json` stays a few KB.
 - `COUNTER_ROOT=demo` serves the try-it page at `/` instead of the bare HUD —
   that's how the hosted demo runs; you never need it locally.
-- **Port 7391 is hardcoded by default.** Override with `COUNTER_PORT=7500` before
-  starting, e.g. `set COUNTER_PORT=7500 && node counter-server.js`.
-- **Node must be on the streaming PC** for this version. You already have it for
-  the Discord bot — just check it's the same machine. If it isn't, Streamer.bot's
-  built-in counters are the no-Node route.
-- Two scenes both showing the counter works fine — every overlay page subscribes
-  to the same server.
-- If the HUD sits at 0 and never moves: the server isn't running (dot will be
-  red). If it moves but the number doesn't change in OBS, the source is probably
-  pointed at the **file**, not the URL.
+- **Port 7391 by default.** Override with `COUNTER_PORT=7500` before starting.
+- **Node must be on the gaming PC.** You already have it for the Discord bot —
+  just check it's the same machine.
+- Two scenes showing the counter works fine; every overlay page subscribes to
+  the same server.
+- HUD stuck at 0 and never moves → server isn't running (dot will be red).
+  Moves on the buttons page but not in OBS → the source points at the **file**
+  instead of the URL.

@@ -2,9 +2,9 @@
 #
 #   Right-click this file -> "Run with PowerShell"
 #
-# Numpad +      add 1
-# Numpad -      subtract 1
-# Numpad 0      reset to 0
+# Numpad +      a chest opened   (+1)
+# Numpad -      undo one          (-1)
+# Numpad 0      GOT A PURPLE      (banks the streak, back to 0)
 #
 # Change the keys below if you like. The numbers are Windows "virtual key codes":
 #   0x60..0x69 = Numpad 0..9      0x6B = Numpad +      0x6D = Numpad -
@@ -23,13 +23,14 @@ $BaseUrl = "http://127.0.0.1:7391"
 
 # --- key code -> API path ---------------------------------------------------
 $Bindings = [ordered]@{
-    0x6B = "/api/bump?d=1"     # Numpad +
-    0x6D = "/api/bump?d=-1"    # Numpad -
-    0x60 = "/api/reset"        # Numpad 0
+    0x6B = "/api/bump?d=1"     # Numpad +   chest opened
+    0x6D = "/api/bump?d=-1"    # Numpad -   undo
+    0x60 = "/api/purple"       # Numpad 0   GOT A PURPLE
+    0x6E = "/api/purple"       # Numpad .   same thing, easier to hit
 }
 
 $Names = @{
-    0x6B = "Numpad +"; 0x6D = "Numpad -"; 0x60 = "Numpad 0"
+    0x6B = "Numpad +"; 0x6D = "Numpad -"; 0x60 = "Numpad 0"; 0x6E = "Numpad ."
     0x70 = "F1"; 0x71 = "F2"; 0x72 = "F3"; 0x73 = "F4"; 0x74 = "F5"; 0x75 = "F6"
     0x76 = "F7"; 0x77 = "F8"; 0x78 = "F9"; 0x79 = "F10"; 0x7A = "F11"; 0x7B = "F12"
 }
@@ -39,7 +40,7 @@ Add-Type -Namespace Win -Name Native -MemberDefinition @'
 '@
 
 Write-Host ""
-Write-Host "  Odinheim counter hotkeys" -ForegroundColor Yellow
+Write-Host "  ToA dry counter - hotkeys" -ForegroundColor Yellow
 Write-Host "  ------------------------"
 foreach ($vk in $Bindings.Keys) {
     $label = if ($Names.ContainsKey($vk)) { $Names[$vk] } else { "key 0x{0:X}" -f $vk }

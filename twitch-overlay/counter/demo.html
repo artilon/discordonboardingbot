@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Odinheim counter — try it</title>
+<title>Odinheim — ToA dry counter demo</title>
 <style>
   :root { --gold:#f0c96b; --gold-hot:#ffe6a8; --line:#1e2a36; }
   * { box-sizing:border-box; }
@@ -29,8 +29,11 @@
   button { appearance:none; border:0; cursor:pointer; font:inherit; font-weight:800;
     padding:14px 20px; border-radius:11px; font-size:15px; }
   .plus { background:linear-gradient(180deg,var(--gold-hot),var(--gold) 55%,#c39a3f); color:#1a1204; }
+  .purple { background:linear-gradient(180deg,#d9b3ff,#b06bff 60%,#7c3fd6); color:#160a24; }
   .minus { background:#141d26; color:#e6eef7; border:1px solid var(--line); }
   .reset { background:#101821; color:#9fadbb; border:1px solid var(--line); font-size:13px; }
+  .stats { font-size:12px; color:#8fa0b3; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .stats b { color:var(--gold); }
   .count { margin-left:auto; font-family:"Iowan Old Style",Palatino,Georgia,serif;
     font-size:30px; color:var(--gold); font-variant-numeric:tabular-nums; }
   p { font-size:12.5px; line-height:1.6; color:#7d8b9a; margin:14px 0 0; }
@@ -38,7 +41,7 @@
 </style>
 </head>
 <body>
-  <h1>Counter &mdash; live demo</h1>
+  <h1>ToA dry counter &mdash; live demo</h1>
 
   <div class="scene">
     <div style="position:absolute;inset:0;background:
@@ -48,36 +51,48 @@
   </div>
 
   <div class="controls">
-    <button class="plus" data-bump="1">+ 1</button>
-    <button class="minus" data-bump="-1">&minus; 1</button>
+    <button class="plus" data-bump="1">Chest &nbsp;+1</button>
+    <button class="purple" id="purple">&#10022; PURPLE</button>
+    <button class="minus" data-bump="-1">Undo</button>
     <button class="reset" id="reset">Reset</button>
     <span class="count" id="num">0</span>
   </div>
+  <div class="controls"><span class="stats" id="stats">best <b>0</b> &middot; <b>0</b> purples</span></div>
 
-  <p>These buttons hit the same API your keyboard does: <code>/api/bump?d=1</code>. Pressing a key
+  <p>One press per chest (<code>/api/bump?d=1</code>), one press when the purple lands
+    (<code>/api/purple</code>) &mdash; that banks the streak, updates your best, and drops the
+    count back to zero. Pressing a key
     can't work from a web page — the browser only sees keys while it has focus — which is why the
     real setup uses <code>hotkeys.ps1</code> (or Streamer.bot) to listen system-wide and call that
     URL. Same endpoint, same result.</p>
 
 <script>
 const numEl = document.getElementById("num");
-const paint = (n) => (numEl.textContent = Number(n).toLocaleString("en-US"));
+const statsEl = document.getElementById("stats");
+const paint = (s) => {
+  numEl.textContent = Number(s.count || 0).toLocaleString("en-US");
+  statsEl.innerHTML = `best <b>${Number(s.best || 0).toLocaleString("en-US")}</b> &middot; ` +
+                      `<b>${Number(s.purples || 0).toLocaleString("en-US")}</b> purples`;
+};
 
 document.querySelectorAll("[data-bump]").forEach((b) =>
-  b.addEventListener("click", () => fetch("/api/bump?d=" + b.dataset.bump).then((r) => r.json()).then((d) => paint(d.count)))
+  b.addEventListener("click", () => fetch("/api/bump?d=" + b.dataset.bump).then((r) => r.json()).then(paint))
+);
+document.getElementById("purple").addEventListener("click", () =>
+  fetch("/api/purple").then((r) => r.json()).then(paint)
 );
 document.getElementById("reset").addEventListener("click", () =>
-  fetch("/api/reset").then((r) => r.json()).then((d) => paint(d.count))
+  fetch("/api/reset").then((r) => r.json()).then(paint)
 );
 
 const es = new EventSource("/events");
 es.onmessage = (e) => {
   try {
     const d = JSON.parse(e.data);
-    if (Number.isFinite(d.count)) paint(d.count);
+    if (Number.isFinite(d.count)) paint(d);
   } catch {}
 };
-fetch("/api/state").then((r) => r.json()).then((d) => paint(d.count)).catch(() => {});
+fetch("/api/state").then((r) => r.json()).then(paint).catch(() => {});
 </script>
 </body>
 </html>

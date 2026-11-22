@@ -2,25 +2,30 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Odinheim counter overlay</title>
+<title>Odinheim — ToA dry counter</title>
 <!--
-  ODINHEIM COUNTER OVERLAY
+  TOMBS OF AMASSCUT — DRY COUNTER OVERLAY
   ==========================================================================
-  A live tally for OBS. It does NOT read your keyboard itself — an OBS browser
-  source only sees keys while its Interact window is focused. Instead it listens
-  to the local counter server, and something that CAN see your keys pushes to it:
+  Big number = chests opened since your last purple.
+
+    one press per chest   -> +1
+    one press when purple -> records the streak, updates your best, back to 0
+
+  It does NOT read your keyboard itself: an OBS browser source only sees keys
+  while its Interact window is focused. So the count lives in the local server
+  (counter-server.js) and a global-hotkey listener pushes to it.
 
       node twitch-overlay/counter/counter-server.js
 
-  Then make an OBS Browser Source pointing at  http://127.0.0.1:7391/
-  (Local file will not work — it has to be the running server's URL.)
+  OBS Browser Source ->  http://127.0.0.1:7391/   (not Local file)
 
-  URL options (all optional):
-      ?label=Deaths      text above the number
-      &suffix=KC         small text after the number
-      &pos=pos-top-left  also -top-right, -bottom-left, pos-center
-      &scale=1.4         bigger/smaller HUD
-      &hideWhenZero=true start invisible until the count moves off 0
+  URL options:
+      ?label=Chests       number label (default: Chests)
+      &eyebrow=TOMBS OF AMASSCUT
+      &sub=since purple
+      &stats=false        hide the "best / purples" line
+      &pos=pos-top-right  -bottom-right, -top-left, -bottom-left, pos-center
+      &scale=1.3
 -->
 
 <style>
@@ -31,6 +36,8 @@
     --muted: #a9b4c2;
     --up: #7ee2a8;
     --down: #ff8a7a;
+    --purple: #b06bff;
+    --purple-hot: #e5c7ff;
     --scale: 1;
   }
 
@@ -49,108 +56,134 @@
     display: flex; padding: 48px;
     align-items: flex-end; justify-content: flex-start;
     pointer-events: none;
-    transition: opacity 260ms ease;
   }
   #stage.pos-bottom-left  { justify-content: flex-start; align-items: flex-end; }
   #stage.pos-bottom-right { justify-content: flex-end;   align-items: flex-end; }
   #stage.pos-top-left     { justify-content: flex-start; align-items: flex-start; }
   #stage.pos-top-right    { justify-content: flex-end;   align-items: flex-start; }
   #stage.pos-center       { justify-content: center;     align-items: center; }
-  #stage.hidden { opacity: 0; }
 
   .hud {
     position: relative;
     display: inline-flex;
     flex-direction: column;
     align-items: center;
-    gap: 2px;
-    padding: calc(18px * var(--scale)) calc(30px * var(--scale)) calc(16px * var(--scale));
+    padding: calc(16px * var(--scale)) calc(32px * var(--scale)) calc(14px * var(--scale));
     border-radius: calc(18px * var(--scale));
     background:
-      radial-gradient(120% 140% at 50% -20%, rgba(240, 201, 107, 0.18), transparent 60%),
+      radial-gradient(120% 140% at 50% -20%, rgba(240, 201, 107, 0.16), transparent 60%),
       linear-gradient(165deg, rgba(22, 29, 39, 0.96), rgba(8, 12, 17, 0.97));
-    border: 1px solid rgba(240, 201, 107, 0.42);
+    border: 1px solid rgba(240, 201, 107, 0.40);
     box-shadow:
       0 18px 44px rgba(0, 0, 0, 0.55),
       inset 0 1px 0 rgba(255, 255, 255, 0.06);
-    transform-origin: 50% 100%;
-    transition: transform 160ms ease;
+    transition: border-color 200ms ease, box-shadow 200ms ease;
   }
 
-  .label {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font: 700 calc(12px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
-    letter-spacing: 0.22em;
+  /* a chest was opened */
+  .hud.up {
+    border-color: rgba(240, 201, 107, 0.85);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55), 0 0 34px rgba(240, 201, 107, 0.30);
+  }
+
+  /* THE PURPLE */
+  .hud.purple {
+    border-color: rgba(176, 107, 255, 0.95);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55), 0 0 60px rgba(176, 107, 255, 0.55);
+    animation: purpleShake 620ms ease-out;
+  }
+  @keyframes purpleShake {
+    0%   { transform: scale(1); }
+    18%  { transform: scale(1.06) rotate(-0.5deg); }
+    38%  { transform: scale(1.02) rotate(0.4deg); }
+    60%  { transform: scale(1.04); }
+    100% { transform: scale(1); }
+  }
+
+  .eyebrow {
+    font: 800 calc(10px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0.24em;
     text-transform: uppercase;
     color: var(--gold);
-    opacity: 0.9;
-    margin-bottom: calc(6px * var(--scale));
+    opacity: 0.85;
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: calc(9px * var(--scale));
   }
   .dot {
     width: 7px; height: 7px; border-radius: 50%;
-    background: var(--gold);
-    box-shadow: 0 0 10px var(--gold);
+    background: var(--gold); box-shadow: 0 0 10px var(--gold);
     transition: background 200ms ease, box-shadow 200ms ease;
   }
   .dot.offline { background: var(--down); box-shadow: 0 0 10px var(--down); }
 
-  .row {
-    display: flex;
-    align-items: baseline;
-    gap: calc(10px * var(--scale));
-  }
-
   .count {
     font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
-    font-size: calc(86px * var(--scale));
-    line-height: 0.92;
-    letter-spacing: 0.01em;
+    font-size: calc(96px * var(--scale));
+    line-height: 0.9;
     font-variant-numeric: tabular-nums;
+    color: transparent;
     background: linear-gradient(180deg, #fff6dd 8%, var(--gold) 62%, #b98a35 100%);
     -webkit-background-clip: text;
     background-clip: text;
-    color: transparent;
-    text-shadow: 0 3px 22px rgba(240, 201, 107, 0.22);
-    transition: transform 130ms cubic-bezier(0.2, 1.6, 0.4, 1);
+    text-shadow: 0 3px 22px rgba(240, 201, 107, 0.20);
+    transition: transform 140ms cubic-bezier(0.2, 1.6, 0.4, 1), filter 200ms ease;
   }
+  .hud.up .count { transform: scale(1.06); }
+  .hud.purple .count { filter: drop-shadow(0 0 22px rgba(176, 107, 255, 0.8)); }
 
-  .suffix {
-    font: 700 calc(15px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
-    letter-spacing: 0.14em;
+  .sub {
+    margin-top: calc(8px * var(--scale));
+    font: 600 calc(11.5px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0.18em;
     text-transform: uppercase;
     color: var(--muted);
-    opacity: 0.85;
+    opacity: 0.8;
   }
 
-  /* the number itself flinches: up pops, down shrinks */
-  .hud.up   .count { transform: scale(1.09); }
-  .hud.down .count { transform: scale(0.94); }
-  .hud.up   { border-color: rgba(126, 226, 168, 0.55); }
-  .hud.down { border-color: rgba(255, 138, 122, 0.55); }
+  .stats {
+    margin-top: calc(9px * var(--scale));
+    font: 600 calc(10.5px * var(--scale)) / 1 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: 0.08em;
+    color: rgba(169, 180, 194, 0.6);
+  }
+  .stats b { color: rgba(240, 201, 107, 0.85); font-weight: 700; }
 
-  /* the little +1 / -1 that floats away */
   .ghost {
     position: absolute;
-    right: calc(12px * var(--scale));
-    top: calc(4px * var(--scale));
-    font: 800 calc(15px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
+    right: calc(14px * var(--scale));
+    top: calc(6px * var(--scale));
+    font: 800 calc(14px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
     color: var(--up);
     opacity: 0;
     pointer-events: none;
+    white-space: nowrap;
   }
   .ghost.minus { color: var(--down); }
-  .ghost.go { animation: floatUp 900ms ease-out forwards; }
+  .ghost.purple { color: var(--purple-hot); text-shadow: 0 0 16px var(--purple); font-size: calc(16px * var(--scale)); }
+  .ghost.go { animation: floatUp 950ms ease-out forwards; }
   @keyframes floatUp {
-    0%   { opacity: 0; transform: translateY(6px) scale(0.9); }
-    22%  { opacity: 1; transform: translateY(-4px) scale(1); }
+    0%   { opacity: 0; transform: translateY(6px) scale(0.92); }
+    20%  { opacity: 1; transform: translateY(-4px) scale(1); }
     100% { opacity: 0; transform: translateY(-30px) scale(1); }
   }
 
+  /* the shockwave ring on a purple */
+  .ring {
+    position: absolute; inset: 0;
+    border-radius: inherit;
+    border: 2px solid var(--purple);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .ring.go { animation: shock 900ms ease-out forwards; }
+  @keyframes shock {
+    0%   { opacity: 0.9; transform: scale(1); }
+    100% { opacity: 0; transform: scale(1.35); }
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .count, .hud, #stage { transition: none !important; }
-    .ghost.go { animation: none !important; }
+    .count, .hud { transition: none !important; animation: none !important; }
+    .ghost.go, .ring.go { animation: none !important; }
   }
 </style>
 </head>
@@ -158,94 +191,109 @@
 
 <div id="stage" class="pos-bottom-left">
   <div class="hud" id="hud">
-    <div class="label"><span class="dot" id="dot"></span><span id="label">Deaths</span></div>
-    <div class="row">
-      <span class="count" id="count">0</span>
-      <span class="suffix" id="suffix"></span>
-    </div>
+    <div class="eyebrow"><span class="dot" id="dot"></span><span id="eyebrow">Tombs of Amascut</span></div>
+    <span class="count" id="count">0</span>
+    <div class="sub" id="sub">chests since purple</div>
+    <div class="stats" id="stats">best <b>0</b> &middot; <b>0</b> purples</div>
     <span class="ghost" id="ghost">+1</span>
+    <span class="ring" id="ring"></span>
   </div>
 </div>
 
 <script>
 /* ======================= EDIT ME (or use URL params) ======================= */
 const CONFIG = {
-  LABEL:  "Deaths",       // text above the number
-  SUFFIX: "",             // e.g. "KC" — small text after the number
+  EYEBROW: "Tombs of Amascut",   // small gold line up top
+  SUB: "chests since purple",    // small line under the number
+  SHOW_STATS: true,              // the "best / purples" line
   POSITION: "pos-bottom-left",
-  SCALE: 1,               // 1.4 for a bigger HUD, 0.8 for smaller
-  HIDE_WHEN_ZERO: false   // true = invisible until the count leaves zero
+  SCALE: 1                       // 1.3 = bigger HUD
 };
 /* ========================================================================= */
 
 const params = new URLSearchParams(location.search);
 const pick = (k, fallback) => (params.has(k) ? params.get(k) : fallback);
 
-const LABEL = pick("label", CONFIG.LABEL);
-const SUFFIX = pick("suffix", CONFIG.SUFFIX);
+const EYEBROW = pick("eyebrow", CONFIG.EYEBROW);
+const SUB = pick("sub", CONFIG.SUB);
+const SHOW_STATS = String(pick("stats", CONFIG.SHOW_STATS)) !== "false";
 const POSITION = pick("pos", CONFIG.POSITION);
 const SCALE = Number(pick("scale", CONFIG.SCALE)) || 1;
-const HIDE_WHEN_ZERO = String(pick("hideWhenZero", CONFIG.HIDE_WHEN_ZERO)) === "true";
 
 const stage = document.getElementById("stage");
 const hud = document.getElementById("hud");
 const countEl = document.getElementById("count");
 const ghostEl = document.getElementById("ghost");
+const ringEl = document.getElementById("ring");
 const dotEl = document.getElementById("dot");
+const statsEl = document.getElementById("stats");
 
-document.getElementById("label").textContent = LABEL;
-document.getElementById("suffix").textContent = SUFFIX;
+document.getElementById("eyebrow").textContent = EYEBROW;
+document.getElementById("sub").textContent = SUB;
+statsEl.style.display = SHOW_STATS ? "" : "none";
 stage.className = POSITION;
 document.documentElement.style.setProperty("--scale", SCALE);
 
-let current = 0;
-let ghostTimer = null;
+let last = null;
+let timers = [];
 
-const fmt = (n) => n.toLocaleString("en-US");
+const clearTimers = () => { timers.forEach(clearTimeout); timers = []; };
+const later = (fn, ms) => timers.push(setTimeout(fn, ms));
 
-function render(next) {
-  const prev = current;
-  current = next;
-  countEl.textContent = fmt(next);
+function paintStats(s) {
+  if (!SHOW_STATS) return;
+  statsEl.innerHTML = `best <b>${Number(s.best || 0).toLocaleString("en-US")}</b> &middot; ` +
+                      `<b>${Number(s.purples || 0).toLocaleString("en-US")}</b> purples`;
+}
 
-  if (HIDE_WHEN_ZERO) stage.classList.toggle("hidden", next === 0);
-
-  const delta = next - prev;
-  if (delta === 0) return;
-
-  hud.classList.remove("up", "down");
-  void hud.offsetWidth;                 // restart the transition
-  hud.classList.add(delta > 0 ? "up" : "down");
-  setTimeout(() => hud.classList.remove("up", "down"), 150);
-
-  ghostEl.textContent = delta > 0 ? `+${delta}` : `${delta}`;
-  ghostEl.classList.toggle("minus", delta < 0);
-  ghostEl.classList.remove("go");
+function popGhost(text, cls) {
+  ghostEl.textContent = text;
+  ghostEl.className = "ghost" + (cls ? " " + cls : "");
   void ghostEl.offsetWidth;
   ghostEl.classList.add("go");
-  clearTimeout(ghostTimer);
-  ghostTimer = setTimeout(() => ghostEl.classList.remove("go"), 950);
 }
 
-/* Live link to the counter server. EventSource reconnects by itself if the
-   server restarts, so the overlay recovers without a scene refresh. */
-function connect() {
-  const source = new EventSource("/events");
+function render(state) {
+  const prev = last ? last.count : state.count;
+  const isPurple = state.event === "purple";
 
-  source.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      if (Number.isFinite(data.count)) render(data.count);
-    } catch {}
-  };
-  source.onopen = () => dotEl.classList.remove("offline");
-  source.onerror = () => dotEl.classList.add("offline");
+  countEl.textContent = Number(state.count || 0).toLocaleString("en-US");
+  paintStats(state);
 
-  // if the server isn't up yet, keep trying quietly
-  return source;
+  clearTimers();
+
+  if (isPurple) {
+    hud.classList.add("purple");
+    ringEl.classList.remove("go"); void ringEl.offsetWidth; ringEl.classList.add("go");
+    popGhost(`PURPLE! ${Number(state.streak || prev).toLocaleString("en-US")} dry`, "purple");
+    later(() => hud.classList.remove("purple"), 1900);
+    later(() => ringEl.classList.remove("go"), 1000);
+  } else if (state.count > prev) {
+    hud.classList.add("up");
+    popGhost(`+${state.count - prev}`, "");
+    later(() => hud.classList.remove("up"), 220);
+    later(() => ghostEl.classList.remove("go"), 1000);
+  } else if (state.count < prev) {
+    popGhost(`${state.count - prev}`, "minus");
+    later(() => ghostEl.classList.remove("go"), 1000);
+  }
+
+  last = { ...state };
 }
 
-connect();
+/* Live link to the counter server; EventSource reconnects on its own if the
+   server restarts, so a scene refresh isn't needed after a reboot. */
+const source = new EventSource("/events");
+source.onmessage = (event) => {
+  try {
+    const state = JSON.parse(event.data);
+    if (Number.isFinite(state.count)) render(state);
+  } catch {}
+};
+source.onopen = () => dotEl.classList.remove("offline");
+source.onerror = () => dotEl.classList.add("offline");
+
+fetch("/api/state").then((r) => r.json()).then(render).catch(() => {});
 </script>
 </body>
 </html>

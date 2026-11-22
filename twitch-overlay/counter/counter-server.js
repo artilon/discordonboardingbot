@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * Odinheim counter — a tiny local server for a keyboard-driven stream counter
- * (deaths, KC, dry streaks, whatever you want to tally live).
+ * Odinheim counter — a tiny local server for a keyboard-driven stream counter.
+ *
+ * Built for a Tombs of Amascut dry streak: one press per chest opened, one press
+ * when the purple finally lands. The purple press records the streak, updates
+ * your best, and drops the live count back to zero.
  *
  *   node twitch-overlay/counter/counter-server.js
  *
@@ -13,10 +16,11 @@
  * it — the bundled hotkeys.ps1, Streamer.bot, a Stream Deck, a phone on the
  * /app page, or plain old curl.
  *
- *   GET /api/bump?d=1     add 1 (d=-1 subtracts, d=5 adds five)
- *   GET /api/reset        back to zero
+ *   GET /api/bump?d=1     a chest opened — add 1 (d=-1 subtracts, d=5 adds five)
+ *   GET /api/purple       GOT A PURPLE — record the streak, reset to 0
+ *   GET /api/reset        back to zero without recording a purple (misclicks)
  *   GET /api/set?n=42     jump to a number
- *   GET /api/state        {"count":42}
+ *   GET /api/state        {"count":42,"best":41,"purples":3,...}
  *   GET /events           Server-Sent Events stream (what the overlay listens to)
  *   GET /                 the overlay (OBS)
  *   GET /demo             overlay + buttons on one page (handy for trying it out)
@@ -39,12 +43,27 @@ const DEMO_ROOT = process.env.COUNTER_ROOT === "demo";
 const STATE_FILE = process.env.COUNTER_STATE_FILE || path.join(__dirname, "counter-state.json");
 
 /* ---------- state ---------- */
-let state = { count: 0 };
+// count   = chests since the last purple (the big number on stream)
+// best    = longest dry streak ever recorded
+// purples = how many purples have been banked
+// history = every streak, oldest first, capped so the file stays tiny
+const HISTORY_MAX = 200;
+
+const FRESH = { count: 0, best: 0, purples: 0, lastStreak: 0, history: [] };
+let state = { ...FRESH };
+
 try {
   const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  if (Number.isFinite(saved.count)) state.count = saved.count;
+  // Tolerates the old deaths-counter file, which only had { count }.
+  state = {
+    count: Number.isFinite(saved.count) ? saved.count : 0,
+    best: Number.isFinite(saved.best) ? saved.best : 0,
+    purples: Number.isFinite(saved.purples) ? saved.purples : 0,
+    lastStreak: Number.isFinite(saved.lastStreak) ? saved.lastStreak : 0,
+    history: Array.isArray(saved.history) ? saved.history : [],
+  };
 } catch {
-  /* first run, or a half-written file — start at zero */
+  /* first run, or a half-written file — start fresh */
 }
 
 function persist() {
@@ -58,8 +77,8 @@ function persist() {
 /* ---------- Server-Sent Events fan-out ---------- */
 const clients = new Set();
 
-function broadcast() {
-  const frame = `data: ${JSON.stringify(state)}\n\n`;
+function broadcast(extra = {}) {
+  const frame = `data: ${JSON.stringify({ ...state, ...extra })}\n\n`;
   for (const res of clients) {
     try {
       res.write(frame);
@@ -71,13 +90,28 @@ function broadcast() {
 
 function setCount(next) {
   const before = state.count;
-  state.count = Math.trunc(next);
+  state.count = Math.max(0, Math.trunc(next));   // a dry streak can't go negative
   persist();
   broadcast();
   const delta = state.count - before;
   const arrow = delta > 0 ? `+${delta}` : delta < 0 ? `${delta}` : "=";
-  console.log(`[counter] ${arrow} -> ${state.count}`);
+  console.log(`[counter] chest ${arrow} -> dry ${state.count}`);
   return state;
+}
+
+/** The good one: bank the streak, remember the best, start again at zero. */
+function setPurple() {
+  const streak = state.count;
+  state.best = Math.max(state.best, streak);
+  state.purples += 1;
+  state.lastStreak = streak;
+  state.history.push({ streak, at: new Date().toISOString() });
+  if (state.history.length > HISTORY_MAX) state.history.splice(0, state.history.length - HISTORY_MAX);
+  state.count = 0;
+  persist();
+  broadcast({ event: "purple", streak });
+  console.log(`[counter] PURPLE at ${streak} dry (best ${state.best}, ${state.purples} total)`);
+  return { ...state, streak };
 }
 
 /* ---------- helpers ---------- */
@@ -128,6 +162,8 @@ const server = http.createServer((req, res) => {
     return json(res, 200, setCount(state.count + d));
   }
 
+  if (route === "/api/purple") return json(res, 200, setPurple());
+
   if (route === "/api/reset") return json(res, 200, setCount(0));
 
   if (route === "/api/set") {
@@ -165,10 +201,11 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
+  console.log(`[counter] listening on port ${PORT}`);
   console.log(`[counter] overlay   http://127.0.0.1:${PORT}/`);
   console.log(`[counter] buttons   http://127.0.0.1:${PORT}/app`);
   console.log(`[counter] bump api  http://127.0.0.1:${PORT}/api/bump?d=1`);
-  console.log(`[counter] count is  ${state.count}`);
+  console.log(`[counter] dry for     ${state.count} chests (best ${state.best}, ${state.purples} purples)`);
 });
 
 /* let Ctrl+C exit cleanly even with SSE clients attached */

@@ -3,91 +3,103 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Odinheim counter — buttons</title>
+<title>Odinheim — ToA dry counter buttons</title>
 <style>
-  :root { --gold:#f0c96b; --gold-hot:#ffe6a8; --line:#1e2a36; }
+  :root { --gold:#f0c96b; --gold-hot:#ffe6a8; --purple:#b06bff; --purple-hot:#e5c7ff; --line:#1e2a36; }
   * { box-sizing:border-box; }
-  html, body { margin:0; height:100%; }
+  html, body { margin:0; min-height:100%; }
   body {
     background:
-      radial-gradient(80% 60% at 50% -10%, rgba(240,201,107,.12), transparent 60%),
+      radial-gradient(80% 60% at 50% -10%, rgba(240,201,107,.10), transparent 60%),
       linear-gradient(165deg,#12181f,#0a0e13 60%,#07090c);
     color:#f5ecd8; font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
-    display:flex; align-items:center; justify-content:center; padding:26px;
+    display:flex; align-items:center; justify-content:center; padding:24px;
   }
-  .wrap { width:100%; max-width:440px; }
-  .eyebrow { font-size:11px; font-weight:800; letter-spacing:.22em; text-transform:uppercase;
-    color:var(--gold); margin-bottom:12px; display:flex; align-items:center; gap:8px; }
+  .wrap { width:100%; max-width:460px; }
+  .eyebrow { font-size:10.5px; font-weight:800; letter-spacing:.22em; text-transform:uppercase;
+    color:var(--gold); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
   .dot { width:7px; height:7px; border-radius:50%; background:var(--gold); box-shadow:0 0 10px var(--gold); }
   .dot.offline { background:#ff8a7a; box-shadow:0 0 10px #ff8a7a; }
 
   .num {
-    font-family:"Iowan Old Style",Palatino,Georgia,serif; font-size:86px; line-height:.95;
-    font-variant-numeric:tabular-nums; text-align:center; margin:4px 0 22px;
+    font-family:"Iowan Old Style",Palatino,Georgia,serif; font-size:88px; line-height:.92;
+    font-variant-numeric:tabular-nums; text-align:center; margin:2px 0 4px;
     background:linear-gradient(180deg,#fff6dd,var(--gold) 64%,#b98a35);
     -webkit-background-clip:text; background-clip:text; color:transparent;
   }
+  .sub { text-align:center; font-size:11px; letter-spacing:.18em; text-transform:uppercase;
+    color:#8fa0b3; margin-bottom:6px; }
+  .stats { text-align:center; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px;
+    color:#6f8093; margin-bottom:20px; }
+  .stats b { color:var(--gold); }
+
   .btns { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-  button {
-    appearance:none; border:0; cursor:pointer; font:inherit; font-weight:800;
-    padding:20px 10px; border-radius:14px; font-size:19px;
-  }
-  .plus { background:linear-gradient(180deg,var(--gold-hot),var(--gold) 55%,#c39a3f); color:#1a1204;
+  button { appearance:none; border:0; cursor:pointer; font:inherit; font-weight:800;
+    border-radius:14px; }
+  .chest { grid-column:1 / -1; padding:26px 10px; font-size:20px;
+    background:linear-gradient(180deg,var(--gold-hot),var(--gold) 55%,#c39a3f); color:#1a1204;
     box-shadow:0 12px 26px rgba(240,201,107,.22), inset 0 1px 0 rgba(255,255,255,.6); }
-  .minus { background:#141d26; color:#e6eef7; border:1px solid var(--line); }
-  .reset { grid-column:1 / -1; background:#101821; color:#9fadbb; border:1px solid var(--line); font-size:14px; padding:14px; }
+  .purple { grid-column:1 / -1; padding:20px 10px; font-size:16px; letter-spacing:.04em;
+    background:linear-gradient(180deg,#d9b3ff,var(--purple) 60%,#7c3fd6); color:#160a24;
+    box-shadow:0 12px 26px rgba(176,107,255,.28), inset 0 1px 0 rgba(255,255,255,.45); }
+  .undo, .zero { padding:16px 10px; font-size:14px; background:#111a22; color:#c9d6e4; border:1px solid var(--line); }
   button:active { transform:translateY(1px) scale(.995); }
-  .hint { margin-top:18px; font-size:12.5px; line-height:1.6; color:#7d8b9a; text-align:center; }
+  .hint { margin-top:16px; font-size:12px; line-height:1.6; color:#7d8b9a; text-align:center; }
   .hint code { color:var(--gold); background:#131b24; padding:1px 5px; border-radius:4px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="eyebrow"><span class="dot" id="dot"></span>Odinheim counter</div>
+  <div class="eyebrow"><span class="dot" id="dot"></span>Tombs of Amascut</div>
   <div class="num" id="num">0</div>
+  <div class="sub">chests since purple</div>
+  <div class="stats" id="stats">best <b>0</b> &middot; <b>0</b> purples</div>
+
   <div class="btns">
-    <button class="plus" data-bump="1">+ 1</button>
-    <button class="minus" data-bump="-1">&minus; 1</button>
-    <button class="reset" id="reset">Reset to 0</button>
+    <button class="chest" data-bump="1">Chest opened &nbsp;+1</button>
+    <button class="purple" id="purple">&#10022; GOT A PURPLE</button>
+    <button class="undo" data-bump="-1">Undo &minus;1</button>
+    <button class="zero" id="zero">Reset (no purple)</button>
   </div>
-  <p class="hint">Works from your phone too — open <code>http://&lt;your-pc-ip&gt;:7391/app</code> on the
-    same Wi-Fi. Or map these buttons to a Stream Deck's web page.</p>
+
+  <p class="hint">Same API as your keyboard: <code>/api/bump?d=1</code> and <code>/api/purple</code>.
+    Open <code>http://&lt;your-pc-ip&gt;:7391/app</code> on your phone on the same Wi-Fi.</p>
 </div>
 
 <script>
 const numEl = document.getElementById("num");
+const statsEl = document.getElementById("stats");
 const dotEl = document.getElementById("dot");
-const fmt = (n) => n.toLocaleString("en-US");
+const fmt = (n) => Number(n || 0).toLocaleString("en-US");
 
-const paint = (n) => { numEl.textContent = fmt(n); };
+function paint(s) {
+  numEl.textContent = fmt(s.count);
+  statsEl.innerHTML = `best <b>${fmt(s.best)}</b> &middot; <b>${fmt(s.purples)}</b> purples`;
+}
 
 async function call(path) {
   try {
     const res = await fetch(path);
     if (!res.ok) throw new Error("HTTP " + res.status);
-    paint((await res.json()).count);
-  } catch (e) {
+    paint(await res.json());
+  } catch {
     dotEl.classList.add("offline");
     numEl.textContent = "—";
   }
 }
 
-document.querySelectorAll("[data-bump]").forEach((btn) => {
-  btn.addEventListener("click", () => call("/api/bump?d=" + btn.dataset.bump));
-});
-document.getElementById("reset").addEventListener("click", () => call("/api/reset"));
+document.querySelectorAll("[data-bump]").forEach((b) =>
+  b.addEventListener("click", () => call("/api/bump?d=" + b.dataset.bump))
+);
+document.getElementById("purple").addEventListener("click", () => call("/api/purple"));
+document.getElementById("zero").addEventListener("click", () => call("/api/reset"));
 
-const source = new EventSource("/events");
-source.onmessage = (e) => {
-  try {
-    const d = JSON.parse(e.data);
-    if (Number.isFinite(d.count)) paint(d.count);
-  } catch {}
-};
-source.onopen = () => dotEl.classList.remove("offline");
-source.onerror = () => dotEl.classList.add("offline");
+const es = new EventSource("/events");
+es.onmessage = (e) => { try { paint(JSON.parse(e.data)); } catch {} };
+es.onopen = () => dotEl.classList.remove("offline");
+es.onerror = () => dotEl.classList.add("offline");
 
-fetch("/api/state").then((r) => r.json()).then((d) => paint(d.count)).catch(() => {});
+fetch("/api/state").then((r) => r.json()).then(paint).catch(() => {});
 </script>
 </body>
 </html>

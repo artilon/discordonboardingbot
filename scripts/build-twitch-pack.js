@@ -96,10 +96,12 @@ index.html + vendor/                The same overlay as a two-file page. Identic
 preview.html                        Mock stream + fake chat, to see it in context.
 panel/panel-640x200.png             The clickable panel image for your channel page.
 panel/make-panel.py                 Redraws that image with different wording.
-counter/counter-server.js            KEYBOARD COUNTER: run this with node, then point an
-counter/counter.html                 OBS Browser Source at http://127.0.0.1:7391/
-counter/hotkeys.ps1                  Windows: right-click -> Run with PowerShell.
-counter/README.md                    Numpad + = add 1, Numpad - = minus 1, Numpad 0 = reset.
+counter/counter-server.js            TOA DRY COUNTER (chests since purple): run this with
+counter/counter.html                 node, then point an OBS Browser Source at
+counter/hotkeys.ps1                  http://127.0.0.1:7391/  Windows: right-click
+counter/README.md                    hotkeys.ps1 -> Run with PowerShell.
+                                     Numpad + = chest, Numpad - = undo,
+                                     Numpad 0 = PURPLE (banks streak, resets to 0).
 README.md                           Full setup notes, troubleshooting, and the rules
                                     about what Twitch does and doesn't allow.
 

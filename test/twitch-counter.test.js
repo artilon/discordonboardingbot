@@ -1,5 +1,10 @@
-// Coverage for the Twitch counter overlay's local server
+// Coverage for the ToA dry counter's local server
 // (twitch-overlay/counter/counter-server.js).
+//
+// The counter means one specific thing: how many chests since the last purple.
+// So the arithmetic that has to be exactly right is not just +1 — it's that a
+// purple banks the streak, updates the best, and leaves the live count at zero,
+// and that none of it is lost when OBS or the PC restarts mid-session.
 //
 // Why this exists: the overlay is driven entirely through HTTP endpoints that
 // other software calls — hotkeys.ps1, Streamer.bot, a Stream Deck, a phone on
@@ -44,7 +49,7 @@ function startServer(port, stateFile) {
     const timer = setTimeout(() => reject(new Error(`server did not start: ${out}`)), 5000);
     child.stdout.on("data", (buf) => {
       out += buf.toString();
-      if (out.includes("count is")) {
+      if (out.includes("listening on port")) {
         clearTimeout(timer);
         resolve();
       }
@@ -78,6 +83,8 @@ async function main() {
   // --- fresh start is zero ------------------------------------------------
   let r = await api("/api/state");
   check("GET /api/state returns JSON with count 0 on a fresh state file", r.status === 200 && r.body.count === 0);
+  check("fresh state also carries best/purples for the HUD's stats line",
+    r.body.best === 0 && r.body.purples === 0 && Array.isArray(r.body.history));
 
   // --- bump ---------------------------------------------------------------
   r = await api("/api/bump?d=1");
@@ -87,7 +94,7 @@ async function main() {
   r = await api("/api/bump?d=-1");
   check("GET /api/bump?d=-1 decrements to 1", r.body.count === 1);
   r = await api("/api/bump?d=-5");
-  check("negative counts are allowed (count 1 - 5 = -4)", r.body.count === -4);
+  check("a dry streak can't go negative (1 - 5 clamps to 0)", r.body.count === 0);
 
   // --- set / reset --------------------------------------------------------
   r = await api("/api/set?n=42");
@@ -97,13 +104,46 @@ async function main() {
   r = await api("/api/bump?d=7");
   check("bump after reset works (7)", r.body.count === 7);
 
+  // --- the purple: bank the streak, remember the best, start again --------
+  await api("/api/reset");
+  for (let i = 0; i < 26; i++) await api("/api/bump?d=1");   // a 26-chest dry streak
+  r = await api("/api/state");
+  check("26 chests in a row leaves the count at 26", r.body.count === 26);
+
+  r = await api("/api/purple");
+  check("GET /api/purple returns the streak that just ended", r.body.streak === 26);
+  check("the live count drops back to 0 after a purple", r.body.count === 0);
+  check("the best streak is updated to 26", r.body.best === 26);
+  check("the purple count goes to 1", r.body.purples === 1);
+  check("the streak is appended to history with a timestamp",
+    r.body.history.length === 1 && r.body.history[0].streak === 26 && !!r.body.history[0].at);
+
+  r = await api("/api/purple");
+  check("a purple at 0 dry is recorded but doesn't lower the best (still 26)",
+    r.body.best === 26 && r.body.count === 0 && r.body.purples === 2);
+
+  for (let i = 0; i < 31; i++) await api("/api/bump?d=1");   // beat it
+  r = await api("/api/purple");
+  check("a longer streak replaces the best (31)", r.body.best === 31 && r.body.streak === 31);
+  check("history keeps both streaks, oldest first",
+    r.body.history.length === 3 && r.body.history[2].streak === 31);
+
+  r = await api("/api/reset");
+  check("/api/reset zeroes the count without touching best or purple count",
+    r.body.count === 0 && r.body.best === 31 && r.body.purples === 3);
+  check("/api/reset does not invent a history entry", r.body.history.length === 3);
+
+  await api("/api/set?n=8");                                  // leave a known value
+  r = await api("/api/state");
+  check("count can be set directly for fixing a miscount (8)", r.body.count === 8);
+
   // --- bad input is rejected, not crashed on -----------------------------
   r = await api("/api/bump?d=banana");
   check("non-numeric d is a 400, not a crash", r.status === 400);
   r = await api("/api/set?n=nope");
   check("non-numeric n is a 400", r.status === 400);
   r = await api("/api/state");
-  check("the count is untouched by the rejected calls", r.body.count === 7);
+  check("the count is untouched by the rejected calls", r.body.count === 8);
 
   // --- CORS: a phone on the LAN / another local page must be able to call it
   const corsRes = await fetch(base + "/api/state", { headers: { Origin: "http://example.test" } });
@@ -117,10 +157,14 @@ async function main() {
   const overlay = await fetch(base + "/");
   const overlayHtml = await overlay.text();
   check("GET / serves the overlay page", overlay.status === 200 && overlayHtml.includes("EventSource"));
+  check("overlay labels itself as a chests-since-purple counter",
+    overlayHtml.includes("chests since purple"));
   check("overlay page has a transparent background for OBS", overlayHtml.includes("background: transparent"));
 
   const control = await fetch(base + "/app");
-  check("GET /app serves the buttons page", control.status === 200 && (await control.text()).includes("/api/bump"));
+  const controlHtml = await control.text();
+  check("GET /app serves the buttons page", control.status === 200 && controlHtml.includes("/api/bump"));
+  check("buttons page has the purple button", controlHtml.includes("/api/purple"));
 
   const demo = await fetch(base + "/demo");
   check("GET /demo serves the try-it page", demo.status === 200);
@@ -147,11 +191,17 @@ async function main() {
     return buffer.includes(needle);
   };
 
-  check("SSE sends the current count immediately on connect", await readUntil('"count":7'));
+  check("SSE sends the current count immediately on connect", await readUntil('"count":8'));
 
   buffer = "";
   await api("/api/bump?d=1");
-  check("SSE pushes the new count to connected overlays", await readUntil('"count":8'));
+  check("SSE pushes the new chest count to connected overlays", await readUntil('"count":9'));
+
+  buffer = "";
+  r = await api("/api/purple");
+  check("SSE tags a purple with an event so the overlay can flash it",
+    await readUntil('"event":"purple"'));
+  check("the purple event carries the streak that just ended", r.body.streak === 9);
 
   sseController.abort();
 
@@ -162,7 +212,21 @@ async function main() {
   ({ child, ready } = startServer(port, stateFile));
   await ready;
   r = await api("/api/state");
-  check("count is restored after restarting the server (OBS closed overnight)", r.body.count === 8);
+  check("count is restored after restarting the server (OBS closed overnight)", r.body.count === 0);
+  check("best survives the restart", r.body.best === 31);
+  check("purple count survives the restart", r.body.purples === 4);
+  check("streak history survives the restart", r.body.history.length === 4);
+
+  // --- an old deaths-counter state file must not explode ----------------
+  const legacy = path.join(dir, "legacy.json");
+  fs.writeFileSync(legacy, JSON.stringify({ count: 5 }));
+  const legacyPort = await freePort();
+  const legacyServer = startServer(legacyPort, legacy);
+  await legacyServer.ready;
+  const legacyState = await (await fetch(`http://127.0.0.1:${legacyPort}/api/state`)).json();
+  check("a legacy {count:5} state file loads and gains best/purples fields",
+    legacyState.count === 5 && legacyState.best === 0 && legacyState.purples === 0);
+  await stop(legacyServer.child);
 
   await stop(child);
   fs.rmSync(dir, { recursive: true, force: true });

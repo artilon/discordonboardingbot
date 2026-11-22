@@ -12,7 +12,7 @@ twitch-overlay/
 ├── panel/              ← the clickable panel graphic + the script that draws it
 │   ├── panel-640x200.png   ← upload this to Twitch
 │   └── make-panel.py       ← regenerate it with different text
-├── counter/            ← keyboard-driven count-up HUD (deaths, KC, dry streaks)
+├── counter/            ← ToA dry counter HUD (chests since your last purple)
 │   ├── counter-server.js   ← run this; it holds the count
 │   ├── counter.html        ← the OBS overlay
 │   ├── hotkeys.ps1         ← global keys on Windows (no install)
@@ -114,13 +114,15 @@ cd twitch-overlay/panel && pip install pillow && python3 make-panel.py
 **Text** panel, paste the invite, and Twitch auto-links it. The image just looks
 better and matches the stream.
 
-## The counter (keyboard-driven HUD)
+## The dry counter (ToA)
 
-A number on screen that you bump with a keypress — deaths, KC, dry streaks.
+A HUD showing **chests since your last purple**. One keypress per chest bumps it
+up; one keypress when the purple lands banks the streak, updates your best, and
+drops it back to zero. It also tracks your purple total and every past streak.
 
 The catch worth knowing: **an OBS browser source only receives keys while its
-Interact window is focused**, so a keypress mid-game never reaches an overlay.
-That's not fixable in CSS or JS. So the count lives in a small local server, and
+Interact window is focused**, so a keypress mid-raid never reaches an overlay.
+That isn't fixable in CSS or JS. So the count lives in a small local server, and
 a global-hotkey listener pushes to it:
 
 ```bash
@@ -128,8 +130,8 @@ node twitch-overlay/counter/counter-server.js      # → http://127.0.0.1:7391/
 ```
 
 OBS Browser source → `http://127.0.0.1:7391/` → 1920×1080. Windows hotkeys:
-right-click `counter/hotkeys.ps1` → Run with PowerShell (Numpad **+** / **−** /
-**0** by default). Streamer.bot and Stream Decks hit the same HTTP API.
+right-click `counter/hotkeys.ps1` → Run with PowerShell (Numpad **+** chest,
+**−** undo, **0** purple). Streamer.bot and Stream Decks hit the same HTTP API.
 
 Full details, API table and URL options: [`counter/README.md`](counter/README.md).
 
