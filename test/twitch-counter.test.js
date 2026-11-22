@@ -167,7 +167,10 @@ async function main() {
   check("buttons page has the purple button", controlHtml.includes("/api/purple"));
 
   const demo = await fetch(base + "/demo");
+  const demoHtml = await demo.text();
   check("GET /demo serves the try-it page", demo.status === 200);
+  check("the demo's iframe points at /counter.html, not /, so demo-root mode can't recurse",
+    demoHtml.includes('src="/counter.html"') && !demoHtml.includes('src="/"'));
 
   const missing = await fetch(base + "/nope");
   check("unknown routes 404 instead of hanging OBS", missing.status === 404);
