@@ -129,9 +129,10 @@ a global-hotkey listener pushes to it:
 node twitch-overlay/counter/counter-server.js      # → http://127.0.0.1:7391/
 ```
 
-OBS Browser source → `http://127.0.0.1:7391/` → 1920×1080. Windows hotkeys:
-right-click `counter/hotkeys.ps1` → Run with PowerShell (Numpad **+** chest,
-**−** undo, **0** purple). Streamer.bot and Stream Decks hit the same HTTP API.
+OBS Browser source → `http://127.0.0.1:7391/` → 1920×1080 (a **URL**, not a
+local file — different from the pop-up above). Windows hotkeys: double-click
+`counter/run-hotkeys.bat` (Numpad **+** chest, **−** undo, **0** purple).
+Streamer.bot and Stream Decks hit the same HTTP API.
 
 Full details, API table and URL options: [`counter/README.md`](counter/README.md).
 

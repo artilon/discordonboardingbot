@@ -47,6 +47,8 @@ copy("counter/counter.html");
 copy("counter/control.html");
 copy("counter/demo.html");
 copy("counter/hotkeys.ps1");
+copy("counter/run-hotkeys.bat");
+copy("counter/test-keys.bat");
 copy("counter/README.md");
 
 /* ---- 2. single-file overlay: same page with the QR encoder inlined ---- */
@@ -98,8 +100,10 @@ panel/panel-640x200.png             The clickable panel image for your channel p
 panel/make-panel.py                 Redraws that image with different wording.
 counter/counter-server.js            TOA DRY COUNTER (chests since purple): run this with
 counter/counter.html                 node, then point an OBS Browser Source at
-counter/hotkeys.ps1                  http://127.0.0.1:7391/  Windows: right-click
-counter/README.md                    hotkeys.ps1 -> Run with PowerShell.
+counter/hotkeys.ps1                  http://127.0.0.1:7391/  Windows: double-click
+counter/run-hotkeys.bat              run-hotkeys.bat (keeps the window open).
+counter/test-keys.bat                If a key does nothing, run test-keys.bat.
+counter/README.md                    Numpad + = chest, - = undo, 0 = PURPLE.
                                      Numpad + = chest, Numpad - = undo,
                                      Numpad 0 = PURPLE (banks streak, resets to 0).
 README.md                           Full setup notes, troubleshooting, and the rules

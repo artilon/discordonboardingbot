@@ -41,7 +41,8 @@ node twitch-overlay/counter/counter-server.js
 # 2. in OBS: + → Browser → URL http://127.0.0.1:7391/ → 1920x1080
 #    (a Local file will NOT work — it has to be the server's URL)
 
-# 3. Windows: right-click hotkeys.ps1 → Run with PowerShell
+# 3. Windows: double-click run-hotkeys.bat
+#    (NOT hotkeys.ps1 — see below)
 ```
 
 | Key | Does |
@@ -53,6 +54,35 @@ node twitch-overlay/counter/counter-server.js
 Change the keys at the top of `hotkeys.ps1`; the numbers are Windows virtual key
 codes and there's a cheat sheet in the file. `GetAsyncKeyState` polling needs no
 admin rights, installs nothing, and runs at ~28 Hz.
+
+### "I ran it and the window closed instantly"
+
+That's PowerShell refusing the script before it gets to the listening loop —
+almost always the script-execution policy, or the file still marked as "came
+from the internet" after unzipping. A double-clicked `.ps1` shows the error for
+about 200 ms and vanishes, which is why it looks like nothing happened.
+
+**Use `run-hotkeys.bat` instead.** It runs PowerShell with
+`-NoProfile -ExecutionPolicy Bypass`, unblocks the `.ps1` first, and then
+**pauses** — so an error stays on screen and can be read.
+
+### Numpad + does nothing, no errors
+
+Run **`test-keys.bat`**. It prints the virtual-key code of every key you press:
+
+```
+  key down: VK 107 (0x6B)      <- that's Numpad +
+  key down: VK 109 (0x6D)      <- that's Numpad -
+```
+
+- **Lines appear** when you press Numpad + → Windows sees the key; the binding
+  or the server is the problem, not the keyboard.
+- **No lines at all** → the key isn't reaching Windows as a numpad key (laptops
+  without a numpad, or NumLock oddities). Use the codes it *does* report: paste
+  them into `$Bindings` at the top of `hotkeys.ps1`.
+- **`Add-Type failed`** → your PowerShell can't compile the key-polling call.
+  Run it with PowerShell 7 (`pwsh.exe`) instead, or drive the counter from the
+  `/app` buttons page / Streamer.bot.
 
 ## Fixing a wrong count
 
@@ -115,3 +145,9 @@ different from a dead one.
 - HUD stuck at 0 and never moves → server isn't running (dot will be red).
   Moves on the buttons page but not in OBS → the source points at the **file**
   instead of the URL.
+- **Two different overlays live in this pack.** The Discord pop-up (`index.html`
+  / `odinheim-overlay-single-file.html`) is a **Local file** source. The counter
+  is a **URL** source (`http://127.0.0.1:7391/`). Pointing OBS at the wrong one
+  is the most common "the counter never moves".
+- Nothing here needs you to be live. It's all `127.0.0.1` — Twitch isn't
+  involved until the pixels leave OBS.
