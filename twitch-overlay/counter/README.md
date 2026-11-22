@@ -92,6 +92,8 @@ you can see at a glance that the counter has gone deaf.
 
 ## Notes
 
+- `COUNTER_ROOT=demo` serves the try-it page at `/` instead of the bare HUD —
+  that's how the hosted demo runs; you never need it locally.
 - **Port 7391 is hardcoded by default.** Override with `COUNTER_PORT=7500` before
   starting, e.g. `set COUNTER_PORT=7500 && node counter-server.js`.
 - **Node must be on the streaming PC** for this version. You already have it for

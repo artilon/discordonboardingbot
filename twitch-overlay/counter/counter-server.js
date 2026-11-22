@@ -32,6 +32,9 @@ const path = require("path");
 
 const PORT = Number(process.env.COUNTER_PORT || 7391);
 const HOST = process.env.COUNTER_HOST || "0.0.0.0";
+// COUNTER_ROOT=demo serves the try-it page at / instead of the bare HUD. Only
+// used for the hosted demo; normal runs leave this unset and get the overlay.
+const DEMO_ROOT = process.env.COUNTER_ROOT === "demo";
 // Overridable so tests (and throwaway demo instances) never clobber your real count.
 const STATE_FILE = process.env.COUNTER_STATE_FILE || path.join(__dirname, "counter-state.json");
 
@@ -107,7 +110,7 @@ const server = http.createServer((req, res) => {
   const q = url.searchParams;
 
   if (route === "/" || route === "/counter.html") {
-    return serveFile(res, "counter.html", "text/html; charset=utf-8");
+    return serveFile(res, DEMO_ROOT && route === "/" ? "demo.html" : "counter.html", "text/html; charset=utf-8");
   }
   if (route === "/demo" || route === "/demo.html") {
     return serveFile(res, "demo.html", "text/html; charset=utf-8");
