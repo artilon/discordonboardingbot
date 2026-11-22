@@ -42,6 +42,12 @@ copy("panel/panel-640x200.png");
 copy("panel/panel-320x100.png");
 copy("panel/make-panel.py");
 copy("vendor/qrcode.min.js");
+copy("counter/counter-server.js");
+copy("counter/counter.html");
+copy("counter/control.html");
+copy("counter/demo.html");
+copy("counter/hotkeys.ps1");
+copy("counter/README.md");
 
 /* ---- 2. single-file overlay: same page with the QR encoder inlined ---- */
 const indexHtml = read("index.html");
@@ -90,6 +96,10 @@ index.html + vendor/                The same overlay as a two-file page. Identic
 preview.html                        Mock stream + fake chat, to see it in context.
 panel/panel-640x200.png             The clickable panel image for your channel page.
 panel/make-panel.py                 Redraws that image with different wording.
+counter/counter-server.js            KEYBOARD COUNTER: run this with node, then point an
+counter/counter.html                 OBS Browser Source at http://127.0.0.1:7391/
+counter/hotkeys.ps1                  Windows: right-click -> Run with PowerShell.
+counter/README.md                    Numpad + = add 1, Numpad - = minus 1, Numpad 0 = reset.
 README.md                           Full setup notes, troubleshooting, and the rules
                                     about what Twitch does and doesn't allow.
 

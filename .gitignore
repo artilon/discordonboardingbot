@@ -3,3 +3,4 @@ node_modules/
 *.log
 honour-marks/.env
 honour-marks/node_modules/
+twitch-overlay/counter/counter-state.json

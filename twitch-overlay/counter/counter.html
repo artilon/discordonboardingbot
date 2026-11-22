@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Odinheim counter overlay</title>
+<!--
+  ODINHEIM COUNTER OVERLAY
+  ==========================================================================
+  A live tally for OBS. It does NOT read your keyboard itself — an OBS browser
+  source only sees keys while its Interact window is focused. Instead it listens
+  to the local counter server, and something that CAN see your keys pushes to it:
+
+      node twitch-overlay/counter/counter-server.js
+
+  Then make an OBS Browser Source pointing at  http://127.0.0.1:7391/
+  (Local file will not work — it has to be the running server's URL.)
+
+  URL options (all optional):
+      ?label=Deaths      text above the number
+      &suffix=KC         small text after the number
+      &pos=pos-top-left  also -top-right, -bottom-left, pos-center
+      &scale=1.4         bigger/smaller HUD
+      &hideWhenZero=true start invisible until the count moves off 0
+-->
+
+<style>
+  :root {
+    --gold: #f0c96b;
+    --gold-hot: #ffe6a8;
+    --parchment: #f5ecd8;
+    --muted: #a9b4c2;
+    --up: #7ee2a8;
+    --down: #ff8a7a;
+    --scale: 1;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent;
+    overflow: hidden;
+    user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; padding: 48px;
+    align-items: flex-end; justify-content: flex-start;
+    pointer-events: none;
+    transition: opacity 260ms ease;
+  }
+  #stage.pos-bottom-left  { justify-content: flex-start; align-items: flex-end; }
+  #stage.pos-bottom-right { justify-content: flex-end;   align-items: flex-end; }
+  #stage.pos-top-left     { justify-content: flex-start; align-items: flex-start; }
+  #stage.pos-top-right    { justify-content: flex-end;   align-items: flex-start; }
+  #stage.pos-center       { justify-content: center;     align-items: center; }
+  #stage.hidden { opacity: 0; }
+
+  .hud {
+    position: relative;
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: calc(18px * var(--scale)) calc(30px * var(--scale)) calc(16px * var(--scale));
+    border-radius: calc(18px * var(--scale));
+    background:
+      radial-gradient(120% 140% at 50% -20%, rgba(240, 201, 107, 0.18), transparent 60%),
+      linear-gradient(165deg, rgba(22, 29, 39, 0.96), rgba(8, 12, 17, 0.97));
+    border: 1px solid rgba(240, 201, 107, 0.42);
+    box-shadow:
+      0 18px 44px rgba(0, 0, 0, 0.55),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    transform-origin: 50% 100%;
+    transition: transform 160ms ease;
+  }
+
+  .label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font: 700 calc(12px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--gold);
+    opacity: 0.9;
+    margin-bottom: calc(6px * var(--scale));
+  }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--gold);
+    box-shadow: 0 0 10px var(--gold);
+    transition: background 200ms ease, box-shadow 200ms ease;
+  }
+  .dot.offline { background: var(--down); box-shadow: 0 0 10px var(--down); }
+
+  .row {
+    display: flex;
+    align-items: baseline;
+    gap: calc(10px * var(--scale));
+  }
+
+  .count {
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    font-size: calc(86px * var(--scale));
+    line-height: 0.92;
+    letter-spacing: 0.01em;
+    font-variant-numeric: tabular-nums;
+    background: linear-gradient(180deg, #fff6dd 8%, var(--gold) 62%, #b98a35 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow: 0 3px 22px rgba(240, 201, 107, 0.22);
+    transition: transform 130ms cubic-bezier(0.2, 1.6, 0.4, 1);
+  }
+
+  .suffix {
+    font: 700 calc(15px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    opacity: 0.85;
+  }
+
+  /* the number itself flinches: up pops, down shrinks */
+  .hud.up   .count { transform: scale(1.09); }
+  .hud.down .count { transform: scale(0.94); }
+  .hud.up   { border-color: rgba(126, 226, 168, 0.55); }
+  .hud.down { border-color: rgba(255, 138, 122, 0.55); }
+
+  /* the little +1 / -1 that floats away */
+  .ghost {
+    position: absolute;
+    right: calc(12px * var(--scale));
+    top: calc(4px * var(--scale));
+    font: 800 calc(15px * var(--scale)) / 1 ui-sans-serif, system-ui, sans-serif;
+    color: var(--up);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .ghost.minus { color: var(--down); }
+  .ghost.go { animation: floatUp 900ms ease-out forwards; }
+  @keyframes floatUp {
+    0%   { opacity: 0; transform: translateY(6px) scale(0.9); }
+    22%  { opacity: 1; transform: translateY(-4px) scale(1); }
+    100% { opacity: 0; transform: translateY(-30px) scale(1); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .count, .hud, #stage { transition: none !important; }
+    .ghost.go { animation: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="stage" class="pos-bottom-left">
+  <div class="hud" id="hud">
+    <div class="label"><span class="dot" id="dot"></span><span id="label">Deaths</span></div>
+    <div class="row">
+      <span class="count" id="count">0</span>
+      <span class="suffix" id="suffix"></span>
+    </div>
+    <span class="ghost" id="ghost">+1</span>
+  </div>
+</div>
+
+<script>
+/* ======================= EDIT ME (or use URL params) ======================= */
+const CONFIG = {
+  LABEL:  "Deaths",       // text above the number
+  SUFFIX: "",             // e.g. "KC" — small text after the number
+  POSITION: "pos-bottom-left",
+  SCALE: 1,               // 1.4 for a bigger HUD, 0.8 for smaller
+  HIDE_WHEN_ZERO: false   // true = invisible until the count leaves zero
+};
+/* ========================================================================= */
+
+const params = new URLSearchParams(location.search);
+const pick = (k, fallback) => (params.has(k) ? params.get(k) : fallback);
+
+const LABEL = pick("label", CONFIG.LABEL);
+const SUFFIX = pick("suffix", CONFIG.SUFFIX);
+const POSITION = pick("pos", CONFIG.POSITION);
+const SCALE = Number(pick("scale", CONFIG.SCALE)) || 1;
+const HIDE_WHEN_ZERO = String(pick("hideWhenZero", CONFIG.HIDE_WHEN_ZERO)) === "true";
+
+const stage = document.getElementById("stage");
+const hud = document.getElementById("hud");
+const countEl = document.getElementById("count");
+const ghostEl = document.getElementById("ghost");
+const dotEl = document.getElementById("dot");
+
+document.getElementById("label").textContent = LABEL;
+document.getElementById("suffix").textContent = SUFFIX;
+stage.className = POSITION;
+document.documentElement.style.setProperty("--scale", SCALE);
+
+let current = 0;
+let ghostTimer = null;
+
+const fmt = (n) => n.toLocaleString("en-US");
+
+function render(next) {
+  const prev = current;
+  current = next;
+  countEl.textContent = fmt(next);
+
+  if (HIDE_WHEN_ZERO) stage.classList.toggle("hidden", next === 0);
+
+  const delta = next - prev;
+  if (delta === 0) return;
+
+  hud.classList.remove("up", "down");
+  void hud.offsetWidth;                 // restart the transition
+  hud.classList.add(delta > 0 ? "up" : "down");
+  setTimeout(() => hud.classList.remove("up", "down"), 150);
+
+  ghostEl.textContent = delta > 0 ? `+${delta}` : `${delta}`;
+  ghostEl.classList.toggle("minus", delta < 0);
+  ghostEl.classList.remove("go");
+  void ghostEl.offsetWidth;
+  ghostEl.classList.add("go");
+  clearTimeout(ghostTimer);
+  ghostTimer = setTimeout(() => ghostEl.classList.remove("go"), 950);
+}
+
+/* Live link to the counter server. EventSource reconnects by itself if the
+   server restarts, so the overlay recovers without a scene refresh. */
+function connect() {
+  const source = new EventSource("/events");
+
+  source.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (Number.isFinite(data.count)) render(data.count);
+    } catch {}
+  };
+  source.onopen = () => dotEl.classList.remove("offline");
+  source.onerror = () => dotEl.classList.add("offline");
+
+  // if the server isn't up yet, keep trying quietly
+  return source;
+}
+
+connect();
+</script>
+</body>
+</html>

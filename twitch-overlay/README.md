@@ -12,6 +12,11 @@ twitch-overlay/
 ├── panel/              ← the clickable panel graphic + the script that draws it
 │   ├── panel-640x200.png   ← upload this to Twitch
 │   └── make-panel.py       ← regenerate it with different text
+├── counter/            ← keyboard-driven count-up HUD (deaths, KC, dry streaks)
+│   ├── counter-server.js   ← run this; it holds the count
+│   ├── counter.html        ← the OBS overlay
+│   ├── hotkeys.ps1         ← global keys on Windows (no install)
+│   └── README.md           ← everything about it
 └── vendor/qrcode.js    ← QR encoder, MIT, vendored so OBS can load it offline
 ```
 
@@ -108,6 +113,25 @@ cd twitch-overlay/panel && pip install pillow && python3 make-panel.py
 **Text panel instead?** Also completely fine and takes ten seconds: add a
 **Text** panel, paste the invite, and Twitch auto-links it. The image just looks
 better and matches the stream.
+
+## The counter (keyboard-driven HUD)
+
+A number on screen that you bump with a keypress — deaths, KC, dry streaks.
+
+The catch worth knowing: **an OBS browser source only receives keys while its
+Interact window is focused**, so a keypress mid-game never reaches an overlay.
+That's not fixable in CSS or JS. So the count lives in a small local server, and
+a global-hotkey listener pushes to it:
+
+```bash
+node twitch-overlay/counter/counter-server.js      # → http://127.0.0.1:7391/
+```
+
+OBS Browser source → `http://127.0.0.1:7391/` → 1920×1080. Windows hotkeys:
+right-click `counter/hotkeys.ps1` → Run with PowerShell (Numpad **+** / **−** /
+**0** by default). Streamer.bot and Stream Decks hit the same HTTP API.
+
+Full details, API table and URL options: [`counter/README.md`](counter/README.md).
 
 ## Setup in OBS
 
