@@ -587,9 +587,29 @@ async function syncBountyBoardInner(guildId) {
   let active = await loadActiveBounties(guildId);
 
   // Retire bounties past their window: 3h cycle, or 96h from last accept if
-  // someone is actively hunting.
+  // someone is actively hunting. A bounty every hunter has finished
+  // leaves the board right away instead of waiting out its window.
   const expiredIds = new Set();
   for (const b of active) {
+    const accs = await loadBountyAcceptances(b.id);
+    if (accs.length > 0 && accs.every((a) => a.completed)) {
+      expiredIds.add(b.id);
+      await supabase.from("hm_bounties").update({ status: "completed" }).eq("id", b.id);
+      logEvent(guildId, {
+        title: "🏁 Bounty Retired",
+        color: 0x57f287,
+        fields: [
+          { name: "Bounty", value: b.title, inline: true },
+          { name: "Category", value: `${b.category} (${b.size})`, inline: true },
+          { name: "Hunters", value: `${accs.length} finished`, inline: true },
+        ],
+      });
+      if (b.message_id) {
+        const msg = await channel.messages.fetch(b.message_id).catch(() => null);
+        await msg?.delete().catch(() => {});
+      }
+      continue;
+    }
     const createdMs = new Date(b.created_at).getTime();
     const lastAcceptMs = b.last_accepted_at ? new Date(b.last_accepted_at).getTime() : 0;
     const hasHunters = lastAcceptMs > 0;
