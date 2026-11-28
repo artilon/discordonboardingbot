@@ -123,6 +123,7 @@ Append to the browser source URL:
 | `&scale=1.3` | `1` | bigger HUD |
 | `&wander=20` | `20` | every N minutes the HUD bounces around the screen for a few seconds, then springs back home (`0` = off) |
 | `&wander-seconds=20` | `20` | how long it roams before springing back home |
+| `&purple-seconds=45` | `45` | how long the HUD stays violet after a purple, then defaults back to gold |
 
 e.g. `http://127.0.0.1:7391/?pos=pos-top-right&scale=1.25&stats=false`
 

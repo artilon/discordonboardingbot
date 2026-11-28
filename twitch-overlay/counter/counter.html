@@ -26,6 +26,9 @@
       &stats=false        hide the "best / purples" line
       &pos=pos-top-right  -bottom-right, -top-left, -bottom-left, pos-center
       &scale=1.3
+      &wander=20          bounce around the screen every N minutes (0 = off)
+      &wander-seconds=20  how long it roams before springing back home
+      &purple-seconds=45  how long the HUD stays violet after a purple
 -->
 
 <style>
@@ -173,6 +176,33 @@
     100% { opacity: 0; transform: translateY(-30px) scale(1); }
   }
 
+  /* fanfare banner on a purple */
+  .banner {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    font-size: calc(52px * var(--scale));
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    color: var(--purple-hot);
+    text-shadow: 0 0 26px rgba(176, 107, 255, 0.9), 0 2px 10px rgba(0, 0, 0, 0.6);
+    opacity: 0;
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  .banner.go { animation: bannerPop 2s ease-out forwards; }
+  @keyframes bannerPop {
+    0%   { opacity: 0; transform: scale(0.4) rotate(-3deg); }
+    18%  { opacity: 1; transform: scale(1.15) rotate(1deg); }
+    30%  { transform: scale(1) rotate(0deg); }
+    75%  { opacity: 1; transform: scale(1.03); }
+    100% { opacity: 0; transform: scale(1.08) translateY(-8px); }
+  }
+
+  /* confetti burst on a purple */
+  .confetti-wrap { position: absolute; inset: 0; pointer-events: none; }
+  .confetti { position: absolute; top: -8px; border-radius: 2px; }
+
   /* the shockwave ring on a purple */
   .ring {
     position: absolute; inset: 0;
@@ -189,7 +219,7 @@
 
   @media (prefers-reduced-motion: reduce) {
     .count, .hud { transition: none !important; animation: none !important; }
-    .ghost.go, .ring.go { animation: none !important; }
+    .ghost.go, .ring.go, .banner.go { animation: none !important; }
   }
 </style>
 </head>
@@ -215,7 +245,10 @@ const CONFIG = {
   SUB: "chests since purple",    // small line under the number
   SHOW_STATS: true,              // the "best / purples" line
   POSITION: "pos-bottom-left",
-  SCALE: 1                       // 1.3 = bigger HUD
+  SCALE: 1,                      // 1.3 = bigger HUD
+  WANDER_MINUTES: 20,            // bounce around the screen every N minutes (0 = off)
+  WANDER_SECONDS: 20,            // how long it roams before springing back home
+  PURPLE_SECONDS: 45             // how long the HUD stays violet after a purple
 };
 /* ========================================================================= */
 
@@ -227,12 +260,18 @@ const SUB = pick("sub", CONFIG.SUB);
 const SHOW_STATS = String(pick("stats", CONFIG.SHOW_STATS)) !== "false";
 const POSITION = pick("pos", CONFIG.POSITION);
 const SCALE = Number(pick("scale", CONFIG.SCALE)) || 1;
+const WANDER_MINUTES = Number(pick("wander", CONFIG.WANDER_MINUTES));
+const WANDER_SECONDS = Number(pick("wander-seconds", CONFIG.WANDER_SECONDS)) || 20;
+const PURPLE_SECONDS = Number(pick("purple-seconds", CONFIG.PURPLE_SECONDS)) || 45;
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const stage = document.getElementById("stage");
 const hud = document.getElementById("hud");
 const countEl = document.getElementById("count");
 const ghostEl = document.getElementById("ghost");
 const ringEl = document.getElementById("ring");
+const bannerEl = document.getElementById("banner");
+const confettiWrap = document.getElementById("confettiWrap");
 const dotEl = document.getElementById("dot");
 const statsEl = document.getElementById("stats");
 
@@ -244,6 +283,7 @@ document.documentElement.style.setProperty("--scale", SCALE);
 
 let last = null;
 let timers = [];
+let purpleTimer = null;   // dedicated: must survive clearTimers(), or the border sticks
 
 const clearTimers = () => { timers.forEach(clearTimeout); timers = []; };
 const later = (fn, ms) => timers.push(setTimeout(fn, ms));
@@ -252,6 +292,37 @@ function paintStats(s) {
   if (!SHOW_STATS) return;
   statsEl.innerHTML = `best <b>${Number(s.best || 0).toLocaleString("en-US")}</b> &middot; ` +
                       `<b>${Number(s.purples || 0).toLocaleString("en-US")}</b> purples`;
+}
+
+/* PURPLE fanfare: big banner + confetti burst over the HUD */
+function fanfare() {
+  bannerEl.textContent = "PURPLE!";
+  bannerEl.classList.remove("go"); void bannerEl.offsetWidth; bannerEl.classList.add("go");
+  later(() => bannerEl.classList.remove("go"), 2100);
+  if (reduceMotion) return;
+  const colors = ["#f0c96b", "#ffe6a8", "#b06bff", "#e5c7ff", "#ffffff"];
+  const W = hud.offsetWidth, H = hud.offsetHeight;
+  for (let i = 0; i < 36; i++) {
+    const c = document.createElement("span");
+    c.className = "confetti";
+    const size = 5 + Math.random() * 6;
+    c.style.width = size + "px";
+    c.style.height = (size * (0.5 + Math.random())) + "px";
+    c.style.left = (Math.random() * W) + "px";
+    c.style.background = colors[(Math.random() * colors.length) | 0];
+    confettiWrap.appendChild(c);
+    const dx = (Math.random() - 0.5) * 120;
+    const dy = H + 40 + Math.random() * 60;
+    const rot = (Math.random() - 0.5) * 720;
+    const anim = c.animate(
+      [
+        { transform: "translate(0px, 0px) rotate(0deg)", opacity: 1 },
+        { transform: `translate(${dx}px, ${dy}px) rotate(${rot}deg)`, opacity: 0 }
+      ],
+      { duration: 1100 + Math.random() * 900, delay: Math.random() * 250, easing: "cubic-bezier(0.2, 0.7, 0.3, 1)", fill: "forwards" }
+    );
+    anim.onfinish = () => c.remove();
+  }
 }
 
 function popGhost(text, cls) {
@@ -275,7 +346,8 @@ function render(state) {
     ringEl.classList.remove("go"); void ringEl.offsetWidth; ringEl.classList.add("go");
     fanfare();
     popGhost(`PURPLE! ${Number(state.streak || prev).toLocaleString("en-US")} dry`, "purple");
-    later(() => hud.classList.remove("purple"), 1900);
+    if (purpleTimer) clearTimeout(purpleTimer);
+    purpleTimer = setTimeout(() => hud.classList.remove("purple"), PURPLE_SECONDS * 1000);
     later(() => ringEl.classList.remove("go"), 1000);
   } else if (state.count > prev) {
     hud.classList.add("up");
@@ -288,6 +360,54 @@ function render(state) {
   }
 
   last = { ...state };
+}
+
+/* ---- wander: every N minutes the HUD bounces around the screen for a few
+   seconds, then springs back to its home spot. The translate goes on #stage
+   (not .hud) so it never fights the purple shake animation, which also uses
+   transform. ?wander=20 (minutes, 0 = off) &wander-seconds=20 ---- */
+let wandering = false;
+
+function randomHop(home) {
+  const margin = 24;
+  const w = hud.offsetWidth, h = hud.offsetHeight;
+  const maxX = Math.max(margin, window.innerWidth - w - margin);
+  const maxY = Math.max(margin, window.innerHeight - h - margin);
+  const tx = margin + Math.random() * (maxX - margin);
+  const ty = margin + Math.random() * (maxY - margin);
+  return { x: tx - home.left, y: ty - home.top, r: (Math.random() * 4 - 2).toFixed(2) };
+}
+
+async function doWander() {
+  if (wandering || !Number.isFinite(WANDER_MINUTES) || WANDER_MINUTES <= 0 || reduceMotion) return;
+  wandering = true;
+  hud.classList.add("wandering");
+  const home = hud.getBoundingClientRect();
+  const hops = Math.max(3, Math.round(WANDER_SECONDS / 3));
+  const hopMs = (WANDER_SECONDS * 1000) / hops;
+  for (let i = 0; i < hops; i++) {
+    const p = randomHop(home);
+    const anim = stage.animate(
+      [{ transform: `translate(${p.x}px, ${p.y}px) rotate(${p.r}deg)` }],
+      { duration: hopMs, easing: "cubic-bezier(0.34, 1.45, 0.64, 1)", fill: "forwards" }
+    );
+    try { await anim.finished; } catch {}
+  }
+  // spring back home
+  const back = stage.animate(
+    [{ transform: "translate(0px, 0px) rotate(0deg)" }],
+    { duration: 700, easing: "cubic-bezier(0.34, 1.56, 0.64, 1)", fill: "forwards" }
+  );
+  try { await back.finished; } catch {}
+  stage.getAnimations().forEach((a) => a.cancel());
+  stage.style.transform = "";
+  hud.classList.remove("wandering");
+  wandering = false;
+}
+
+function scheduleWander() {
+  if (!Number.isFinite(WANDER_MINUTES) || WANDER_MINUTES <= 0 || reduceMotion) return;
+  setTimeout(() => { doWander(); scheduleWander(); }, WANDER_MINUTES * 60 * 1000);
 }
 
 /* Live link to the counter server; EventSource reconnects on its own if the
