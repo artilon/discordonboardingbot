@@ -126,8 +126,9 @@ Append to the browser source URL:
 
 e.g. `http://127.0.0.1:7391/?pos=pos-top-right&scale=1.25&stats=false`
 
-On a purple the HUD flashes violet, fires a shockwave ring, and floats
-`PURPLE! 41 dry` above the number while it drops back to 0. The gold dot beside
+On a purple the HUD flashes violet, fires a shockwave ring, pops a big
+`PURPLE!` banner with a confetti burst, and floats `PURPLE! 41 dry` above the
+number while it drops back to 0. The gold dot beside
 the label turns **red** if the overlay loses the server, so a frozen HUD looks
 different from a dead one.
 

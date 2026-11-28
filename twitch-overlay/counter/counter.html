@@ -203,6 +203,8 @@
     <div class="stats" id="stats">best <b>0</b> &middot; <b>0</b> purples</div>
     <span class="ghost" id="ghost">+1</span>
     <span class="ring" id="ring"></span>
+    <div class="banner" id="banner"></div>
+    <div class="confetti-wrap" id="confettiWrap"></div>
   </div>
 </div>
 
@@ -271,6 +273,7 @@ function render(state) {
   if (isPurple) {
     hud.classList.add("purple");
     ringEl.classList.remove("go"); void ringEl.offsetWidth; ringEl.classList.add("go");
+    fanfare();
     popGhost(`PURPLE! ${Number(state.streak || prev).toLocaleString("en-US")} dry`, "purple");
     later(() => hud.classList.remove("purple"), 1900);
     later(() => ringEl.classList.remove("go"), 1000);
