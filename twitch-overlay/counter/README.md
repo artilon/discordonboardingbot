@@ -121,6 +121,8 @@ Append to the browser source URL:
 | `&stats=false` | shown | hide the `best 41 · 3 purples` line |
 | `&pos=pos-top-left` | `pos-bottom-left` | also `-bottom-right`, `-top-right`, `pos-center` |
 | `&scale=1.3` | `1` | bigger HUD |
+| `&wander=20` | `20` | every N minutes the HUD bounces around the screen for a few seconds, then springs back home (`0` = off) |
+| `&wander-seconds=20` | `20` | how long it roams before springing back home |
 
 e.g. `http://127.0.0.1:7391/?pos=pos-top-right&scale=1.25&stats=false`
 
