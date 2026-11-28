@@ -222,7 +222,7 @@ const CONFIG = {
   TAGLINE: "Raids · PvM · Skilling · 18+",
   CTA:     "Scan to join",                 // try "or type !discord"
   SHOW_SECONDS: 14,                        // how long it stays up
-  INTERVAL_SECONDS: 0,                     // auto pop every N seconds (0 = off)
+  INTERVAL_SECONDS: 240,                   // auto pop every N seconds (0 = off)
   START_VISIBLE: true,
   POSITION: "pos-bottom-right"             // …-bottom-left | -top-right | -top-left | pos-center
 };
